@@ -55,3 +55,35 @@ func TestMatchModel(t *testing.T) {
 		t.Error("matchModel(nonesuch) matched unexpectedly")
 	}
 }
+
+func TestToolLabel(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   Event
+		want string
+	}{
+		{"bash with command", Event{"toolName": "bash", "args": map[string]any{"command": "npm test"}}, "running: npm test"},
+		{"bash collapses whitespace", Event{"toolName": "bash", "args": map[string]any{"command": "go  build\n./..."}}, "running: go build ./..."},
+		{"non-bash tool", Event{"toolName": "read_file"}, "running read_file"},
+		{"missing name", Event{}, "running a tool…"},
+		{"bash no command", Event{"toolName": "bash"}, "running bash"},
+	}
+	for _, c := range cases {
+		if got := toolLabel(c.ev); got != c.want {
+			t.Errorf("%s: toolLabel = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestTruncateLabel(t *testing.T) {
+	if got := truncateLabel("short", 40); got != "short" {
+		t.Errorf("short = %q, want unchanged", got)
+	}
+	long := "abcdefghij" // 10 runes
+	if got := truncateLabel(long, 5); got != "abcd…" {
+		t.Errorf("long = %q, want abcd…", got)
+	}
+	if got := truncateLabel("a\tb\nc  d", 40); got != "a b c d" {
+		t.Errorf("whitespace = %q, want single-spaced", got)
+	}
+}

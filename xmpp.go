@@ -99,7 +99,8 @@ type XMPPBridge struct {
 	mu       sync.Mutex
 	session  *xmpp.Session
 	online   bool
-	presence string
+	show     string // presence <show>: "" (available) or "dnd"/"away"/… (availability axis)
+	presence string // presence <status> free text (activity axis)
 
 	seen      map[string]struct{}
 	seenOrder []string
@@ -163,7 +164,7 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	b.mu.Lock()
 	b.session = session
 	b.online = true
-	status := b.presence
+	show, status := b.show, b.presence
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
 	b.occupants = make(map[string]string)
 	b.selfNick = ""
@@ -171,7 +172,7 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 
 	// Announce presence so the server routes messages to this resource and the
 	// owner's roster shows the bot online.
-	if err := b.encodePresence("", status); err != nil {
+	if err := b.encodePresence(show, status); err != nil {
 		b.setOffline()
 		return fmt.Errorf("presence: %w", err)
 	}
@@ -434,20 +435,24 @@ func (b *XMPPBridge) Send(text string) {
 	}
 }
 
-// SetPresence announces available presence with a status label, remembering it
-// for re-assertion on reconnect. Pass "" to re-send the current label.
-func (b *XMPPBridge) SetPresence(status string) {
+// SetPresence announces presence with a show (availability axis: "" = available,
+// "dnd" = busy, …) and a status label (activity axis), remembering both for
+// re-assertion on reconnect. Redundant no-change calls are dropped so streaming
+// deltas don't spray identical presence stanzas.
+func (b *XMPPBridge) SetPresence(show, status string) {
 	b.mu.Lock()
-	if status != "" {
-		b.presence = status
+	if show == b.show && status == b.presence {
+		b.mu.Unlock()
+		return // unchanged; skip the stanza
 	}
-	cur := b.presence
+	b.show = show
+	b.presence = status
 	online := b.online
 	b.mu.Unlock()
 	if !online {
 		return
 	}
-	if err := b.encodePresence("", cur); err != nil {
+	if err := b.encodePresence(show, status); err != nil {
 		b.log("warning", "presence failed: "+err.Error())
 	}
 }

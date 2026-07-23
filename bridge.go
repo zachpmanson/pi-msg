@@ -142,22 +142,38 @@ func (b *Bridge) shutdown(reason string) {
 
 // --- pi event handling ---
 
+// The bridge conveys agent state on three orthogonal axes so they don't all
+// mean "busy" (see docs): the typing indicator = "a message is arriving right
+// now" (lit only while assistant text streams); presence <show> = availability
+// (dnd while a run is in flight, available when idle); presence <status> = the
+// current activity label (thinking / running a tool / replying / retrying).
 func (b *Bridge) handleRPCEvent(ev Event) {
 	switch ev.Type() {
 	case "agent_start":
 		b.setStreaming(true)
 		b.setReplied(false)
-		b.startTyping()
-		b.xmpp.SetPresence("working…")
+		b.xmpp.SetPresence("dnd", "thinking…")
 	case "agent_settled":
 		b.setStreaming(false)
 		b.stopTyping()
-		b.xmpp.SetPresence("listening")
+		b.xmpp.SetPresence("", "listening")
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		if !b.replied() {
 			b.reply("✅ done (no reply) — your turn")
 		}
+	case "message_update":
+		b.handleStreamDelta(ev)
+	case "tool_execution_start":
+		// A tool is running, not text streaming: drop the typing bubble and
+		// label the activity.
+		b.stopTyping()
+		b.xmpp.SetPresence("dnd", toolLabel(ev))
+	case "auto_retry_start":
+		b.stopTyping()
+		b.xmpp.SetPresence("dnd", "retrying (transient error)…")
+	case "auto_retry_end":
+		b.xmpp.SetPresence("dnd", "thinking…")
 	case "message_end":
 		msg := ev.Obj("message")
 		if msg == nil || msg.Str("role") != "assistant" {
@@ -258,7 +274,9 @@ func (b *Bridge) handleCanonical(text string) {
 		return
 	}
 	b.rpc.Prompt(b.composePrompt(t, true, ""), b.steerBehavior())
-	b.startTyping()
+	// Immediate "got it, working" ack; agent_start confirms it shortly (deduped).
+	// Typing is no longer lit here — it now tracks literal text streaming.
+	b.xmpp.SetPresence("dnd", "thinking…")
 }
 
 // dispatchCommentary sends a non-owner addressed message as an untrusted
@@ -270,7 +288,7 @@ func (b *Bridge) dispatchCommentary(body, nick string) {
 		return
 	}
 	b.rpc.Prompt(b.composePrompt(t, false, nick), b.steerBehavior())
-	b.startTyping()
+	b.xmpp.SetPresence("dnd", "thinking…")
 }
 
 // handleCommand runs a recognized control command and returns true. Unknown
@@ -421,6 +439,54 @@ func (b *Bridge) reportResult(err error, res Event, okMsg, cmd string) {
 	b.reply(fmt.Sprintf("⚠️ %s failed: %s", cmd, res.errText()))
 }
 
+// handleStreamDelta maps an assistant streaming delta (message_update) to the
+// typing indicator and status label. Typing is lit only between text_start and
+// text_end — i.e. only while words are actually being produced — so a "typing…"
+// bubble genuinely predicts an imminent message rather than "busy".
+func (b *Bridge) handleStreamDelta(ev Event) {
+	ame := ev.Obj("assistantMessageEvent")
+	if ame == nil {
+		return
+	}
+	switch ame.Str("type") {
+	case "thinking_start":
+		b.xmpp.SetPresence("dnd", "thinking…")
+	case "text_start":
+		b.xmpp.SetPresence("dnd", "replying…")
+		b.startTyping()
+	case "text_end":
+		b.stopTyping()
+	}
+}
+
+// toolLabel renders a short "running <tool>" status from a tool_execution_start
+// event, appending a command snippet for bash.
+func toolLabel(ev Event) string {
+	name := ev.Str("toolName")
+	if name == "" {
+		return "running a tool…"
+	}
+	if name == "bash" {
+		if args := ev.Obj("args"); args != nil {
+			if cmd := strings.TrimSpace(args.Str("command")); cmd != "" {
+				return "running: " + truncateLabel(cmd, 40)
+			}
+		}
+	}
+	return "running " + name
+}
+
+// truncateLabel collapses newlines and rune-safely caps s to max characters for
+// use in a one-line presence status.
+func truncateLabel(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
+}
+
 // --- typing indicator ---
 
 func (b *Bridge) startTyping() {
@@ -472,7 +538,7 @@ func (b *Bridge) stopTyping() {
 func (b *Bridge) settleLocally() {
 	b.setStreaming(false)
 	b.stopTyping()
-	b.xmpp.SetPresence("listening")
+	b.xmpp.SetPresence("", "listening")
 }
 
 // --- small state accessors ---
