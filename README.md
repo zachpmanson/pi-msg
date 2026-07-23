@@ -79,6 +79,17 @@ npm install
 node src/bridge.ts           # or: npm link  &&  pi-msg   (from anywhere)
 ```
 
+### Nix
+
+```bash
+nix run github:zachpmanson/pi-msg      # run the bridge
+nix build github:zachpmanson/pi-msg    # build the package (bin: pi-msg)
+```
+
+Dev shell (Node 22 + TypeScript) via `nix develop`, or automatically with
+[direnv](https://direnv.net/) — the repo ships a `.envrc` (`use flake`); run
+`direnv allow` once.
+
 Set `PI_MSG_DEBUG=1` to print connection/status/stderr diagnostics. On startup you
 should see `🟢 pi-msg bridge up` in your chat client.
 
