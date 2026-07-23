@@ -283,6 +283,7 @@ func (b *Bridge) handleCommand(t string) bool {
 		if b.streaming() {
 			b.rpc.Abort()
 		}
+		b.settleLocally()
 		res, err := b.rpc.NewSession(b.ctx)
 		b.reportResult(err, res, "🆕 new session ready", "/new")
 	case "compact":
@@ -295,6 +296,7 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.handleModel(arg)
 	case "abort", "stop":
 		b.rpc.Abort()
+		b.settleLocally()
 		b.reply("⛔ aborted")
 	case "quit", "exit":
 		b.shutdown("requested over chat")
@@ -458,6 +460,19 @@ func (b *Bridge) stopTyping() {
 		b.typingStop = nil
 	}
 	b.xmpp.ChatState("active")
+}
+
+// settleLocally resets run-scoped UI (streaming flag, typing indicator,
+// presence) when a control command ends the current run directly. Pi answers
+// `abort` with an `error`(aborted) event rather than `agent_settled`, so the
+// normal agent_settled cleanup never fires for an aborted run — otherwise the
+// typing goroutine keeps re-asserting "composing" (and presence stays
+// "working…") into the next session. Idempotent and mutex-guarded, so it's
+// safe if a late agent_settled also arrives.
+func (b *Bridge) settleLocally() {
+	b.setStreaming(false)
+	b.stopTyping()
+	b.xmpp.SetPresence("listening")
 }
 
 // --- small state accessors ---
