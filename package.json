@@ -1,0 +1,29 @@
+{
+  "name": "pi-msg",
+  "version": "0.2.0",
+  "description": "Bridge the Pi coding agent to XMPP: drive Pi entirely from a chat client (spawns `pi --mode rpc`).",
+  "keywords": [
+    "pi",
+    "xmpp",
+    "chat",
+    "rpc",
+    "agent"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "pi-msg": "src/bridge.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "@xmpp/client": "^0.13.5",
+    "saslmechanisms": "^0.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/xmpp__client": "^0.13.4",
+    "typescript": "^5.6.0"
+  }
+}
