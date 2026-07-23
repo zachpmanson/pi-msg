@@ -12,7 +12,11 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "pi-msg": "src/bridge.ts"
+    "pi-msg": "dist/bridge.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
   },
   "engines": {
     "node": ">=22.18"
