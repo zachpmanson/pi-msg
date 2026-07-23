@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# Go build output (bin name matches the module/dir)
+/pi-msg
 *.log
 .DS_Store
 result

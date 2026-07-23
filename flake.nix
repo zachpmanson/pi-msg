@@ -17,17 +17,14 @@
     {
       packages = forAllSystems (pkgs: rec {
         default = pi-msg;
-        pi-msg = pkgs.buildNpmPackage {
+        pi-msg = pkgs.buildGoModule {
           pname = "pi-msg";
-          version = "0.2.0";
+          version = "0.3.0";
           src = ./.;
-          npmDepsHash = "sha256-gYx/oiDnnYZDvREj/Ff7ZhHe8cntu7lNVWedO75NWd0=";
-          # `npm run build` (tsc) compiles src/*.ts -> dist/*.js. We can't rely on
-          # Node's runtime type-stripping here: the installed package lives under
-          # node_modules, and Node refuses to strip types for files under
-          # node_modules. The bin (package.json) points at dist/bridge.js; tsc
-          # preserves its shebang and patchShebangs pins this node into it.
-          nodejs = pkgs.nodejs_22;
+          # Hash of the Go module dependencies. Bump when go.mod/go.sum change:
+          # set to pkgs.lib.fakeHash, run `nix build`, and copy the reported hash.
+          vendorHash = "sha256-sqeYJ140P0Ke6ZuqBMrzQoBhTNATCzP7MbIVhvenl/k=";
+          # Single static bin from package main at the module root.
           meta = {
             description = "Bridge the Pi coding agent to XMPP.";
             homepage = "https://github.com/zachpmanson/pi-msg";
@@ -40,11 +37,11 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = [
-            pkgs.nodejs_22
-            pkgs.typescript
+            pkgs.go
+            pkgs.gopls
           ];
           shellHook = ''
-            echo "pi-msg dev shell — node $(node --version)"
+            echo "pi-msg dev shell — $(go version)"
           '';
         };
       });

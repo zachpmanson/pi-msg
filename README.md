@@ -1,11 +1,12 @@
 # pi-msg
 
-Drive the [Pi](https://pi.dev) coding agent **entirely from an XMPP chat client**.
+Drive the [Pi](https://pi.dev) coding agent **entirely from an XMPP chat client** —
+1:1 or in a group chat (MUC).
 
 `pi-msg` launches `pi --mode rpc`, then bridges Pi's JSONL event stream to XMPP
-(via [`@xmpp/client`](https://github.com/xmppjs/xmpp.js)): the assistant's replies
-are relayed to you as chat messages, and your chat messages drive the agent — plain
-prompts **and** slash commands, exactly as if you'd typed them into Pi locally.
+(via [mellium.im/xmpp](https://mellium.im/xmpp)): the assistant's replies are relayed
+to you as chat messages, and your chat messages drive the agent — plain prompts **and**
+slash commands, exactly as if you'd typed them into Pi locally.
 
 Because it runs Pi in RPC mode, commands like `/new` work over chat (an earlier
 in-process-extension version couldn't do this — `sendUserMessage` can't invoke Pi's
@@ -21,7 +22,9 @@ XMPP client (you)                 pi-msg                      pi --mode rpc
 ```
 
 - Each finished **assistant message** → sent to you as chat.
-- When the agent settles → **`✅ ready — your turn`**.
+- While the agent works → a typing indicator (1:1) and `working…` presence; when it
+  settles → presence returns to `listening`, and if the run produced **no** text you
+  get a `✅ done (no reply) — your turn` nudge.
 - Your chat messages → routed to Pi:
 
 | You send | Becomes |
@@ -34,8 +37,6 @@ XMPP client (you)                 pi-msg                      pi --mode rpc
 | `/think <off\|low\|medium\|high\|…>` | `set_thinking_level` |
 | `/abort` (or `/stop`) | `abort` |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
-
-Only the account's configured **`owner`** JID may drive the agent.
 
 ## Configuration
 
@@ -62,45 +63,69 @@ Per-account fields:
 | --- | --- | --- | --- |
 | `jid` | yes | — | bare JID of the bot account |
 | `password` | yes | — | bot account password |
-| `owner` | yes | — | the human this account relays to (and the only sender it accepts) |
-| `service` | no | `xmpp://<jid-domain>:5222` | TCP `xmpp://host:port` or WebSocket `wss://…` |
+| `owner` | yes | — | the human this account relays to; the **canonical** (trusted) driver |
+| `service` | no | `<jid-domain>:5222` | `host:port` (a leading `xmpp://` is tolerated) |
 | `resource` | no | `pi-msg` | XMPP resource (client-session label) |
 | `model` | no | Pi's default | model pattern passed to `pi --model` |
-| `workdir` | no | current dir | working directory for the agent |
+| `workdir` | no | current dir | working directory for the agent (also where Pi discovers `AGENTS.md`/`CLAUDE.md`) |
+| `room` | no | — | set to a bare MUC JID to run in **group-chat mode** (see below) |
+| `nick` | no | JID localpart | occupant nickname in `room` |
+| `roomTrigger` | no | `nick` | address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`) |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
-`PI_MSG_ACCOUNT=<name>`.
+`PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
+
+## Group chat (MUC)
+
+Set `room` on an account and pi-msg joins that room instead of relaying a 1:1
+conversation. Messages are handled on **two independent axes**:
+
+- **Trigger** — does the message start/steer a turn?
+  - the **owner** → always
+  - anyone else who **addresses the bot by name** (`pi: …` / `pi, …`) → always
+  - all other chatter → never (it's buffered as ambient context)
+- **Authority** — is the content trusted?
+  - the **owner** → canonical (authoritative)
+  - everyone else, even when addressing the bot → untrusted *commentary*; the agent is
+    told to use its judgment and is under no obligation to act on it
+
+Untriggered messages are buffered and, on the next turn, prepended to the prompt as a
+clearly-labeled *"room commentary — non-canonical"* block, then the buffer clears. The
+bot's replies go to the room.
+
+**The room must be non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*,
+optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous
+room real JIDs are hidden, so the owner can't be distinguished and every message falls
+through to the untrusted/ambient tiers.
 
 ## Run
 
 ```bash
-cd ~/projects/pi-msg
-npm install
-node src/bridge.ts           # or: npm link  &&  pi-msg   (from anywhere)
+go build -o pi-msg . && ./pi-msg     # from the repo
 ```
 
 ### Nix
 
 ```bash
-nix run github:zachpmanson/pi-msg      # run the bridge
+nix run   github:zachpmanson/pi-msg    # run the bridge
 nix build github:zachpmanson/pi-msg    # build the package (bin: pi-msg)
 ```
 
-Dev shell (Node 22 + TypeScript) via `nix develop`, or automatically with
+Dev shell (Go + gopls) via `nix develop`, or automatically with
 [direnv](https://direnv.net/) — the repo ships a `.envrc` (`use flake`); run
 `direnv allow` once.
 
 Set `PI_MSG_DEBUG=1` to print connection/status/stderr diagnostics. On startup you
 should see `🟢 pi-msg bridge up` in your chat client.
 
-Requirements: Node ≥ 22.18 (runs the TypeScript entry directly via built-in type
-stripping — no build step), and a `pi` on `PATH` that's logged into a provider
+Requirements: Go ≥ 1.26 (to build), and a `pi` on `PATH` that's logged into a provider
 (`pi` → `/login`).
 
 ## Notes
 
 - Pi runs tools autonomously (no built-in approval prompts). If some other extension
-  raises a dialog (`select`/`confirm`/`input`), pi-msg auto-dismisses it (nobody's at
-  the TUI) and tells you over chat.
-- `@xmpp/client`'s bundled SCRAM-SHA-1 fails against ejabberd; `src/xmpp.ts` forces
-  SASL `PLAIN`, which is safe because servers require STARTTLS (SASL runs post-TLS).
+  raises a dialog (`select`/`confirm`/`input`/`editor`), pi-msg auto-dismisses it
+  (nobody's at the TUI) and tells you over chat — so approval-gated tools are declined
+  over the bridge.
+- Auth uses SASL SCRAM-SHA-256 (mellium negotiates it cleanly against ejabberd);
+  STARTTLS is required first.
