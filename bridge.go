@@ -79,7 +79,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			b.shutdown("signal")
+			b.shutdown("interrupted (SIGINT/SIGTERM)")
 			return nil
 		case ev, ok := <-b.rpc.Events():
 			if !ok {
@@ -106,8 +106,21 @@ func (b *Bridge) onPiExit() error {
 	if b.rpc.StoppedIntentionally() {
 		return nil
 	}
-	b.reply(fmt.Sprintf("🔴 pi exited (%v). Bridge shutting down.", b.rpc.ExitErr()))
-	return fmt.Errorf("pi exited: %v", b.rpc.ExitErr())
+	// pi died on its own (crash): XMPP is still connected, so clear the typing
+	// indicator, report the exit error if there is one, and drop presence — in
+	// that order, while still online.
+	b.stopTyping()
+	err := b.rpc.ExitErr()
+	if err != nil {
+		b.reply(fmt.Sprintf("🔴 pi crashed: %v. Bridge shutting down.", err))
+	} else {
+		b.reply("🔴 pi exited unexpectedly (no error reported). Bridge shutting down.")
+	}
+	b.xmpp.GoOffline()
+	if err != nil {
+		return fmt.Errorf("pi exited: %v", err)
+	}
+	return fmt.Errorf("pi exited unexpectedly")
 }
 
 func (b *Bridge) shutdown(reason string) {
@@ -119,7 +132,10 @@ func (b *Bridge) shutdown(reason string) {
 	b.shuttingDown = true
 	b.mu.Unlock()
 	b.log("info", "shutting down: "+reason)
-	b.reply("🔴 session ended")
+	// Clear the typing indicator (sends chat-state "active") while still online,
+	// so the owner isn't left seeing "typing…" against an offline bot.
+	b.stopTyping()
+	b.reply("🔴 session ended gracefully — " + reason + ".")
 	b.xmpp.GoOffline()
 	b.rpc.Stop()
 }
