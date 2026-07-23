@@ -120,6 +120,7 @@ func (b *Bridge) shutdown(reason string) {
 	b.mu.Unlock()
 	b.log("info", "shutting down: "+reason)
 	b.reply("🔴 session ended")
+	b.xmpp.GoOffline()
 	b.rpc.Stop()
 }
 
