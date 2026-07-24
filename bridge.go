@@ -368,7 +368,7 @@ func (b *Bridge) dumpSession() {
 // routingHint tells the agent, when the account has room access, that every
 // reply must begin with an explicit "to: <jid>" line, and how to choose it.
 func (b *Bridge) routingHint() string {
-	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above; to DM the person who sent it, use their \"sender:\" jid (if shown); to reach your owner, use to: %s. You may include several \"to: <jid>\" blocks in one reply to send different parts to different destinations — each \"to:\" line starts a new message. Any text with no valid \"to:\" line is sent to the owner.]", b.acct.Owner)
+	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above; to DM the person who sent it, use their \"sender:\" jid (if shown); to reach your owner, use to: %s. You may include several \"to: <jid>\" blocks in one reply to send different parts to different destinations — each \"to:\" line starts a new message. To attach a file, add a line \"file: <absolute path>\" inside a \"to:\" block. Any text with no valid \"to:\" line is sent to the owner.]", b.acct.Owner)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -485,16 +485,26 @@ func (b *Bridge) deliverReply(text string) {
 		b.rejectReply(leading, "this text came before the first \"to:\" line, so it had no destination")
 	}
 	for _, s := range segs {
-		if strings.TrimSpace(s.body) == "" {
+		kind := b.xmpp.classifyDest(s.dest)
+		if kind == destBlocked {
+			note := s.body
+			if note == "" {
+				note = fmt.Sprintf("(a file attachment: %s)", strings.Join(s.files, ", "))
+			}
+			b.rejectReply(note, fmt.Sprintf("%q is not an allowed destination", s.dest))
 			continue
 		}
-		switch b.xmpp.classifyDest(s.dest) {
-		case destRoom:
-			b.xmpp.SendRoomTo(bareJid(s.dest), s.body)
-		case destUser:
-			b.xmpp.SendChatTo(s.dest, s.body)
-		default:
-			b.rejectReply(s.body, fmt.Sprintf("%q is not an allowed destination", s.dest))
+		if s.body != "" {
+			if kind == destRoom {
+				b.xmpp.SendRoomTo(bareJid(s.dest), s.body)
+			} else {
+				b.xmpp.SendChatTo(s.dest, s.body)
+			}
+		}
+		for _, path := range s.files {
+			if err := b.xmpp.SendFile(s.dest, path); err != nil {
+				b.reply(fmt.Sprintf("⚠️ couldn't send file %q to %s: %v", path, s.dest, err))
+			}
 		}
 	}
 }
@@ -526,18 +536,20 @@ func (b *Bridge) bumpRoutingNudge() bool {
 
 func (b *Bridge) resetRoutingNudges() { b.mu.Lock(); b.routingNudges = 0; b.mu.Unlock() }
 
-// replySegment is one routed chunk of an agent reply: a destination jid and the
-// text to send there.
+// replySegment is one routed chunk of an agent reply: a destination jid, the
+// text to send there, and any files to upload and attach.
 type replySegment struct {
-	dest string
-	body string
+	dest  string
+	body  string
+	files []string
 }
 
 // splitReplySegments parses an agent reply into "to: <jid>" segments. A line
 // whose first token after "to:" looks like a jid (contains "@") starts a new
-// segment; its body is that line's remainder plus subsequent lines up to the
-// next such line. Text before the first "to:" line is returned as leading (a
-// routing error). This lets one agent output fan out to several destinations.
+// segment; a "file: <path>" line within a segment attaches a file; other lines
+// form the body (that line's remainder plus subsequent lines up to the next
+// "to:"). Text before the first "to:" line is returned as leading (a routing
+// error). This lets one agent output fan out to several destinations.
 func splitReplySegments(text string) (segs []replySegment, leading string) {
 	var leadingLines []string
 	cur := -1
@@ -552,6 +564,10 @@ func splitReplySegments(text string) (segs []replySegment, leading string) {
 			leadingLines = append(leadingLines, line)
 			continue
 		}
+		if path, ok := fileLine(line); ok {
+			segs[cur].files = append(segs[cur].files, path)
+			continue
+		}
 		if segs[cur].body == "" {
 			segs[cur].body = line
 		} else {
@@ -562,6 +578,18 @@ func splitReplySegments(text string) (segs []replySegment, leading string) {
 		segs[i].body = strings.TrimSpace(segs[i].body)
 	}
 	return segs, strings.TrimSpace(strings.Join(leadingLines, "\n"))
+}
+
+// fileLine reports whether line is a "file: <path>" attachment directive and
+// returns the path.
+func fileLine(line string) (path string, ok bool) {
+	t := strings.TrimSpace(line)
+	const p = "file:"
+	if len(t) < len(p) || !strings.EqualFold(t[:len(p)], p) {
+		return "", false
+	}
+	path = strings.TrimSpace(t[len(p):])
+	return path, path != ""
 }
 
 // routeLine reports whether line is a "to: <jid>" routing directive, returning

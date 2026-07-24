@@ -7,7 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
+	"io"
+	"mime"
 	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,8 +20,10 @@ import (
 	"mellium.im/sasl"
 	"mellium.im/xmlstream"
 	"mellium.im/xmpp"
+	"mellium.im/xmpp/disco"
 	"mellium.im/xmpp/jid"
 	"mellium.im/xmpp/stanza"
+	"mellium.im/xmpp/upload"
 )
 
 // maxBody is a soft cap for a single outgoing message body; longer text is
@@ -117,6 +124,9 @@ type XMPPBridge struct {
 	// MUC occupant tracking (room mode), keyed by room bare JID.
 	occupants map[string]map[string]string // roomBare -> nick -> bare real JID
 	selfNick  map[string]string            // roomBare -> our nick (per status code 110)
+
+	uploadMu  sync.Mutex
+	uploadSvc string // resolved XEP-0363 upload component JID (cached)
 }
 
 // NewXMPPBridge constructs a bridge. onMsg is called for each message that
@@ -715,6 +725,147 @@ func (b *XMPPBridge) SendRoomTo(room, text string) {
 			break
 		}
 	}
+}
+
+// SendFile uploads a local file via XEP-0363 and sends its URL to `to` as an
+// XEP-0066 out-of-band message (groupchat if `to` is a joined room, else 1:1),
+// so the recipient's client shows it as a downloadable file.
+func (b *XMPPBridge) SendFile(to, path string) error {
+	session := b.currentSession()
+	if session == nil {
+		return fmt.Errorf("not online")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if fi.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	svc, err := b.uploadService(ctx)
+	if err != nil {
+		return err
+	}
+	svcJID, err := jid.Parse(svc)
+	if err != nil {
+		return fmt.Errorf("invalid upload service %q: %w", svc, err)
+	}
+	name := filepath.Base(path)
+	ctype := mime.TypeByExtension(filepath.Ext(name))
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	slot, err := upload.GetSlot(ctx, upload.File{Name: name, Size: int(fi.Size()), Type: ctype}, svcJID, session)
+	if err != nil {
+		return fmt.Errorf("requesting upload slot: %w", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	req, err := slot.Put(ctx, f)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = fi.Size()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("uploading file: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("upload rejected (HTTP %d)", resp.StatusCode)
+	}
+
+	typ := stanza.ChatMessage
+	if b.isRoomJID(bareJid(to)) {
+		typ = stanza.GroupChatMessage
+	}
+	return b.encodeOOB(to, slot.GetURL.String(), typ)
+}
+
+// uploadService resolves (and caches) the XEP-0363 upload component JID: the
+// configured one, else the first of upload.<domain> / httpupload.<domain> that
+// advertises the upload feature via disco#info.
+func (b *XMPPBridge) uploadService(ctx context.Context) (string, error) {
+	b.uploadMu.Lock()
+	cached := b.uploadSvc
+	b.uploadMu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+	session := b.currentSession()
+	if session == nil {
+		return "", fmt.Errorf("not online")
+	}
+	candidates := []string{b.acct.UploadService}
+	if b.acct.UploadService == "" {
+		domain := domainOf(b.acct.JID)
+		candidates = []string{"upload." + domain, "httpupload." + domain}
+	}
+	for _, c := range candidates {
+		toJID, err := jid.Parse(c)
+		if err != nil {
+			continue
+		}
+		info, err := disco.GetInfo(ctx, "", toJID, session)
+		if err != nil {
+			continue
+		}
+		for _, f := range info.Features {
+			if f.Var == upload.NS {
+				b.uploadMu.Lock()
+				b.uploadSvc = c
+				b.uploadMu.Unlock()
+				return c, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no XEP-0363 upload service found (set uploadService in config)")
+}
+
+// encodeOOB sends a message whose body is url plus an XEP-0066 <x> payload, so
+// clients render it as a file/link rather than plain text.
+func (b *XMPPBridge) encodeOOB(to, url string, typ stanza.MessageType) error {
+	session := b.currentSession()
+	if session == nil {
+		return fmt.Errorf("not online")
+	}
+	toJID, err := jid.Parse(to)
+	if err != nil {
+		return fmt.Errorf("invalid recipient %q: %w", to, err)
+	}
+	msg := struct {
+		stanza.Message
+		Body string `xml:"body"`
+		X    struct {
+			XMLName xml.Name `xml:"jabber:x:oob x"`
+			URL     string   `xml:"url"`
+		}
+	}{
+		Message: stanza.Message{ID: newStanzaID(), To: toJID, Type: typ},
+		Body:    url,
+	}
+	msg.X.URL = url
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return session.Encode(ctx, msg)
+}
+
+// domainOf returns the domain part of a JID (after '@', before '/').
+func domainOf(j string) string {
+	if at := strings.IndexByte(j, '@'); at >= 0 {
+		j = j[at+1:]
+	}
+	if slash := strings.IndexByte(j, '/'); slash >= 0 {
+		j = j[:slash]
+	}
+	return j
 }
 
 // joinRoom sends MUC join presence to room/nick, suppressing history replay

@@ -77,6 +77,7 @@ Per-account fields:
 | `room` | no | — | a bare MUC JID (or an **array** of them) to also join for **group chat** (see below) |
 | `nick` | no | JID localpart | occupant nickname used in the room(s) |
 | `roomTrigger` | no | `nick` | address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`) |
+| `uploadService` | no | auto-probed | XEP-0363 upload component JID for file transfer (e.g. `upload.chat.example.com`) |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
 `PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
@@ -132,6 +133,20 @@ Destinations are **allowlisted**: the owner, joined room(s), and real JIDs curre
 in a room. A reply whose `to:` is missing or points anywhere else is sent to the owner, so
 nothing is silently lost — the agent can't message arbitrary users. In a pure 1:1 account
 (no room) there are no prefixes; replies just go to the owner.
+
+**File transfer.** Inside a `to:` block the agent can attach files with `file: <path>`
+lines — pi-msg uploads each via **XEP-0363 HTTP Upload** and sends the resulting URL as an
+**XEP-0066** out-of-band message, so the recipient's client shows a downloadable file:
+
+```
+to: zach@chat.zachmanson.com
+Here's the diff and the build log.
+file: /home/beltino/work/change.patch
+file: /home/beltino/work/build.log
+```
+
+The upload component is discovered automatically (`upload.<domain>` / `httpupload.<domain>`)
+or set explicitly via the `uploadService` config field.
 
 **The room must be non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*,
 optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous

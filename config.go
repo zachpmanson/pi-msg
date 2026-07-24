@@ -68,6 +68,10 @@ type Account struct {
 	// message a prompt for the agent (e.g. "pi" matches "pi: …" / "pi, …").
 	// Defaults to Nick.
 	RoomTrigger string `json:"roomTrigger,omitempty"`
+	// UploadService is the XEP-0363 HTTP-upload component JID used for file
+	// transfer. Optional; if unset the bridge probes "upload.<domain>" and
+	// "httpupload.<domain>".
+	UploadService string `json:"uploadService,omitempty"`
 }
 
 // Config is the on-disk config: an arbitrary number of named accounts.
@@ -79,18 +83,19 @@ type Config struct {
 // ResolvedAccount is a fully-resolved account ready to connect with, defaults
 // applied. RoomMode reports whether any room was set.
 type ResolvedAccount struct {
-	Name         string
-	JID          string
-	Password     string
-	Owner        string
-	Service      string
-	Resource     string
-	ToolActivity bool
-	Model        string
-	Workdir      string
-	Rooms        []string
-	Nick         string
-	RoomTrigger  string
+	Name          string
+	JID           string
+	Password      string
+	Owner         string
+	Service       string
+	Resource      string
+	ToolActivity  bool
+	Model         string
+	Workdir       string
+	Rooms         []string
+	Nick          string
+	RoomTrigger   string
+	UploadService string
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
@@ -221,18 +226,19 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 	}
 
 	return ResolvedAccount{
-		Name:         name,
-		JID:          acct.JID,
-		Password:     acct.Password,
-		Owner:        acct.Owner,
-		Service:      service,
-		Resource:     resource,
-		ToolActivity: acct.ToolActivity,
-		Model:        acct.Model,
-		Workdir:      acct.Workdir,
-		Rooms:        rooms,
-		Nick:         nick,
-		RoomTrigger:  trigger,
+		Name:          name,
+		JID:           acct.JID,
+		Password:      acct.Password,
+		Owner:         acct.Owner,
+		Service:       service,
+		Resource:      resource,
+		ToolActivity:  acct.ToolActivity,
+		Model:         acct.Model,
+		Workdir:       acct.Workdir,
+		Rooms:         rooms,
+		Nick:          nick,
+		RoomTrigger:   trigger,
+		UploadService: strings.TrimSpace(acct.UploadService),
 	}, nil
 }
 

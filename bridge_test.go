@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestExtractText(t *testing.T) {
 	if got := extractText("  hi  "); got != "hi" {
@@ -89,7 +92,9 @@ func TestTruncateLabel(t *testing.T) {
 }
 
 func TestSplitReplySegments(t *testing.T) {
-	seg := func(dest, body string) replySegment { return replySegment{dest: dest, body: body} }
+	seg := func(dest, body string, files ...string) replySegment {
+		return replySegment{dest: dest, body: body, files: files}
+	}
 	cases := []struct {
 		name        string
 		in          string
@@ -106,6 +111,8 @@ func TestSplitReplySegments(t *testing.T) {
 			[]replySegment{seg("a@x.com", "blah blah"), seg("b@x.com", "more stuff")}, ""},
 		{"multiline body per segment", "to: a@x\nl1\nl2\nto: b@x\nm1",
 			[]replySegment{seg("a@x", "l1\nl2"), seg("b@x", "m1")}, ""},
+		{"file attachment", "to: zach@x\nfile: /tmp/diff.patch\nhere's the diff",
+			[]replySegment{seg("zach@x", "here's the diff", "/tmp/diff.patch")}, ""},
 		{"case insensitive", "TO: zach@x\nyo",
 			[]replySegment{seg("zach@x", "yo")}, ""},
 		{"leading junk before first to", "oops forgot\nto: a@x\nbody",
@@ -119,14 +126,8 @@ func TestSplitReplySegments(t *testing.T) {
 		if gotLeading != c.wantLeading {
 			t.Errorf("%s: leading = %q, want %q", c.name, gotLeading, c.wantLeading)
 		}
-		if len(gotSegs) != len(c.wantSegs) {
-			t.Errorf("%s: got %d segs, want %d (%+v)", c.name, len(gotSegs), len(c.wantSegs), gotSegs)
-			continue
-		}
-		for i := range gotSegs {
-			if gotSegs[i] != c.wantSegs[i] {
-				t.Errorf("%s: seg %d = %+v, want %+v", c.name, i, gotSegs[i], c.wantSegs[i])
-			}
+		if !reflect.DeepEqual(gotSegs, c.wantSegs) {
+			t.Errorf("%s: segs = %+v, want %+v", c.name, gotSegs, c.wantSegs)
 		}
 	}
 }
