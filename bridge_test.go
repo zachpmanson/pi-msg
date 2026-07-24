@@ -88,31 +88,26 @@ func TestTruncateLabel(t *testing.T) {
 	}
 }
 
-func TestReplyDirective(t *testing.T) {
-	room := NewBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"}, false)
-	solo := NewBridge(ResolvedAccount{Owner: "zach@x"}, false) // 1:1, no room
+func TestParseToPrefix(t *testing.T) {
 	cases := []struct {
 		name              string
-		b                 *Bridge
 		in                string
 		wantDest, wantOut string
 	}{
-		{"dm alias → owner", room, "@dm here are headlines", "zach@x", "here are headlines"},
-		{"owner alias", room, "@owner hi", "zach@x", "hi"},
-		{"room alias → room jid", room, "@room broadcast", "team@muc.x", "broadcast"},
-		{"to explicit user jid", room, "@to:alice@x hello", "alice@x", "hello"},
-		{"to explicit room jid", room, "@to:team@muc.x hey", "team@muc.x", "hey"},
-		{"newline after directive", room, "@dm\nline1\nline2", "zach@x", "line1\nline2"},
-		{"case insensitive", room, "@DM yo", "zach@x", "yo"},
-		{"leading whitespace", room, "  @room x", "team@muc.x", "x"},
-		{"no directive", room, "just a reply", "", "just a reply"},
-		{"mid-text not matched", room, "reply @dm inline", "", "reply @dm inline"},
-		{"ignored in 1:1 mode", solo, "@dm hi", "", "@dm hi"},
+		{"newline form", "to: room@muc.x\nhere are headlines", "room@muc.x", "here are headlines"},
+		{"no space after colon", "to:zach@x\nhi", "zach@x", "hi"},
+		{"space form", "to: alice@x hello there", "alice@x", "hello there"},
+		{"multiline body", "to: room@muc.x\nline1\nline2", "room@muc.x", "line1\nline2"},
+		{"case insensitive", "TO: zach@x\nyo", "zach@x", "yo"},
+		{"leading whitespace", "  to: room@muc.x\nx", "room@muc.x", "x"},
+		{"only a target, no body", "to: zach@x", "zach@x", ""},
+		{"no prefix", "just a reply", "", "just a reply"},
+		{"mid-text not matched", "reply to: someone later", "", "reply to: someone later"},
 	}
 	for _, c := range cases {
-		gotDest, gotOut := c.b.replyDirective(c.in)
+		gotDest, gotOut := parseToPrefix(c.in)
 		if gotDest != c.wantDest || gotOut != c.wantOut {
-			t.Errorf("%s: replyDirective(%q) = (%q, %q), want (%q, %q)", c.name, c.in, gotDest, gotOut, c.wantDest, c.wantOut)
+			t.Errorf("%s: parseToPrefix(%q) = (%q, %q), want (%q, %q)", c.name, c.in, gotDest, gotOut, c.wantDest, c.wantOut)
 		}
 	}
 }

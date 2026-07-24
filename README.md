@@ -102,20 +102,25 @@ axes**:
 Untriggered messages are buffered and, on the next turn, prepended to the prompt as a
 clearly-labeled *"room commentary — non-canonical"* block, then the buffer clears.
 
-**Reply routing.** By default a reply goes back to the channel the message came in on
-(a room message → the room; an owner DM → the DM). In room mode the agent can override
-this per message with a leading directive:
+**Reply routing (explicit `from:`/`to:`).** When an account has room access, routing is
+fully explicit — no guessing. Each prompt the agent receives leads with a header naming
+the message's origin:
 
-- `@dm` / `@owner` → privately to the owner
-- `@room` → the joined group chat
-- `@to:<jid>` → an explicit destination — a room (→ groupchat) or a person (→ 1:1)
+```
+from: <channel jid>     # the room (group msg) or the owner (DM) — reply here to answer in place
+sender: <person jid>    # room messages only, when the real JID is known — reply here to DM them
+<message body>
+```
 
-The prompt tells the agent about this, so e.g. "beltino: send me the headlines in a DM"
-makes it prefix its answer with `@dm`. Destinations are **allowlisted**: the owner, the
-joined room(s), and real JIDs currently seen in a room. A directive to any other JID is
-refused and the reply falls back to the source channel — the agent can't message
-arbitrary users. (`@to:<jid>` is the JID-native form; it generalizes to multiple rooms
-once multi-MUC lands.)
+And **every** agent reply must begin with a `to: <jid>` line naming its destination:
+
+- `to: <room jid>` → the group chat (groupchat)
+- `to: <owner or occupant jid>` → that person, 1:1
+
+Destinations are **allowlisted**: the owner, joined room(s), and real JIDs currently seen
+in a room. A reply whose `to:` is missing or points anywhere else is sent to the owner, so
+nothing is silently lost — the agent can't message arbitrary users. In a pure 1:1 account
+(no room) there are no prefixes; replies just go to the owner.
 
 **The room must be non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*,
 optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous
