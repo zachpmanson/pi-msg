@@ -82,8 +82,9 @@ Multiple accounts: add more keys under `accounts`; `default` is used unless you 
 
 ## Group chat (MUC)
 
-Set `room` on an account and pi-msg joins that room instead of relaying a 1:1
-conversation. Messages are handled on **two independent axes**:
+Set `room` on an account and pi-msg **also** joins that room. The owner can still
+DM the bot 1:1 in either mode — each reply goes back to whichever channel the
+message arrived on. Room messages are handled on **two independent axes**:
 
 - **Trigger** — does the message start/steer a turn?
   - the **owner** → always

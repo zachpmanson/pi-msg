@@ -90,6 +90,7 @@ type InboundMessage struct {
 	Nick      string // occupant nick (room mode), or "" for 1:1
 	RealJID   string // sender's bare real JID if known, else ""
 	FromOwner bool   // sender is the configured owner
+	Direct    bool   // arrived as a 1:1 chat, not groupchat (reply goes back 1:1)
 }
 
 // XMPPBridge owns a single account's XMPP connection: it maintains a
@@ -296,13 +297,24 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 	}
 }
 
-// dispatch applies delivery policy and forwards a message to onMsg.
+// dispatch applies delivery policy and forwards a message to onMsg. Routing is
+// by stanza type, not mode: groupchat goes to the room path (room mode only),
+// while 1:1 chat is always handled — so even in room mode the owner can DM the
+// bot and get a 1:1 reply.
 func (b *XMPPBridge) dispatch(m incomingMsg) {
-	if b.acct.RoomMode() {
-		b.dispatchRoom(m)
-		return
+	if m.typ == "groupchat" {
+		if b.acct.RoomMode() {
+			b.dispatchRoom(m)
+		}
+		return // stray groupchat outside room mode: ignore
 	}
-	// 1:1: only direct chat (or type-less) messages from the owner.
+	b.dispatchDirect(m)
+}
+
+// dispatchDirect forwards a 1:1 chat message from the owner. Works in both 1:1
+// and room mode.
+func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
+	// Only direct chat (or type-less) messages from the owner.
 	if m.typ != "" && m.typ != "chat" && m.typ != "normal" {
 		return
 	}
@@ -322,7 +334,7 @@ func (b *XMPPBridge) dispatch(m incomingMsg) {
 	}
 	// The agent is about to take this in — acknowledge it as read/delivered.
 	b.sendReceipts(m)
-	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true})
+	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true})
 }
 
 // dispatchRoom applies groupchat guards and forwards room messages to onMsg.

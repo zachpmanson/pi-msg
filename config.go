@@ -36,9 +36,10 @@ type Account struct {
 	// process cwd.
 	Workdir string `json:"workdir,omitempty"`
 
-	// Room, when set, switches the account into MUC (group-chat) mode: the
-	// bridge joins this bare MUC JID (e.g. "team@muc.chat.example.com") instead
-	// of relaying a 1:1 conversation with owner.
+	// Room, when set, additionally joins this bare MUC JID (e.g.
+	// "team@muc.chat.example.com") and relays group chat. The owner can still DM
+	// the bot 1:1 in either mode; each reply goes back to whichever channel the
+	// message arrived on.
 	Room string `json:"room,omitempty"`
 	// Nick is the occupant nickname used in Room. Defaults to the JID localpart.
 	Nick string `json:"nick,omitempty"`

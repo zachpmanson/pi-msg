@@ -29,6 +29,7 @@ type Bridge struct {
 	repliedThisRun bool
 	shuttingDown   bool
 	bannerSent     bool
+	replyToRoom    bool // reply channel for the active turn (room vs owner 1:1)
 
 	typingMu   sync.Mutex
 	typingStop chan struct{}
@@ -47,7 +48,9 @@ const ambientCap = 50
 
 // NewBridge constructs a bridge for the resolved account.
 func NewBridge(acct ResolvedAccount, debug bool) *Bridge {
-	return &Bridge{acct: acct, debug: debug}
+	// Unsolicited output (startup banner, shutdown/crash notices) defaults to
+	// the room in room mode, else the owner; per-message routing overrides this.
+	return &Bridge{acct: acct, debug: debug, replyToRoom: acct.RoomMode()}
 }
 
 func (b *Bridge) log(level, msg string) {
@@ -215,11 +218,14 @@ func (b *Bridge) handleUIRequest(ev Event) {
 // commands that need a response block only this handler, not pi's event
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
-	if b.acct.RoomMode() {
-		b.handleRoom(m)
+	// Point replies at the channel this message arrived on: a 1:1 DM gets a 1:1
+	// reply, a groupchat message gets a room reply — even in room mode.
+	b.setReplyToRoom(!m.Direct)
+	if m.Direct {
+		b.handleCanonical(m.Body) // owner DM is always canonical
 		return
 	}
-	b.handleCanonical(m.Body) // 1:1 owner is always canonical
+	b.handleRoom(m)
 }
 
 // roomAction is how a room message is treated under the two-axis model.
@@ -390,15 +396,18 @@ func (b *Bridge) drainAmbient() string {
 	return sb.String()
 }
 
-// reply sends an outward bridge message to the active channel: the room in
-// room mode, else the owner 1:1.
+// reply sends an outward bridge message to the current reply channel: the room
+// or the owner 1:1, tracking whichever channel the active turn came in on.
 func (b *Bridge) reply(text string) {
-	if b.acct.RoomMode() {
+	if b.replyGoesToRoom() {
 		b.xmpp.SendRoom(text)
 		return
 	}
 	b.xmpp.Send(text)
 }
+
+func (b *Bridge) setReplyToRoom(v bool) { b.mu.Lock(); b.replyToRoom = v; b.mu.Unlock() }
+func (b *Bridge) replyGoesToRoom() bool { b.mu.Lock(); defer b.mu.Unlock(); return b.replyToRoom }
 
 func (b *Bridge) handleModel(arg string) {
 	if arg == "" {
