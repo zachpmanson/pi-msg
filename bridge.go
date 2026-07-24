@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -371,11 +372,14 @@ func (b *Bridge) dumpSession(arg string) {
 	b.reply(string(raw))
 }
 
-// prettyDump reformats a session's JSONL into something more human-readable:
-// one indented JSON block per record, each under a header naming its record
-// index and any role/type field. Non-JSON lines are passed through unchanged.
+// prettyDump reformats a session's JSONL into a compact table — one row per
+// record with its index, time, kind (message role, or record type), and a
+// one-line detail preview. Wrapped in a code fence so styling-aware clients
+// render it monospace.
 func prettyDump(raw []byte) string {
-	var sb strings.Builder
+	type row struct{ idx, tm, kind, detail string }
+	var rows []row
+	kindW := len("KIND")
 	i := 0
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
@@ -383,31 +387,89 @@ func prettyDump(raw []byte) string {
 			continue
 		}
 		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			fmt.Fprintf(&sb, "\n%s\n", line)
+		if json.Unmarshal([]byte(line), &obj) != nil {
 			continue
 		}
-		label := ""
-		if r, _ := obj["role"].(string); r != "" {
-			label = r
+		tm, kind, detail := recordRow(Event(obj))
+		if len(kind) > kindW {
+			kindW = len(kind)
 		}
-		if t, _ := obj["type"].(string); t != "" {
-			if label != "" {
-				label += " · "
-			}
-			label += t
-		}
-		if label != "" {
-			label = " " + label
-		}
-		indented, err := json.MarshalIndent(obj, "", "  ")
-		if err != nil {
-			indented = []byte(line)
-		}
-		fmt.Fprintf(&sb, "\n──── [%d]%s ────\n%s\n", i, label, indented)
+		rows = append(rows, row{strconv.Itoa(i), tm, kind, truncateLabel(detail, 70)})
 		i++
 	}
+	if len(rows) == 0 {
+		return "(no records)"
+	}
+	var sb strings.Builder
+	sb.WriteString("```\n")
+	fmt.Fprintf(&sb, "%3s  %-8s  %-*s  %s\n", "#", "TIME", kindW, "KIND", "DETAIL")
+	for _, r := range rows {
+		fmt.Fprintf(&sb, "%3s  %-8s  %-*s  %s\n", r.idx, r.tm, kindW, r.kind, r.detail)
+	}
+	sb.WriteString("```")
 	return sb.String()
+}
+
+// recordRow summarizes one session JSONL record into (time, kind, detail) for
+// the pretty table. Kind is the message role for message records, else the
+// record type; detail is a one-line preview appropriate to the record.
+func recordRow(e Event) (tm, kind, detail string) {
+	if ts := e.Str("timestamp"); len(ts) >= 19 {
+		tm = ts[11:19] // HH:MM:SS from the ISO timestamp
+	}
+	switch typ := e.Str("type"); typ {
+	case "message":
+		msg := e.Obj("message")
+		role := msg.Str("role")
+		if role == "toolResult" {
+			return tm, "toolResult", "↳ " + msg.Str("toolName") + ": " + contentText(msg["content"])
+		}
+		return tm, role, contentText(msg["content"])
+	case "model_change":
+		return tm, "model", e.Str("provider") + "/" + e.Str("modelId")
+	case "thinking_level_change":
+		return tm, "thinking", e.Str("thinkingLevel")
+	case "compaction":
+		return tm, "compaction", "compacted: " + e.Str("summary")
+	case "session", "session_info":
+		if n := e.Str("name"); n != "" {
+			return tm, typ, n
+		}
+		return tm, typ, e.Str("cwd")
+	default:
+		return tm, typ, ""
+	}
+}
+
+// contentText renders a message's content (string or block array) to a compact
+// one-line preview: text verbatim, tool calls as "⚙ <name>", thinking as 💭.
+func contentText(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var parts []string
+		for _, it := range c {
+			m, ok := it.(map[string]any)
+			if !ok {
+				continue
+			}
+			e := Event(m)
+			switch e.Str("type") {
+			case "text":
+				parts = append(parts, e.Str("text"))
+			case "thinking":
+				parts = append(parts, "💭")
+			case "toolCall":
+				parts = append(parts, "⚙ "+e.Str("toolName"))
+			default:
+				parts = append(parts, "["+e.Str("type")+"]")
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return ""
+	}
 }
 
 // routingHint tells the agent, when the account has room access, that every

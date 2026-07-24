@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -170,5 +171,27 @@ func TestRoutingNudgeBound(t *testing.T) {
 	b.resetRoutingNudges()
 	if !b.bumpRoutingNudge() {
 		t.Error("after reset, a nudge should be allowed again")
+	}
+}
+
+func TestPrettyDump(t *testing.T) {
+	jsonl := strings.Join([]string{
+		`{"type":"session","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/proj"}`,
+		`{"type":"message","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"fix the build"}}`,
+		`{"type":"message","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"on it"},{"type":"toolCall","toolName":"bash"}]}}`,
+		`{"type":"message","timestamp":"2024-12-03T14:00:03.000Z","message":{"role":"toolResult","toolName":"bash","content":[{"type":"text","text":"exit 0"}]}}`,
+		`{"type":"model_change","timestamp":"2024-12-03T14:05:00.000Z","provider":"anthropic","modelId":"claude"}`,
+	}, "\n")
+	out := prettyDump([]byte(jsonl))
+	for _, want := range []string{
+		"TIME", "KIND", "DETAIL",
+		"14:00:01", "user", "fix the build",
+		"assistant", "on it ⚙ bash",
+		"toolResult", "↳ bash: exit 0",
+		"model", "anthropic/claude",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("prettyDump missing %q in:\n%s", want, out)
+		}
 	}
 }
