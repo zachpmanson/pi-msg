@@ -118,6 +118,16 @@ And **every** agent reply must begin with a `to: <jid>` line naming its destinat
 - `to: <room jid>` → the group chat (groupchat)
 - `to: <owner or occupant jid>` → that person, 1:1
 
+One reply may contain **several `to:` blocks** — each `to:` line starts a new message, so
+the agent can fan a single turn out to multiple destinations:
+
+```
+to: team@muc.chat.zachmanson.com
+Deploying now — back in 5.
+to: zach@chat.zachmanson.com
+(privately: the staging creds are stale, heads up)
+```
+
 Destinations are **allowlisted**: the owner, joined room(s), and real JIDs currently seen
 in a room. A reply whose `to:` is missing or points anywhere else is sent to the owner, so
 nothing is silently lost — the agent can't message arbitrary users. In a pure 1:1 account

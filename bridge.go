@@ -368,7 +368,7 @@ func (b *Bridge) dumpSession() {
 // routingHint tells the agent, when the account has room access, that every
 // reply must begin with an explicit "to: <jid>" line, and how to choose it.
 func (b *Bridge) routingHint() string {
-	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above. To DM the person who sent it, use their \"sender:\" jid (if shown). To reach your owner, use to: %s. A reply with no valid \"to:\" line is sent to the owner.]", b.acct.Owner)
+	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above; to DM the person who sent it, use their \"sender:\" jid (if shown); to reach your owner, use to: %s. You may include several \"to: <jid>\" blocks in one reply to send different parts to different destinations — each \"to:\" line starts a new message. Any text with no valid \"to:\" line is sent to the owner.]", b.acct.Owner)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -461,11 +461,12 @@ func (b *Bridge) reply(text string) {
 }
 
 // deliverReply routes one agent-produced message. In a pure 1:1 account it goes
-// to the owner. When the account has room access, the agent must begin the
-// message with an explicit "to: <jid>" line (see composePrompt's routing hint);
-// deliverReply strips it and sends to that jid (a joined room → groupchat, the
-// owner or a known occupant → 1:1). A missing or non-allowlisted target falls
-// back to the owner so nothing is silently lost.
+// to the owner verbatim. When the account has room access, the message is split
+// into one or more "to: <jid>" segments (see composePrompt's routing hint) and
+// each is delivered independently — a joined room → groupchat, the owner or a
+// known occupant → 1:1. Text with no "to:" line, text before the first "to:",
+// or a non-allowlisted target is forwarded to the owner with a note and the
+// agent is nudged to resend correctly.
 func (b *Bridge) deliverReply(text string) {
 	if !b.acct.RoomMode() {
 		if strings.TrimSpace(text) != "" {
@@ -473,21 +474,28 @@ func (b *Bridge) deliverReply(text string) {
 		}
 		return
 	}
-	dest, body := parseToPrefix(text)
-	if strings.TrimSpace(body) == "" {
+	segs, leading := splitReplySegments(text)
+	if len(segs) == 0 {
+		if body := strings.TrimSpace(text); body != "" {
+			b.rejectReply(body, "it had no \"to: <jid>\" routing line")
+		}
 		return
 	}
-	if dest == "" {
-		b.rejectReply(body, "it did not begin with a \"to: <jid>\" routing line")
-		return
+	if leading != "" {
+		b.rejectReply(leading, "this text came before the first \"to:\" line, so it had no destination")
 	}
-	switch b.xmpp.classifyDest(dest) {
-	case destRoom:
-		b.xmpp.SendRoomTo(bareJid(dest), body)
-	case destUser:
-		b.xmpp.SendChatTo(dest, body)
-	default:
-		b.rejectReply(body, fmt.Sprintf("%q is not an allowed destination", dest))
+	for _, s := range segs {
+		if strings.TrimSpace(s.body) == "" {
+			continue
+		}
+		switch b.xmpp.classifyDest(s.dest) {
+		case destRoom:
+			b.xmpp.SendRoomTo(bareJid(s.dest), s.body)
+		case destUser:
+			b.xmpp.SendChatTo(s.dest, s.body)
+		default:
+			b.rejectReply(s.body, fmt.Sprintf("%q is not an allowed destination", s.dest))
+		}
 	}
 }
 
@@ -518,19 +526,61 @@ func (b *Bridge) bumpRoutingNudge() bool {
 
 func (b *Bridge) resetRoutingNudges() { b.mu.Lock(); b.routingNudges = 0; b.mu.Unlock() }
 
-// parseToPrefix peels a leading "to: <jid>" routing line off an agent message,
-// returning the target jid ("" if absent) and the remaining body. Tolerates the
-// jid being followed by a newline or a space.
-func parseToPrefix(text string) (dest, body string) {
-	t := strings.TrimLeft(text, " \t\r\n")
+// replySegment is one routed chunk of an agent reply: a destination jid and the
+// text to send there.
+type replySegment struct {
+	dest string
+	body string
+}
+
+// splitReplySegments parses an agent reply into "to: <jid>" segments. A line
+// whose first token after "to:" looks like a jid (contains "@") starts a new
+// segment; its body is that line's remainder plus subsequent lines up to the
+// next such line. Text before the first "to:" line is returned as leading (a
+// routing error). This lets one agent output fan out to several destinations.
+func splitReplySegments(text string) (segs []replySegment, leading string) {
+	var leadingLines []string
+	cur := -1
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if dest, inline, ok := routeLine(line); ok {
+			segs = append(segs, replySegment{dest: dest, body: inline})
+			cur = len(segs) - 1
+			continue
+		}
+		if cur < 0 {
+			leadingLines = append(leadingLines, line)
+			continue
+		}
+		if segs[cur].body == "" {
+			segs[cur].body = line
+		} else {
+			segs[cur].body += "\n" + line
+		}
+	}
+	for i := range segs {
+		segs[i].body = strings.TrimSpace(segs[i].body)
+	}
+	return segs, strings.TrimSpace(strings.Join(leadingLines, "\n"))
+}
+
+// routeLine reports whether line is a "to: <jid>" routing directive, returning
+// the jid and any inline body after it. The jid must contain "@" so ordinary
+// prose beginning with "to:" isn't mistaken for a route.
+func routeLine(line string) (dest, inline string, ok bool) {
+	t := strings.TrimLeft(line, " \t")
 	if len(t) < len("to:") || !strings.EqualFold(t[:len("to:")], "to:") {
-		return "", text
+		return "", "", false
 	}
 	after := strings.TrimLeft(t[len("to:"):], " \t")
-	if i := strings.IndexAny(after, " \t\r\n"); i >= 0 {
-		return strings.TrimSpace(after[:i]), strings.TrimSpace(after[i:])
+	jid := after
+	if i := strings.IndexAny(after, " \t"); i >= 0 {
+		jid, inline = after[:i], strings.TrimSpace(after[i:])
 	}
-	return strings.TrimSpace(after), ""
+	if !strings.Contains(jid, "@") {
+		return "", "", false
+	}
+	return jid, inline, true
 }
 
 func (b *Bridge) setDirectTurn(v bool) { b.mu.Lock(); b.directTurn = v; b.mu.Unlock() }

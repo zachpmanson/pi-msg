@@ -88,26 +88,45 @@ func TestTruncateLabel(t *testing.T) {
 	}
 }
 
-func TestParseToPrefix(t *testing.T) {
+func TestSplitReplySegments(t *testing.T) {
+	seg := func(dest, body string) replySegment { return replySegment{dest: dest, body: body} }
 	cases := []struct {
-		name              string
-		in                string
-		wantDest, wantOut string
+		name        string
+		in          string
+		wantSegs    []replySegment
+		wantLeading string
 	}{
-		{"newline form", "to: room@muc.x\nhere are headlines", "room@muc.x", "here are headlines"},
-		{"no space after colon", "to:zach@x\nhi", "zach@x", "hi"},
-		{"space form", "to: alice@x hello there", "alice@x", "hello there"},
-		{"multiline body", "to: room@muc.x\nline1\nline2", "room@muc.x", "line1\nline2"},
-		{"case insensitive", "TO: zach@x\nyo", "zach@x", "yo"},
-		{"leading whitespace", "  to: room@muc.x\nx", "room@muc.x", "x"},
-		{"only a target, no body", "to: zach@x", "zach@x", ""},
-		{"no prefix", "just a reply", "", "just a reply"},
-		{"mid-text not matched", "reply to: someone later", "", "reply to: someone later"},
+		{"single newline form", "to: room@muc.x\nhere are headlines",
+			[]replySegment{seg("room@muc.x", "here are headlines")}, ""},
+		{"no space after colon", "to:zach@x\nhi",
+			[]replySegment{seg("zach@x", "hi")}, ""},
+		{"inline body", "to: alice@x hello there",
+			[]replySegment{seg("alice@x", "hello there")}, ""},
+		{"two segments", "to: a@x.com\nblah blah\nto: b@x.com\nmore stuff",
+			[]replySegment{seg("a@x.com", "blah blah"), seg("b@x.com", "more stuff")}, ""},
+		{"multiline body per segment", "to: a@x\nl1\nl2\nto: b@x\nm1",
+			[]replySegment{seg("a@x", "l1\nl2"), seg("b@x", "m1")}, ""},
+		{"case insensitive", "TO: zach@x\nyo",
+			[]replySegment{seg("zach@x", "yo")}, ""},
+		{"leading junk before first to", "oops forgot\nto: a@x\nbody",
+			[]replySegment{seg("a@x", "body")}, "oops forgot"},
+		{"prose to: without @ is not a route", "to: whom it may concern\nhello",
+			nil, "to: whom it may concern\nhello"},
+		{"no routing at all", "just a reply", nil, "just a reply"},
 	}
 	for _, c := range cases {
-		gotDest, gotOut := parseToPrefix(c.in)
-		if gotDest != c.wantDest || gotOut != c.wantOut {
-			t.Errorf("%s: parseToPrefix(%q) = (%q, %q), want (%q, %q)", c.name, c.in, gotDest, gotOut, c.wantDest, c.wantOut)
+		gotSegs, gotLeading := splitReplySegments(c.in)
+		if gotLeading != c.wantLeading {
+			t.Errorf("%s: leading = %q, want %q", c.name, gotLeading, c.wantLeading)
+		}
+		if len(gotSegs) != len(c.wantSegs) {
+			t.Errorf("%s: got %d segs, want %d (%+v)", c.name, len(gotSegs), len(c.wantSegs), gotSegs)
+			continue
+		}
+		for i := range gotSegs {
+			if gotSegs[i] != c.wantSegs[i] {
+				t.Errorf("%s: seg %d = %+v, want %+v", c.name, i, gotSegs[i], c.wantSegs[i])
+			}
 		}
 	}
 }
