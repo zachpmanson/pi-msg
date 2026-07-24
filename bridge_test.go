@@ -136,3 +136,19 @@ func TestClassifyDest(t *testing.T) {
 		}
 	}
 }
+
+func TestRoutingNudgeBound(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	for i := 1; i <= maxRoutingNudges; i++ {
+		if !b.bumpRoutingNudge() {
+			t.Errorf("nudge %d should be allowed (cap %d)", i, maxRoutingNudges)
+		}
+	}
+	if b.bumpRoutingNudge() {
+		t.Error("nudge past the cap should be denied")
+	}
+	b.resetRoutingNudges()
+	if !b.bumpRoutingNudge() {
+		t.Error("after reset, a nudge should be allowed again")
+	}
+}

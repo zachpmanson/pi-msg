@@ -30,6 +30,7 @@ type Bridge struct {
 	shuttingDown   bool
 	bannerSent     bool
 	directTurn     bool // active turn arrived as a 1:1 owner DM (drives typing)
+	routingNudges  int  // mis-routed-reply corrections sent this user turn (bounded)
 
 	typingMu   sync.Mutex
 	typingStop chan struct{}
@@ -217,6 +218,7 @@ func (b *Bridge) handleUIRequest(ev Event) {
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.setDirectTurn(m.Direct)
+	b.resetRoutingNudges() // fresh user turn — allow corrections again
 	if m.Direct {
 		// Owner 1:1: origin is the owner; no separate sender.
 		b.handleCanonical(m.Body, b.acct.Owner, "")
@@ -476,8 +478,7 @@ func (b *Bridge) deliverReply(text string) {
 		return
 	}
 	if dest == "" {
-		b.log("warning", "agent reply missing required \"to:\" line; sending to owner")
-		b.xmpp.Send(body)
+		b.rejectReply(body, "it did not begin with a \"to: <jid>\" routing line")
 		return
 	}
 	switch b.xmpp.classifyDest(dest) {
@@ -486,10 +487,36 @@ func (b *Bridge) deliverReply(text string) {
 	case destUser:
 		b.xmpp.SendChatTo(dest, body)
 	default:
-		b.log("warning", "agent reply to non-allowlisted jid "+dest+"; sending to owner")
-		b.xmpp.Send(body)
+		b.rejectReply(body, fmt.Sprintf("%q is not an allowed destination", dest))
 	}
 }
+
+// maxRoutingNudges bounds how many times per user turn we ask the agent to fix
+// a mis-routed reply, so a stubbornly-malformed agent can't loop forever.
+const maxRoutingNudges = 2
+
+// rejectReply handles a room-mode reply that couldn't be routed: it forwards the
+// text to the owner with a note that it was dropped from its intended
+// destination, then (bounded) nudges the agent to resend with a valid "to:"
+// line. The nudge is a steering message, so it isn't confused for a real user.
+func (b *Bridge) rejectReply(body, reason string) {
+	b.log("warning", "agent reply not routed: "+reason)
+	b.xmpp.Send(fmt.Sprintf("⚠️ an agent reply was malformed (%s) and dropped before reaching its destination. Raw text:\n\n%s", reason, body))
+	if b.bumpRoutingNudge() {
+		b.rpc.Prompt(fmt.Sprintf("Your previous message was NOT delivered to anyone in the chat: %s. Every reply MUST begin with a line \"to: <jid>\" naming the destination (e.g. \"to: %s\" for the owner, or a room/person jid). Resend your message now with a valid \"to:\" line.", reason, b.acct.Owner), b.steerBehavior())
+	}
+}
+
+// bumpRoutingNudge increments the per-turn nudge counter and reports whether a
+// nudge is still allowed. Reset by resetRoutingNudges on each real user turn.
+func (b *Bridge) bumpRoutingNudge() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.routingNudges++
+	return b.routingNudges <= maxRoutingNudges
+}
+
+func (b *Bridge) resetRoutingNudges() { b.mu.Lock(); b.routingNudges = 0; b.mu.Unlock() }
 
 // parseToPrefix peels a leading "to: <jid>" routing line off an agent message,
 // returning the target jid ("" if absent) and the remaining body. Tolerates the
