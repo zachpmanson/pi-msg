@@ -97,19 +97,23 @@ func TestAmbientCap(t *testing.T) {
 
 func TestComposePrompt(t *testing.T) {
 	b := roomBridge()
-	// Canonical, no ambient: passthrough.
-	if got := b.composePrompt("hello", true, ""); got != "hello" {
-		t.Errorf("canonical no-ambient = %q, want hello", got)
+	// Canonical, no ambient: body passes through, room-mode delivery hint appended.
+	got := b.composePrompt("hello", true, "")
+	if !strings.HasPrefix(got, "hello") {
+		t.Errorf("canonical no-ambient = %q, want to start with hello", got)
+	}
+	if !strings.Contains(got, "@dm") || !strings.HasSuffix(got, deliveryHint) {
+		t.Errorf("room-mode prompt missing delivery hint: %q", got)
 	}
 	// Commentary: wrapped as untrusted, includes nick.
-	got := b.composePrompt("help", false, "alice")
+	got = b.composePrompt("help", false, "alice")
 	if !strings.Contains(got, "NON-OWNER") || !strings.Contains(got, "alice") || !strings.Contains(got, "help") {
 		t.Errorf("commentary framing wrong: %q", got)
 	}
-	// Canonical with ambient prepended.
+	// Canonical with ambient prepended (body precedes the appended hint).
 	b.bufferAmbient("bob", "fyi")
 	got = b.composePrompt("do it", true, "")
-	if !strings.Contains(got, "room commentary") || !strings.HasSuffix(got, "do it") {
+	if !strings.Contains(got, "room commentary") || !strings.Contains(got, "do it") || !strings.HasSuffix(got, deliveryHint) {
 		t.Errorf("canonical+ambient wrong: %q", got)
 	}
 }

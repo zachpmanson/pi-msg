@@ -96,8 +96,15 @@ message arrived on. Room messages are handled on **two independent axes**:
     told to use its judgment and is under no obligation to act on it
 
 Untriggered messages are buffered and, on the next turn, prepended to the prompt as a
-clearly-labeled *"room commentary — non-canonical"* block, then the buffer clears. The
-bot's replies go to the room.
+clearly-labeled *"room commentary — non-canonical"* block, then the buffer clears.
+
+**Reply routing.** By default a reply goes back to the channel the message came in on
+(a room message → the room; an owner DM → the DM). In room mode the agent can override
+this per message: begin a reply with `@dm` (or `@owner`) to send *that* message
+privately to the owner, or `@room` to send it to the group. The prompt tells the agent
+about this, so e.g. "beltino: send me the headlines in a DM" makes it prefix its answer
+with `@dm`. (DM always means the **owner** — the bridge has no 1:1 channel to other room
+participants.)
 
 **The room must be non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*,
 optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous
