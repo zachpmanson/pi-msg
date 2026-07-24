@@ -315,6 +315,11 @@ func (c *RPCClient) GetAvailableModels(ctx context.Context) (Event, error) {
 	return c.Request(ctx, map[string]any{"type": "get_available_models"}, 30*time.Second)
 }
 
+// GetState returns current session state (session file path, id, name, model).
+func (c *RPCClient) GetState(ctx context.Context) (Event, error) {
+	return c.Request(ctx, map[string]any{"type": "get_state"}, 30*time.Second)
+}
+
 func (c *RPCClient) Abort() { c.Send(map[string]any{"type": "abort"}) }
 
 // CancelUI declines a pi UI request dialog (nobody is at the TUI to answer).

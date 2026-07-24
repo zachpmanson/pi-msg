@@ -100,7 +100,7 @@ func (b *Bridge) onConnected() {
 	}
 	b.bannerSent = true
 	b.mu.Unlock()
-	b.reply("🟢 pi-msg bridge up. Chat to drive the agent; try /new, /compact, /model, /think, /abort, /quit.")
+	b.reply("🟢 pi-msg bridge up. Chat to drive the agent; try /new, /compact, /model, /think, /abort, /dump, /quit.")
 }
 
 func (b *Bridge) onPiExit() error {
@@ -323,10 +323,44 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.reply("⛔ aborted")
 	case "quit", "exit":
 		b.shutdown("requested over chat")
+	case "dump":
+		b.dumpSession()
 	default:
 		return false
 	}
 	return true
+}
+
+// dumpSession sends the current session's raw JSONL transcript to the owner,
+// straight from disk — no LLM turn. It reads the session file path from pi's
+// get_state, then relays the file verbatim (chunked). Useful for inspecting or
+// exporting a conversation.
+func (b *Bridge) dumpSession() {
+	res, err := b.rpc.GetState(b.ctx)
+	if err != nil {
+		b.reply("⚠️ /dump failed: " + err.Error())
+		return
+	}
+	if !res.success() {
+		b.reply("⚠️ /dump failed: " + res.errText())
+		return
+	}
+	path := res.Obj("data").Str("sessionFile")
+	if path == "" {
+		b.reply("⚠️ /dump: no session file (session persistence is disabled)")
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		b.reply("⚠️ /dump: cannot read session file: " + err.Error())
+		return
+	}
+	if len(raw) == 0 {
+		b.reply("📄 session is empty")
+		return
+	}
+	b.reply(fmt.Sprintf("📄 raw session dump — %s (%d bytes)", path, len(raw)))
+	b.reply(string(raw))
 }
 
 // routingHint tells the agent, when the account has room access, that every
