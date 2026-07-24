@@ -97,13 +97,19 @@ func TestAmbientCap(t *testing.T) {
 
 func TestComposePrompt(t *testing.T) {
 	b := roomBridge()
-	// Canonical, no ambient: body passes through, room-mode delivery hint appended.
-	got := b.composePrompt("hello", true, "")
-	if !strings.HasPrefix(got, "hello") {
-		t.Errorf("canonical no-ambient = %q, want to start with hello", got)
+
+	// A 1:1-owner turn (no room source) must NOT get the routing hint — joining
+	// a room shouldn't change the primary 1:1 prompt.
+	b.setReplySource("")
+	if got := b.composePrompt("hello", true, ""); got != "hello" {
+		t.Errorf("1:1 turn = %q, want plain \"hello\" (no hint)", got)
 	}
-	if !strings.Contains(got, "@dm") || !strings.HasSuffix(got, deliveryHint) {
-		t.Errorf("room-mode prompt missing delivery hint: %q", got)
+
+	// A room turn gets the hint appended after the body.
+	b.setReplySource("team@muc.x.com")
+	got := b.composePrompt("hello", true, "")
+	if !strings.HasPrefix(got, "hello") || !strings.Contains(got, "@dm") || !strings.HasSuffix(got, deliveryHint) {
+		t.Errorf("room turn missing delivery hint: %q", got)
 	}
 	// Commentary: wrapped as untrusted, includes nick.
 	got = b.composePrompt("help", false, "alice")
