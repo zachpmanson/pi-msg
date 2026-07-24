@@ -447,17 +447,65 @@ func (b *XMPPBridge) seenDuplicate(id string) bool {
 
 // Send delivers a chat message to the owner, splitting long text across
 // stanzas.
-func (b *XMPPBridge) Send(text string) {
+func (b *XMPPBridge) Send(text string) { b.SendChatTo(b.acct.Owner, text) }
+
+// SendChatTo posts a 1:1 chat message to an arbitrary JID, splitting long text.
+func (b *XMPPBridge) SendChatTo(to, text string) {
 	if b.currentSession() == nil {
 		b.log("warning", "send skipped: not online")
 		return
 	}
 	for _, part := range chunk(text, maxBody) {
-		if err := b.encodeChat(b.acct.Owner, part, stanza.ChatMessage); err != nil {
+		if err := b.encodeChat(to, part, stanza.ChatMessage); err != nil {
 			b.log("error", "send failed: "+err.Error())
 			break
 		}
 	}
+}
+
+// destKind classifies an agent-chosen reply destination for delivery policy.
+type destKind int
+
+const (
+	destBlocked destKind = iota // not permitted (unknown JID)
+	destRoom                    // a joined MUC → groupchat
+	destUser                    // owner or a known room occupant → 1:1 chat
+)
+
+// classifyDest decides how (and whether) to deliver a reply the agent addressed
+// to an explicit JID. Rooms the bridge has joined get groupchat; the owner and
+// real JIDs currently seen in a room get 1:1 chat; anything else is refused, so
+// the agent can't message arbitrary users on the server.
+func (b *XMPPBridge) classifyDest(dest string) destKind {
+	bare := bareJid(dest)
+	switch {
+	case bare == "":
+		return destBlocked
+	case b.isRoomJID(bare):
+		return destRoom
+	case bare == b.ownerBare, b.isOccupant(bare):
+		return destUser
+	default:
+		return destBlocked
+	}
+}
+
+// isRoomJID reports whether bare is one of the rooms the bridge has joined.
+// Single room today; extends to a set when multi-room lands.
+func (b *XMPPBridge) isRoomJID(bare string) bool {
+	return b.acct.Room != "" && bare == b.roomBare
+}
+
+// isOccupant reports whether bare is a real JID currently tracked in a room.
+func (b *XMPPBridge) isOccupant(bare string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, real := range b.occupants {
+		if real == bare {
+			return true
+		}
+	}
+	return false
 }
 
 // SetPresence announces presence with a show (availability axis: "" = available,
@@ -639,14 +687,16 @@ func (b *XMPPBridge) encodeUnavailable() error {
 	return session.Encode(ctx, p)
 }
 
-// SendRoom posts a groupchat message to the room, splitting long text.
-func (b *XMPPBridge) SendRoom(text string) {
+func (b *XMPPBridge) SendRoom(text string) { b.SendRoomTo(b.acct.Room, text) }
+
+// SendRoomTo posts a groupchat message to a room JID, splitting long text.
+func (b *XMPPBridge) SendRoomTo(room, text string) {
 	if b.currentSession() == nil {
 		b.log("warning", "room send skipped: not online")
 		return
 	}
 	for _, part := range chunk(text, maxBody) {
-		if err := b.encodeChat(b.acct.Room, part, stanza.GroupChatMessage); err != nil {
+		if err := b.encodeChat(room, part, stanza.GroupChatMessage); err != nil {
 			b.log("error", "room send failed: "+err.Error())
 			break
 		}

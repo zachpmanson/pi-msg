@@ -331,7 +331,7 @@ func (b *Bridge) handleCommand(t string) bool {
 }
 
 // deliveryHint tells the agent (room mode only) how to pick a reply channel.
-const deliveryHint = "[reply routing: by default your reply goes back to where this message came from; begin a message with \"@dm\" to send that message privately to the owner, or \"@room\" to send it to the group chat.]"
+const deliveryHint = "[reply routing: by default your reply goes back to where this message came from. To redirect a message, begin it with \"@dm\" (privately to the owner), \"@room\" (the group chat), or \"@to:<jid>\" (a specific room or person).]"
 
 // composePrompt assembles the text sent to pi: any buffered ambient commentary
 // is prepended as a clearly non-canonical block, non-owner messages are wrapped
@@ -403,58 +403,60 @@ func (b *Bridge) drainAmbient() string {
 	return sb.String()
 }
 
-// replyTarget selects the delivery channel for an outbound message.
-type replyTarget int
-
-const (
-	targetSource replyTarget = iota // follow the active turn's source channel
-	targetRoom                      // the group chat
-	targetOwner                     // the owner, 1:1
-)
-
 // reply sends outward text to a channel. In room mode the agent can override
-// the destination per message with a leading "@dm"/"@owner" (→ owner 1:1) or
-// "@room" (→ group) directive; otherwise the reply follows whichever channel
-// the active turn arrived on.
+// the destination per message with a leading directive: "@dm"/"@owner" (→ owner
+// 1:1), "@room" (→ the joined room), or "@to:<jid>" (→ an explicit room or
+// person). Without a directive the reply follows whichever channel the active
+// turn arrived on. Destinations are gated (see classifyDest): a directive to an
+// unknown JID is refused and falls back to the source channel.
 func (b *Bridge) reply(text string) {
-	target, body := b.replyDirective(text)
+	dest, body := b.replyDirective(text)
 	if strings.TrimSpace(body) == "" {
 		return
 	}
-	switch target {
-	case targetRoom:
-		b.xmpp.SendRoom(body)
-	case targetOwner:
-		b.xmpp.Send(body)
-	default:
-		if b.replyGoesToRoom() {
-			b.xmpp.SendRoom(body)
-		} else {
-			b.xmpp.Send(body)
+	if dest != "" {
+		switch b.xmpp.classifyDest(dest) {
+		case destRoom:
+			b.xmpp.SendRoomTo(bareJid(dest), body)
+			return
+		case destUser:
+			b.xmpp.SendChatTo(dest, body)
+			return
+		default:
+			b.log("warning", "reply directive to non-allowlisted JID "+dest+"; using source channel")
 		}
+	}
+	if b.replyGoesToRoom() {
+		b.xmpp.SendRoom(body)
+	} else {
+		b.xmpp.Send(body)
 	}
 }
 
-// replyDirective peels an optional leading channel directive ("@room", "@dm",
-// "@owner") off an agent message and returns the resolved target plus the
-// message with the directive removed. Only honored in room mode — 1:1 has a
-// single channel, so a stray "@dm" there is left as literal text.
-func (b *Bridge) replyDirective(text string) (replyTarget, string) {
+// replyDirective peels an optional leading routing directive off an agent
+// message and returns the resolved destination JID ("" = source channel) plus
+// the message with the directive removed. Aliases: "@dm"/"@owner" → the owner,
+// "@room" → the joined room; "@to:<jid>" names any JID. Only honored in room
+// mode — 1:1 has a single channel, so a stray directive there stays literal.
+func (b *Bridge) replyDirective(text string) (dest, body string) {
 	if !b.acct.RoomMode() {
-		return targetSource, text
+		return "", text
 	}
 	t := strings.TrimLeft(text, " \t\r\n")
 	tok := t
 	if i := strings.IndexAny(t, " \t\r\n"); i >= 0 {
 		tok = t[:i]
 	}
-	switch strings.ToLower(tok) {
-	case "@room":
-		return targetRoom, strings.TrimSpace(t[len(tok):])
-	case "@dm", "@owner":
-		return targetOwner, strings.TrimSpace(t[len(tok):])
+	rest := strings.TrimSpace(t[len(tok):])
+	switch {
+	case strings.EqualFold(tok, "@room"):
+		return b.acct.Room, rest
+	case strings.EqualFold(tok, "@dm"), strings.EqualFold(tok, "@owner"):
+		return b.acct.Owner, rest
+	case len(tok) > len("@to:") && strings.EqualFold(tok[:len("@to:")], "@to:"):
+		return tok[len("@to:"):], rest
 	}
-	return targetSource, text
+	return "", text
 }
 
 func (b *Bridge) setReplyToRoom(v bool) { b.mu.Lock(); b.replyToRoom = v; b.mu.Unlock() }

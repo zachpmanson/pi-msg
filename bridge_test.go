@@ -89,29 +89,55 @@ func TestTruncateLabel(t *testing.T) {
 }
 
 func TestReplyDirective(t *testing.T) {
-	room := NewBridge(ResolvedAccount{Room: "team@muc.x"}, false)
-	solo := NewBridge(ResolvedAccount{}, false) // 1:1, no room
+	room := NewBridge(ResolvedAccount{Room: "team@muc.x", Owner: "zach@x"}, false)
+	solo := NewBridge(ResolvedAccount{Owner: "zach@x"}, false) // 1:1, no room
 	cases := []struct {
-		name    string
-		b       *Bridge
-		in      string
-		want    replyTarget
-		wantOut string
+		name              string
+		b                 *Bridge
+		in                string
+		wantDest, wantOut string
 	}{
-		{"dm prefix", room, "@dm here are headlines", targetOwner, "here are headlines"},
-		{"owner alias", room, "@owner hi", targetOwner, "hi"},
-		{"room prefix", room, "@room broadcast", targetRoom, "broadcast"},
-		{"newline after directive", room, "@dm\nline1\nline2", targetOwner, "line1\nline2"},
-		{"case insensitive", room, "@DM yo", targetOwner, "yo"},
-		{"leading whitespace", room, "  @room x", targetRoom, "x"},
-		{"no directive", room, "just a reply", targetSource, "just a reply"},
-		{"mid-text not matched", room, "reply @dm inline", targetSource, "reply @dm inline"},
-		{"ignored in 1:1 mode", solo, "@dm hi", targetSource, "@dm hi"},
+		{"dm alias → owner", room, "@dm here are headlines", "zach@x", "here are headlines"},
+		{"owner alias", room, "@owner hi", "zach@x", "hi"},
+		{"room alias → room jid", room, "@room broadcast", "team@muc.x", "broadcast"},
+		{"to explicit user jid", room, "@to:alice@x hello", "alice@x", "hello"},
+		{"to explicit room jid", room, "@to:team@muc.x hey", "team@muc.x", "hey"},
+		{"newline after directive", room, "@dm\nline1\nline2", "zach@x", "line1\nline2"},
+		{"case insensitive", room, "@DM yo", "zach@x", "yo"},
+		{"leading whitespace", room, "  @room x", "team@muc.x", "x"},
+		{"no directive", room, "just a reply", "", "just a reply"},
+		{"mid-text not matched", room, "reply @dm inline", "", "reply @dm inline"},
+		{"ignored in 1:1 mode", solo, "@dm hi", "", "@dm hi"},
 	}
 	for _, c := range cases {
-		gotT, gotOut := c.b.replyDirective(c.in)
-		if gotT != c.want || gotOut != c.wantOut {
-			t.Errorf("%s: replyDirective(%q) = (%d, %q), want (%d, %q)", c.name, c.in, gotT, gotOut, c.want, c.wantOut)
+		gotDest, gotOut := c.b.replyDirective(c.in)
+		if gotDest != c.wantDest || gotOut != c.wantOut {
+			t.Errorf("%s: replyDirective(%q) = (%q, %q), want (%q, %q)", c.name, c.in, gotDest, gotOut, c.wantDest, c.wantOut)
+		}
+	}
+}
+
+func TestClassifyDest(t *testing.T) {
+	x := NewXMPPBridge(
+		ResolvedAccount{Room: "team@muc.x", Owner: "zach@x"},
+		func(InboundMessage) {}, func(string, string) {},
+	)
+	x.occupants["alice"] = "alice@x"
+	cases := []struct {
+		dest string
+		want destKind
+	}{
+		{"team@muc.x", destRoom},
+		{"team@muc.x/somenick", destRoom},
+		{"zach@x", destUser},
+		{"zach@x/phone", destUser},
+		{"alice@x", destUser},
+		{"stranger@x", destBlocked},
+		{"", destBlocked},
+	}
+	for _, c := range cases {
+		if got := x.classifyDest(c.dest); got != c.want {
+			t.Errorf("classifyDest(%q) = %d, want %d", c.dest, got, c.want)
 		}
 	}
 }

@@ -100,11 +100,18 @@ clearly-labeled *"room commentary — non-canonical"* block, then the buffer cle
 
 **Reply routing.** By default a reply goes back to the channel the message came in on
 (a room message → the room; an owner DM → the DM). In room mode the agent can override
-this per message: begin a reply with `@dm` (or `@owner`) to send *that* message
-privately to the owner, or `@room` to send it to the group. The prompt tells the agent
-about this, so e.g. "beltino: send me the headlines in a DM" makes it prefix its answer
-with `@dm`. (DM always means the **owner** — the bridge has no 1:1 channel to other room
-participants.)
+this per message with a leading directive:
+
+- `@dm` / `@owner` → privately to the owner
+- `@room` → the joined group chat
+- `@to:<jid>` → an explicit destination — a room (→ groupchat) or a person (→ 1:1)
+
+The prompt tells the agent about this, so e.g. "beltino: send me the headlines in a DM"
+makes it prefix its answer with `@dm`. Destinations are **allowlisted**: the owner, the
+joined room(s), and real JIDs currently seen in a room. A directive to any other JID is
+refused and the reply falls back to the source channel — the agent can't message
+arbitrary users. (`@to:<jid>` is the JID-native form; it generalizes to multiple rooms
+once multi-MUC lands.)
 
 **The room must be non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*,
 optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous
