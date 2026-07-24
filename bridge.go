@@ -394,7 +394,9 @@ func prettyDump(raw []byte) string {
 		if len(kind) > kindW {
 			kindW = len(kind)
 		}
-		rows = append(rows, row{strconv.Itoa(i), tm, kind, truncateLabel(detail, 70)})
+		// Collapse whitespace/newlines so each record stays one row, but keep the
+		// full detail (no truncation).
+		rows = append(rows, row{strconv.Itoa(i), tm, kind, strings.Join(strings.Fields(detail), " ")})
 		i++
 	}
 	if len(rows) == 0 {
