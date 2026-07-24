@@ -89,7 +89,7 @@ func TestTruncateLabel(t *testing.T) {
 }
 
 func TestReplyDirective(t *testing.T) {
-	room := NewBridge(ResolvedAccount{Room: "team@muc.x", Owner: "zach@x"}, false)
+	room := NewBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"}, false)
 	solo := NewBridge(ResolvedAccount{Owner: "zach@x"}, false) // 1:1, no room
 	cases := []struct {
 		name              string
@@ -119,10 +119,10 @@ func TestReplyDirective(t *testing.T) {
 
 func TestClassifyDest(t *testing.T) {
 	x := NewXMPPBridge(
-		ResolvedAccount{Room: "team@muc.x", Owner: "zach@x"},
+		ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"},
 		func(InboundMessage) {}, func(string, string) {},
 	)
-	x.occupants["alice"] = "alice@x"
+	x.occupants["team@muc.x"] = map[string]string{"alice": "alice@x"}
 	cases := []struct {
 		dest string
 		want destKind

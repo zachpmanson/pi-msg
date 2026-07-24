@@ -91,6 +91,7 @@ type InboundMessage struct {
 	RealJID   string // sender's bare real JID if known, else ""
 	FromOwner bool   // sender is the configured owner
 	Direct    bool   // arrived as a 1:1 chat, not groupchat (reply goes back 1:1)
+	Room      string // source room bare JID (room mode); "" for 1:1
 }
 
 // XMPPBridge owns a single account's XMPP connection: it maintains a
@@ -100,7 +101,7 @@ type InboundMessage struct {
 type XMPPBridge struct {
 	acct      ResolvedAccount
 	ownerBare string
-	roomBare  string
+	roomBares map[string]bool // bare JIDs of the joined rooms
 	onMsg     func(InboundMessage)
 	logf      func(level, msg string)
 
@@ -113,23 +114,28 @@ type XMPPBridge struct {
 	seen      map[string]struct{}
 	seenOrder []string
 
-	// MUC occupant tracking (room mode).
-	occupants map[string]string // nick -> bare real JID (non-anon rooms)
-	selfNick  string            // our own occupant nick, per status code 110
+	// MUC occupant tracking (room mode), keyed by room bare JID.
+	occupants map[string]map[string]string // roomBare -> nick -> bare real JID
+	selfNick  map[string]string            // roomBare -> our nick (per status code 110)
 }
 
 // NewXMPPBridge constructs a bridge. onMsg is called for each message that
 // should drive the agent; logf receives diagnostics.
 func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(level, msg string)) *XMPPBridge {
+	roomBares := make(map[string]bool, len(acct.Rooms))
+	for _, room := range acct.Rooms {
+		roomBares[bareJid(room)] = true
+	}
 	return &XMPPBridge{
 		acct:      acct,
 		ownerBare: bareJid(acct.Owner),
-		roomBare:  bareJid(acct.Room),
+		roomBares: roomBares,
 		onMsg:     onMsg,
 		logf:      logf,
 		presence:  "listening",
 		seen:      make(map[string]struct{}),
-		occupants: make(map[string]string),
+		occupants: make(map[string]map[string]string),
+		selfNick:  make(map[string]string),
 	}
 }
 
@@ -174,8 +180,8 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	b.online = true
 	show, status := b.show, b.presence
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
-	b.occupants = make(map[string]string)
-	b.selfNick = ""
+	b.occupants = make(map[string]map[string]string)
+	b.selfNick = make(map[string]string)
 	b.mu.Unlock()
 
 	// Announce presence so the server routes messages to this resource and the
@@ -184,12 +190,12 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 		b.setOffline()
 		return fmt.Errorf("presence: %w", err)
 	}
-	if b.acct.RoomMode() {
-		if err := b.joinRoom(); err != nil {
+	for _, room := range b.acct.Rooms {
+		if err := b.joinRoom(room); err != nil {
 			b.setOffline()
-			return fmt.Errorf("join room %s: %w", b.acct.Room, err)
+			return fmt.Errorf("join room %s: %w", room, err)
 		}
-		b.log("info", fmt.Sprintf("joined room %s as %s", b.acct.Room, b.acct.Nick))
+		b.log("info", fmt.Sprintf("joined room %s as %s", room, b.acct.Nick))
 	}
 	b.log("info", fmt.Sprintf("online as %s, relaying to %s", b.acct.JID, b.ownerBare))
 	if onConnected != nil {
@@ -337,19 +343,21 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true})
 }
 
-// dispatchRoom applies groupchat guards and forwards room messages to onMsg.
+// dispatchRoom applies groupchat guards and forwards room messages to onMsg,
+// tagging each with the room it arrived from so replies route back to it.
 func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	if m.typ != "groupchat" {
 		return // ignore 1:1 DMs to the bot in room mode (v1)
 	}
-	if bareJid(m.from) != b.roomBare {
+	room := bareJid(m.from)
+	if !b.isRoomJID(room) {
 		return
 	}
 	nick := resourcepart(m.from)
 	if nick == "" {
 		return // room-level stanza (e.g. subject with no occupant)
 	}
-	if nick == b.ownNick() {
+	if nick == b.ownNick(room) {
 		return // our own echo
 	}
 	if m.delay {
@@ -361,12 +369,13 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
 	}
-	real := b.occupantRealJID(nick)
+	real := b.occupantRealJID(room, nick)
 	b.onMsg(InboundMessage{
 		Body:      m.body,
 		Nick:      nick,
 		RealJID:   real,
 		FromOwner: real != "" && real == b.ownerBare,
+		Room:      room,
 	})
 }
 
@@ -376,7 +385,7 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 	from := attr(start.Attr, "from")
 	ptype := attr(start.Attr, "type")
 
-	if b.acct.RoomMode() && bareJid(from) == b.roomBare {
+	if room := bareJid(from); b.isRoomJID(room) {
 		nick := resourcepart(from)
 		if nick == "" {
 			return nil
@@ -384,7 +393,7 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 		// Our own occupant presence carries status code 110.
 		if hasStatusCode(toks, "110") {
 			b.mu.Lock()
-			b.selfNick = nick
+			b.selfNick[room] = nick
 			b.mu.Unlock()
 		}
 		real := ""
@@ -392,10 +401,13 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 			real = bareJid(attr(item.Attr, "jid"))
 		}
 		b.mu.Lock()
+		if b.occupants[room] == nil {
+			b.occupants[room] = make(map[string]string)
+		}
 		if ptype == "unavailable" {
-			delete(b.occupants, nick)
+			delete(b.occupants[room], nick)
 		} else if real != "" {
-			b.occupants[nick] = real
+			b.occupants[room][nick] = real
 		}
 		b.mu.Unlock()
 		return nil
@@ -409,22 +421,25 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 	return nil
 }
 
-// ownNick returns our occupant nick (server-confirmed via 110 if known, else
-// the configured nick).
-func (b *XMPPBridge) ownNick() string {
+// ownNick returns our occupant nick in room (server-confirmed via 110 if known,
+// else the configured nick).
+func (b *XMPPBridge) ownNick(room string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.selfNick != "" {
-		return b.selfNick
+	if n := b.selfNick[room]; n != "" {
+		return n
 	}
 	return b.acct.Nick
 }
 
-// occupantRealJID returns the bare real JID mapped to nick, or "".
-func (b *XMPPBridge) occupantRealJID(nick string) string {
+// occupantRealJID returns the bare real JID mapped to nick in room, or "".
+func (b *XMPPBridge) occupantRealJID(room, nick string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.occupants[nick]
+	if m := b.occupants[room]; m != nil {
+		return m[nick]
+	}
+	return ""
 }
 
 // seenDuplicate reports whether id was already handled, recording it if not.
@@ -491,18 +506,19 @@ func (b *XMPPBridge) classifyDest(dest string) destKind {
 }
 
 // isRoomJID reports whether bare is one of the rooms the bridge has joined.
-// Single room today; extends to a set when multi-room lands.
 func (b *XMPPBridge) isRoomJID(bare string) bool {
-	return b.acct.Room != "" && bare == b.roomBare
+	return b.roomBares[bare]
 }
 
-// isOccupant reports whether bare is a real JID currently tracked in a room.
+// isOccupant reports whether bare is a real JID currently tracked in any room.
 func (b *XMPPBridge) isOccupant(bare string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, real := range b.occupants {
-		if real == bare {
-			return true
+	for _, occ := range b.occupants {
+		for _, real := range occ {
+			if real == bare {
+				return true
+			}
 		}
 	}
 	return false
@@ -687,8 +703,6 @@ func (b *XMPPBridge) encodeUnavailable() error {
 	return session.Encode(ctx, p)
 }
 
-func (b *XMPPBridge) SendRoom(text string) { b.SendRoomTo(b.acct.Room, text) }
-
 // SendRoomTo posts a groupchat message to a room JID, splitting long text.
 func (b *XMPPBridge) SendRoomTo(room, text string) {
 	if b.currentSession() == nil {
@@ -705,12 +719,12 @@ func (b *XMPPBridge) SendRoomTo(room, text string) {
 
 // joinRoom sends MUC join presence to room/nick, suppressing history replay
 // (maxstanzas=0) so past room chatter isn't reprocessed as new ambient.
-func (b *XMPPBridge) joinRoom() error {
+func (b *XMPPBridge) joinRoom(room string) error {
 	session := b.currentSession()
 	if session == nil {
 		return fmt.Errorf("not online")
 	}
-	occupant := b.acct.Room + "/" + b.acct.Nick
+	occupant := room + "/" + b.acct.Nick
 	join := struct {
 		XMLName xml.Name `xml:"presence"`
 		To      string   `xml:"to,attr"`

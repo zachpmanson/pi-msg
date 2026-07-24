@@ -29,7 +29,7 @@ type Bridge struct {
 	repliedThisRun bool
 	shuttingDown   bool
 	bannerSent     bool
-	replyToRoom    bool // reply channel for the active turn (room vs owner 1:1)
+	replySource    string // source room JID for the active turn, or "" for owner 1:1
 
 	typingMu   sync.Mutex
 	typingStop chan struct{}
@@ -49,8 +49,12 @@ const ambientCap = 50
 // NewBridge constructs a bridge for the resolved account.
 func NewBridge(acct ResolvedAccount, debug bool) *Bridge {
 	// Unsolicited output (startup banner, shutdown/crash notices) defaults to
-	// the room in room mode, else the owner; per-message routing overrides this.
-	return &Bridge{acct: acct, debug: debug, replyToRoom: acct.RoomMode()}
+	// the first room in room mode, else the owner; per-message routing overrides.
+	var src string
+	if len(acct.Rooms) > 0 {
+		src = acct.Rooms[0]
+	}
+	return &Bridge{acct: acct, debug: debug, replySource: src}
 }
 
 func (b *Bridge) log(level, msg string) {
@@ -219,12 +223,14 @@ func (b *Bridge) handleUIRequest(ev Event) {
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
 	// Point replies at the channel this message arrived on: a 1:1 DM gets a 1:1
-	// reply, a groupchat message gets a room reply — even in room mode.
-	b.setReplyToRoom(!m.Direct)
+	// reply, a groupchat message gets a reply to that same room — even in room
+	// mode, and even with several rooms joined.
 	if m.Direct {
-		b.handleCanonical(m.Body) // owner DM is always canonical
+		b.setReplySource("") // owner 1:1
+		b.handleCanonical(m.Body)
 		return
 	}
+	b.setReplySource(m.Room)
 	b.handleRoom(m)
 }
 
@@ -426,8 +432,8 @@ func (b *Bridge) reply(text string) {
 			b.log("warning", "reply directive to non-allowlisted JID "+dest+"; using source channel")
 		}
 	}
-	if b.replyGoesToRoom() {
-		b.xmpp.SendRoom(body)
+	if src := b.replySrc(); src != "" {
+		b.xmpp.SendRoomTo(bareJid(src), body)
 	} else {
 		b.xmpp.Send(body)
 	}
@@ -450,7 +456,7 @@ func (b *Bridge) replyDirective(text string) (dest, body string) {
 	rest := strings.TrimSpace(t[len(tok):])
 	switch {
 	case strings.EqualFold(tok, "@room"):
-		return b.acct.Room, rest
+		return b.primaryRoom(), rest
 	case strings.EqualFold(tok, "@dm"), strings.EqualFold(tok, "@owner"):
 		return b.acct.Owner, rest
 	case len(tok) > len("@to:") && strings.EqualFold(tok[:len("@to:")], "@to:"):
@@ -459,8 +465,20 @@ func (b *Bridge) replyDirective(text string) (dest, body string) {
 	return "", text
 }
 
-func (b *Bridge) setReplyToRoom(v bool) { b.mu.Lock(); b.replyToRoom = v; b.mu.Unlock() }
-func (b *Bridge) replyGoesToRoom() bool { b.mu.Lock(); defer b.mu.Unlock(); return b.replyToRoom }
+func (b *Bridge) setReplySource(room string) { b.mu.Lock(); b.replySource = room; b.mu.Unlock() }
+func (b *Bridge) replySrc() string          { b.mu.Lock(); defer b.mu.Unlock(); return b.replySource }
+
+// primaryRoom is the room "@room" targets: the active turn's source room, or
+// the first configured room if the turn came from a 1:1 DM.
+func (b *Bridge) primaryRoom() string {
+	if src := b.replySrc(); src != "" {
+		return src
+	}
+	if len(b.acct.Rooms) > 0 {
+		return b.acct.Rooms[0]
+	}
+	return ""
+}
 
 func (b *Bridge) handleModel(arg string) {
 	if arg == "" {

@@ -50,7 +50,7 @@ func TestResolveAccountRoomMode(t *testing.T) {
 	cfg := &Config{Accounts: map[string]Account{
 		"default": {
 			JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com",
-			Room: "team@muc.chat.example.com", Nick: "botpi",
+			Room: roomList{"team@muc.chat.example.com"}, Nick: "botpi",
 		},
 	}}
 	got, err := resolveAccount(cfg, "")
@@ -59,6 +59,9 @@ func TestResolveAccountRoomMode(t *testing.T) {
 	}
 	if !got.RoomMode() {
 		t.Error("RoomMode() = false, want true")
+	}
+	if len(got.Rooms) != 1 || got.Rooms[0] != "team@muc.chat.example.com" {
+		t.Errorf("Rooms = %v, want [team@muc.chat.example.com]", got.Rooms)
 	}
 	if got.Nick != "botpi" {
 		t.Errorf("Nick = %q, want botpi", got.Nick)
@@ -116,5 +119,35 @@ func TestLoadConfigRoundTrip(t *testing.T) {
 	}
 	if _, ok := cfg.Accounts["default"]; !ok {
 		t.Error("default account not loaded")
+	}
+}
+
+func TestRoomConfigParsing(t *testing.T) {
+	// "room" accepts a single string...
+	var single Config
+	if err := json.Unmarshal([]byte(`{"accounts":{"default":{"room":"a@muc.x"}}}`), &single); err != nil {
+		t.Fatalf("string form: %v", err)
+	}
+	if got := []string(single.Accounts["default"].Room); len(got) != 1 || got[0] != "a@muc.x" {
+		t.Errorf("string form Room = %v, want [a@muc.x]", got)
+	}
+	// ...or an array of strings.
+	var multi Config
+	if err := json.Unmarshal([]byte(`{"accounts":{"default":{"room":["a@muc.x","b@muc.x"]}}}`), &multi); err != nil {
+		t.Fatalf("array form: %v", err)
+	}
+	if got := []string(multi.Accounts["default"].Room); len(got) != 2 || got[1] != "b@muc.x" {
+		t.Errorf("array form Room = %v, want [a@muc.x b@muc.x]", got)
+	}
+	// resolveAccount dedupes/cleans and drives RoomMode + multiple Rooms.
+	got, err := resolveAccount(&Config{Accounts: map[string]Account{
+		"default": {JID: "pi@x", Password: "p", Owner: "o@x",
+			Room: roomList{"a@muc.x", " a@muc.x ", "b@muc.x", ""}},
+	}}, "")
+	if err != nil {
+		t.Fatalf("resolveAccount: %v", err)
+	}
+	if len(got.Rooms) != 2 || got.Rooms[0] != "a@muc.x" || got.Rooms[1] != "b@muc.x" {
+		t.Errorf("resolved Rooms = %v, want [a@muc.x b@muc.x]", got.Rooms)
 	}
 }

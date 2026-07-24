@@ -10,6 +10,25 @@ import (
 	"strings"
 )
 
+// roomList is the set of MUC JIDs from the "room" config field. It accepts
+// either a single JID string ("room": "a@muc…") or an array of JID strings
+// ("room": ["a@muc…", "b@muc…"]) so older single-room configs keep working.
+type roomList []string
+
+func (r *roomList) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		*r = roomList{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return fmt.Errorf("\"room\" must be a JID string or an array of JID strings")
+	}
+	*r = many
+	return nil
+}
+
 // Account is one XMPP account the bridge can connect as, as stored in the
 // config file. Only jid/password/owner are required; the rest have defaults.
 type Account struct {
@@ -36,12 +55,14 @@ type Account struct {
 	// process cwd.
 	Workdir string `json:"workdir,omitempty"`
 
-	// Room, when set, additionally joins this bare MUC JID (e.g.
-	// "team@muc.chat.example.com") and relays group chat. The owner can still DM
-	// the bot 1:1 in either mode; each reply goes back to whichever channel the
-	// message arrived on.
-	Room string `json:"room,omitempty"`
-	// Nick is the occupant nickname used in Room. Defaults to the JID localpart.
+	// Room, when set, additionally joins these bare MUC JIDs (e.g.
+	// "team@muc.chat.example.com") and relays group chat. Accepts a single JID
+	// string or an array of JID strings. The owner can still DM the bot 1:1 in
+	// either mode; each reply goes back to whichever channel the message arrived
+	// on.
+	Room roomList `json:"room,omitempty"`
+	// Nick is the occupant nickname used in the rooms. Defaults to the JID
+	// localpart.
 	Nick string `json:"nick,omitempty"`
 	// RoomTrigger is the case-insensitive address prefix that makes a room
 	// message a prompt for the agent (e.g. "pi" matches "pi: …" / "pi, …").
@@ -56,7 +77,7 @@ type Config struct {
 }
 
 // ResolvedAccount is a fully-resolved account ready to connect with, defaults
-// applied. RoomMode reports whether Room was set.
+// applied. RoomMode reports whether any room was set.
 type ResolvedAccount struct {
 	Name         string
 	JID          string
@@ -67,13 +88,13 @@ type ResolvedAccount struct {
 	ToolActivity bool
 	Model        string
 	Workdir      string
-	Room         string
+	Rooms        []string
 	Nick         string
 	RoomTrigger  string
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
-func (a ResolvedAccount) RoomMode() bool { return a.Room != "" }
+func (a ResolvedAccount) RoomMode() bool { return len(a.Rooms) > 0 }
 
 const (
 	defaultAccount  = "default"
@@ -171,6 +192,17 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q is missing required field(s): %s", name, strings.Join(missing, ", "))
 	}
 
+	var rooms []string
+	seen := make(map[string]bool)
+	for _, rm := range acct.Room {
+		rm = strings.TrimSpace(rm)
+		if rm == "" || seen[rm] {
+			continue
+		}
+		seen[rm] = true
+		rooms = append(rooms, rm)
+	}
+
 	nick := acct.Nick
 	if nick == "" {
 		nick = localpart(acct.JID)
@@ -198,7 +230,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		ToolActivity: acct.ToolActivity,
 		Model:        acct.Model,
 		Workdir:      acct.Workdir,
-		Room:         acct.Room,
+		Rooms:        rooms,
 		Nick:         nick,
 		RoomTrigger:  trigger,
 	}, nil

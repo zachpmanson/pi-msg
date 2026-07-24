@@ -8,7 +8,7 @@ import (
 func roomBridge() *Bridge {
 	return NewBridge(ResolvedAccount{
 		Owner:       "zach@x.com",
-		Room:        "team@muc.x.com",
+		Rooms:       []string{"team@muc.x.com"},
 		Nick:        "pi",
 		RoomTrigger: "pi",
 	}, false)

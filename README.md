@@ -73,8 +73,8 @@ Per-account fields:
 | `resource` | no | `pi-msg` | XMPP resource (client-session label) |
 | `model` | no | Pi's default | model pattern passed to `pi --model` |
 | `workdir` | no | current dir | working directory for the agent (also where Pi discovers `AGENTS.md`/`CLAUDE.md`) |
-| `room` | no | — | set to a bare MUC JID to run in **group-chat mode** (see below) |
-| `nick` | no | JID localpart | occupant nickname in `room` |
+| `room` | no | — | a bare MUC JID (or an **array** of them) to also join for **group chat** (see below) |
+| `nick` | no | JID localpart | occupant nickname used in the room(s) |
 | `roomTrigger` | no | `nick` | address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`) |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
@@ -82,9 +82,11 @@ Multiple accounts: add more keys under `accounts`; `default` is used unless you 
 
 ## Group chat (MUC)
 
-Set `room` on an account and pi-msg **also** joins that room. The owner can still
-DM the bot 1:1 in either mode — each reply goes back to whichever channel the
-message arrived on. Room messages are handled on **two independent axes**:
+Set `room` on an account (a single MUC JID, or an array of them) and pi-msg
+**also** joins each. The owner can still DM the bot 1:1 in either mode — each
+reply goes back to whichever channel the message arrived on, including the
+specific room when several are joined. Room messages are handled on **two
+independent axes**:
 
 - **Trigger** — does the message start/steer a turn?
   - the **owner** → always
