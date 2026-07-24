@@ -48,7 +48,7 @@ sequenceDiagram
 | `/model <provider/id>` or `/model <search>` | `set_model` |
 | `/think <off\|low\|medium\|high\|…>` | `set_thinking_level` |
 | `/abort` (or `/stop`) | `abort` |
-| `/dump` | send the raw session JSONL to the owner (no LLM turn) |
+| `/dump` (or `/dump pretty`) | send the session transcript to the owner — raw JSONL, or `pretty` for indented per-record JSON (no LLM turn) |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
 
 ## Configuration

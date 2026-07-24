@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -101,7 +102,7 @@ func (b *Bridge) onConnected() {
 	}
 	b.bannerSent = true
 	b.mu.Unlock()
-	b.reply("🟢 pi-msg bridge up. Chat to drive the agent; try /new, /compact, /model, /think, /abort, /dump, /quit.")
+	b.reply("🟢 pi-msg bridge up. Chat to drive the agent; try /new, /compact, /model, /think, /abort, /dump [pretty], /quit.")
 }
 
 func (b *Bridge) onPiExit() error {
@@ -326,18 +327,18 @@ func (b *Bridge) handleCommand(t string) bool {
 	case "quit", "exit":
 		b.shutdown("requested over chat")
 	case "dump":
-		b.dumpSession()
+		b.dumpSession(arg)
 	default:
 		return false
 	}
 	return true
 }
 
-// dumpSession sends the current session's raw JSONL transcript to the owner,
-// straight from disk — no LLM turn. It reads the session file path from pi's
-// get_state, then relays the file verbatim (chunked). Useful for inspecting or
-// exporting a conversation.
-func (b *Bridge) dumpSession() {
+// dumpSession sends the current session's transcript to the owner, straight
+// from disk — no LLM turn. It reads the session file path from pi's get_state,
+// then relays the file: verbatim JSONL by default, or record-by-record indented
+// JSON with role/type headers when arg is "pretty".
+func (b *Bridge) dumpSession(arg string) {
 	res, err := b.rpc.GetState(b.ctx)
 	if err != nil {
 		b.reply("⚠️ /dump failed: " + err.Error())
@@ -361,8 +362,52 @@ func (b *Bridge) dumpSession() {
 		b.reply("📄 session is empty")
 		return
 	}
+	if strings.EqualFold(strings.TrimSpace(arg), "pretty") {
+		b.reply(fmt.Sprintf("📄 session dump (pretty) — %s", path))
+		b.reply(prettyDump(raw))
+		return
+	}
 	b.reply(fmt.Sprintf("📄 raw session dump — %s (%d bytes)", path, len(raw)))
 	b.reply(string(raw))
+}
+
+// prettyDump reformats a session's JSONL into something more human-readable:
+// one indented JSON block per record, each under a header naming its record
+// index and any role/type field. Non-JSON lines are passed through unchanged.
+func prettyDump(raw []byte) string {
+	var sb strings.Builder
+	i := 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			fmt.Fprintf(&sb, "\n%s\n", line)
+			continue
+		}
+		label := ""
+		if r, _ := obj["role"].(string); r != "" {
+			label = r
+		}
+		if t, _ := obj["type"].(string); t != "" {
+			if label != "" {
+				label += " · "
+			}
+			label += t
+		}
+		if label != "" {
+			label = " " + label
+		}
+		indented, err := json.MarshalIndent(obj, "", "  ")
+		if err != nil {
+			indented = []byte(line)
+		}
+		fmt.Fprintf(&sb, "\n──── [%d]%s ────\n%s\n", i, label, indented)
+		i++
+	}
+	return sb.String()
 }
 
 // routingHint tells the agent, when the account has room access, that every
