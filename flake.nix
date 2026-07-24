@@ -23,7 +23,7 @@
           src = ./.;
           # Hash of the Go module dependencies. Bump when go.mod/go.sum change:
           # set to pkgs.lib.fakeHash, run `nix build`, and copy the reported hash.
-          vendorHash = "sha256-sqeYJ140P0Ke6ZuqBMrzQoBhTNATCzP7MbIVhvenl/k=";
+          vendorHash = "sha256-/yBOILFXGNEgImJz5K4+nHguqaAGlg1UNBYnHiedizM=";
           # Single static bin from package main at the module root.
           meta = {
             description = "Bridge the Pi coding agent to XMPP.";
