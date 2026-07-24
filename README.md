@@ -14,11 +14,18 @@ command layer).
 
 ## How it works
 
-```
-XMPP client (you)                 pi-msg                      pi --mode rpc
-  │  "fix the build"  ───────────▶ prompt ──────────────────▶ agent runs
-  │  ◀─────────────── assistant text ◀── message_end event ──┘
-  │  "/new"           ───────────▶ {type:"new_session"} ─────▶ fresh session
+```mermaid
+sequenceDiagram
+    participant You as You (XMPP client)
+    participant Bridge as pi-msg
+    participant Pi as pi --mode rpc
+    You->>Bridge: "fix the build"
+    Bridge->>Pi: prompt
+    Pi-->>Bridge: message_end event
+    Bridge-->>You: assistant text
+    You->>Bridge: "/new"
+    Bridge->>Pi: {type:"new_session"}
+    Note over Pi: fresh session
 ```
 
 - Each finished **assistant message** → sent to you as chat.
