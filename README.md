@@ -22,9 +22,14 @@ XMPP client (you)                 pi-msg                      pi --mode rpc
 ```
 
 - Each finished **assistant message** → sent to you as chat.
-- While the agent works → a typing indicator (1:1) and `working…` presence; when it
-  settles → presence returns to `listening`, and if the run produced **no** text you
-  get a `✅ done (no reply) — your turn` nudge.
+- Agent state shows on three independent signals (1:1): a **typing indicator** while a
+  reply is actually being written, presence **`<show>`** (`dnd` while busy, available
+  when idle), and a presence **status** label of the current activity (`thinking…`,
+  `running: <cmd>`, `replying…`, `retrying…`, `listening`). When a run settles with
+  **no** text you get a `✅ done (no reply) — your turn` nudge.
+- Messages you send are acknowledged with **read receipts** — XEP-0184 delivery
+  receipts and XEP-0333 chat markers (`displayed`) — when the agent takes them in, if
+  your client requests them.
 - Your chat messages → routed to Pi:
 
 | You send | Becomes |

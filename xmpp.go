@@ -26,6 +26,13 @@ const maxBody = 3000
 
 const chatStatesNS = "http://jabber.org/protocol/chatstates"
 
+// Receipt namespaces: XEP-0184 message delivery receipts and XEP-0333 chat
+// markers. The bridge honors whichever an incoming owner message requests.
+const (
+	receiptsNS    = "urn:xmpp:receipts"
+	chatMarkersNS = "urn:xmpp:chat-markers:0"
+)
+
 // newStanzaID generates a random stanza id.
 func newStanzaID() string {
 	b := make([]byte, 8)
@@ -248,11 +255,13 @@ func (b *XMPPBridge) connect(ctx context.Context) (*xmpp.Session, error) {
 // incomingMsg is a received message stanza reduced to the fields the bridge
 // cares about.
 type incomingMsg struct {
-	from  string
-	typ   string
-	body  string
-	id    string
-	delay bool // carried an XEP-0203 <delay/> (server-replayed history)
+	from        string
+	typ         string
+	body        string
+	id          string
+	delay       bool // carried an XEP-0203 <delay/> (server-replayed history)
+	wantReceipt bool // carried a XEP-0184 <request/> (delivery receipt)
+	markable    bool // carried a XEP-0333 <markable/> (chat marker)
 }
 
 // handle is the mellium read-loop callback for one inbound stanza.
@@ -270,6 +279,8 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 			body: childText(toks, "body"),
 		}
 		_, m.delay = element(toks, "urn:xmpp:delay", "delay")
+		_, m.wantReceipt = element(toks, receiptsNS, "request")
+		_, m.markable = element(toks, chatMarkersNS, "markable")
 		b.dispatch(m)
 		return nil
 	case "presence":
@@ -309,6 +320,8 @@ func (b *XMPPBridge) dispatch(m incomingMsg) {
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
 	}
+	// The agent is about to take this in — acknowledge it as read/delivered.
+	b.sendReceipts(m)
 	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true})
 }
 
@@ -526,6 +539,56 @@ func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) e
 		Message: stanza.Message{To: toJID, Type: typ},
 	}
 	msg.State.XMLName = xml.Name{Space: chatStatesNS, Local: state}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return session.Encode(ctx, msg)
+}
+
+// sendReceipts acknowledges an accepted 1:1 owner message: a XEP-0184 delivery
+// receipt if the sender requested one, and a XEP-0333 "displayed" chat marker
+// if the message was markable — a genuine read receipt, since the agent is
+// about to act on it. Sent to the message's full from-JID so it routes back to
+// the originating resource. Best-effort; failures are logged, not fatal.
+func (b *XMPPBridge) sendReceipts(m incomingMsg) {
+	if m.id == "" || m.from == "" {
+		return
+	}
+	if m.wantReceipt {
+		if err := b.encodeReceipt(m.from, receiptsNS, "received", m.id); err != nil {
+			b.log("warning", "delivery receipt failed: "+err.Error())
+		}
+	}
+	if m.markable {
+		if err := b.encodeReceipt(m.from, chatMarkersNS, "displayed", m.id); err != nil {
+			b.log("warning", "chat marker failed: "+err.Error())
+		}
+	}
+}
+
+// encodeReceipt sends a bodyless message to `to` carrying a single ack element
+// (namespace ns, local name) whose `id` attribute references the acknowledged
+// message forID — the wire form shared by XEP-0184 receipts and XEP-0333
+// markers.
+func (b *XMPPBridge) encodeReceipt(to, ns, local, forID string) error {
+	session := b.currentSession()
+	if session == nil {
+		return fmt.Errorf("not online")
+	}
+	toJID, err := jid.Parse(to)
+	if err != nil {
+		return fmt.Errorf("invalid recipient %q: %w", to, err)
+	}
+	msg := struct {
+		stanza.Message
+		Ack struct {
+			XMLName xml.Name
+			ID      string `xml:"id,attr"`
+		}
+	}{
+		Message: stanza.Message{To: toJID, Type: stanza.ChatMessage},
+	}
+	msg.Ack.XMLName = xml.Name{Space: ns, Local: local}
+	msg.Ack.ID = forID
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return session.Encode(ctx, msg)

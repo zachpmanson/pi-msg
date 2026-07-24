@@ -86,3 +86,28 @@ func TestTokenHelpers(t *testing.T) {
 		t.Error("found nonexistent element")
 	}
 }
+
+func TestReceiptAckMarshal(t *testing.T) {
+	// The ack child shared by XEP-0184 receipts and XEP-0333 markers must emit
+	// its namespace and the referenced message id.
+	cases := []struct{ ns, local, id string }{
+		{receiptsNS, "received", "msg-1"},
+		{chatMarkersNS, "displayed", "msg-2"},
+	}
+	for _, c := range cases {
+		ack := struct {
+			XMLName xml.Name
+			ID      string `xml:"id,attr"`
+		}{XMLName: xml.Name{Space: c.ns, Local: c.local}, ID: c.id}
+		out, err := xml.Marshal(ack)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", c.local, err)
+		}
+		got := string(out)
+		for _, want := range []string{"<" + c.local, `xmlns="` + c.ns + `"`, `id="` + c.id + `"`} {
+			if !strings.Contains(got, want) {
+				t.Errorf("%s ack = %q, missing %q", c.local, got, want)
+			}
+		}
+	}
+}
