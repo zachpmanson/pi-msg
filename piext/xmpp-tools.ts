@@ -15,9 +15,8 @@
 // can fail.
 //
 // Which tools are registered is chosen by pi-msg via the PI_MSG_TOOLS env var
-// (comma-separated). The send_reaction tool is now provided by the filesystem
-// extension (~/.pi/agent/extensions/send-reaction-id.ts) with a mandatory
-// stanza-id parameter, so only send_file is registered here.
+// (comma-separated). This companion extension now registers both send_reaction
+// (with mandatory messageId — like send_file's mandatory path) and send_file.
 //
 // Types are erased by jiti at load time, so the `import type` never resolves at
 // runtime; only the value import (`typebox`) is resolved, against Pi's own deps.
@@ -42,10 +41,10 @@ export default function xmppTools(pi: ExtensionAPI) {
 	});
 
 	// Which tools to register, chosen by pi-msg via PI_MSG_TOOLS (comma list).
-	// Unset (e.g. running the extension standalone) enables send_file only.
+	// Unset (e.g. running the extension standalone) enables both.
 	const raw = process.env.PI_MSG_TOOLS;
 	const enabled =
-		raw === undefined ? new Set(["file"]) : new Set(raw.split(",").map((s) => s.trim()));
+		raw === undefined ? new Set(["file", "reaction"]) : new Set(raw.split(",").map((s) => s.trim()));
 
 	// relay hands an action to pi-msg and blocks for its boolean result.
 	async function relay(action: string, args: Record<string, unknown>): Promise<boolean> {
@@ -53,6 +52,47 @@ export default function xmppTools(pi: ExtensionAPI) {
 			throw new Error("no relay channel to pi-msg (session not started)");
 		}
 		return ui.confirm(RELAY_PREFIX + JSON.stringify({ action, ...args }), "pi-msg action");
+	}
+
+	if (enabled.has("reaction")) {
+		pi.registerTool({
+			name: "send_reaction",
+			label: "React (XMPP)",
+			description:
+				"React to a specific chat message with an emoji, over XMPP (XEP-0444). Use for a lightweight acknowledgement in place of a text reply. You MUST pass the messageId to target a specific message.",
+			promptSnippet: "React to a chat message with an emoji",
+			promptGuidelines: [
+				"Use send_reaction to acknowledge the human's message with one emoji (e.g. 👀 for seen, ✅ for done) when a full text reply isn't warranted.",
+				"The messageId parameter is required — always pass the stanza-id of the message you are reacting to, which is provided in the prompt as stanza-id.",
+			],
+			parameters: Type.Object({
+				emoji: Type.String({ description: "A single emoji, e.g. 👀 or ✅" }),
+				messageId: Type.String({ description: "XMPP stanza ID of the target message to react to" }),
+				from: Type.Optional(Type.String({ description: "Optional full JID of the target message's author; resolved automatically from message history cache when messageId is provided" })),
+			}),
+			async execute(_toolCallId, params) {
+				const p = params as { emoji?: string; messageId?: string; from?: string };
+				const emoji = String(p.emoji ?? "").trim();
+				if (!emoji) {
+					throw new Error("emoji is required");
+				}
+				const messageId = String(p.messageId ?? "").trim();
+				if (!messageId) {
+					throw new Error("messageId is required");
+				}
+				const args: Record<string, unknown> = { emoji, messageId };
+				if (p.from) {
+					args.from = p.from;
+				}
+				if (!(await relay("react", args))) {
+					throw new Error("pi-msg could not send the reaction");
+				}
+				return {
+					content: [{ type: "text", text: `Reacted with ${emoji} to message ${messageId}.` }],
+					details: { emoji, messageId },
+				};
+			},
+		});
 	}
 
 	if (enabled.has("file")) {
