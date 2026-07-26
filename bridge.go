@@ -82,10 +82,10 @@ func (b *Bridge) Run(ctx context.Context) error {
 			b.log("info", "pi stderr: "+line)
 		}
 	})
-	// Tell the companion extension which tools to register. Both send_file and
-	// send_reaction are always available; only lifecycle auto-reactions (👀✅⛔)
-	// are gated behind the account's reactions flag.
-	tools := []string{"file", "reaction"}
+	// The send_reaction tool is provided by the filesystem extension in
+	// ~/.pi/agent/extensions/send-reaction-id.ts, not by this embedded
+	// companion extension, so only register send_file here.
+	tools := []string{"file"}
 	b.rpc.env = []string{"PI_MSG_TOOLS=" + strings.Join(tools, ",")}
 
 	// Bring up XMPP first so we can report problems, then start pi.
