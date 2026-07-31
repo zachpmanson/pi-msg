@@ -87,6 +87,13 @@ type Account struct {
 	// XEP-0153 vCard avatar on connect. Optional; a missing/invalid file is a
 	// logged warning, not fatal.
 	Avatar string `json:"avatar,omitempty"`
+	// OMEMO, when true, enables legacy OMEMO (XEP-0384 v0.3) end-to-end
+	// encryption for 1:1 messages with the owner: the bot publishes its device
+	// bundle to PEP, encrypts replies to every device the owner has, and
+	// decrypts incoming encrypted messages. Long-term keys live under
+	// omemoStateDir. Off by default. Group chat and encrypted file transfer are
+	// not covered.
+	OMEMO bool `json:"omemo,omitempty"`
 }
 
 // Config is the on-disk config: an arbitrary number of named accounts.
@@ -114,6 +121,7 @@ type ResolvedAccount struct {
 	UploadService string
 	PingInterval  time.Duration
 	Avatar        string
+	OMEMO         bool
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
@@ -270,7 +278,26 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		UploadService: strings.TrimSpace(acct.UploadService),
 		PingInterval:  pingInterval,
 		Avatar:        strings.TrimSpace(acct.Avatar),
+		OMEMO:         acct.OMEMO,
 	}, nil
+}
+
+// omemoStateDir returns the directory where an account's OMEMO long-term keys
+// and sessions are persisted: $PI_MSG_STATE_DIR (if set) or
+// $XDG_STATE_HOME/pi-msg (default ~/.local/state/pi-msg), then omemo/<account>.
+// Keys must survive restarts, so this lives outside the scratch/config tree.
+func omemoStateDir(accountName string) string {
+	base := os.Getenv("PI_MSG_STATE_DIR")
+	if base == "" {
+		if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+			base = filepath.Join(xdg, "pi-msg")
+		} else if home, err := os.UserHomeDir(); err == nil {
+			base = filepath.Join(home, ".local", "state", "pi-msg")
+		} else {
+			base = filepath.Join(".pi-msg-state")
+		}
+	}
+	return filepath.Join(base, "omemo", accountName)
 }
 
 // accountNames returns the configured account names (unsorted).

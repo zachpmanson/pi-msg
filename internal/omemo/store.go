@@ -43,9 +43,10 @@ type persisted struct {
 	SignedPreKeyPriv string            `json:"signed_prekey_priv"` // 32-byte private key
 	SignedPreKeySig  string            `json:"signed_prekey_sig"`  // 64-byte signature
 	SignedPreKeyTS   int64             `json:"signed_prekey_ts"`
-	PreKeys          map[string]string `json:"prekeys"`    // id -> 32-byte private key
-	Sessions         map[string]string `json:"sessions"`   // "name:deviceid" -> record.Session.Serialize()
-	Identities       map[string]string `json:"identities"` // "name:deviceid" -> identity.Key.Serialize() (33 bytes)
+	NextPreKeyID     uint32            `json:"next_prekey_id"` // monotonic; consumed ids are never reused
+	PreKeys          map[string]string `json:"prekeys"`        // id -> 32-byte private key
+	Sessions         map[string]string `json:"sessions"`       // "name:deviceid" -> record.Session.Serialize()
+	Identities       map[string]string `json:"identities"`     // "name:deviceid" -> identity.Key.Serialize() (33 bytes)
 }
 
 // Store is a file-backed implementation of libsignal's composite
@@ -171,7 +172,40 @@ func (s *Store) initIdentity() error {
 		pkPriv := pk.KeyPair().PrivateKey().Serialize()
 		s.data.PreKeys[fmt.Sprint(pk.ID().Value)] = b64(pkPriv[:])
 	}
+	s.data.NextPreKeyID = preKeyCount + 1
 	return nil
+}
+
+// preKeyLowWater is the count below which we top the one-time prekey pool back
+// up to preKeyCount (a peer consumes one per new session it initiates).
+const preKeyLowWater = 20
+
+// replenishPreKeys tops the one-time prekey pool back up to preKeyCount if it
+// has dropped below preKeyLowWater, minting ids from a monotonic counter so a
+// consumed id is never reused. It returns true if any keys were added (meaning
+// the caller should republish its bundle).
+func (s *Store) replenishPreKeys() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	have := len(s.data.PreKeys)
+	if have >= preKeyLowWater {
+		return false, nil
+	}
+	need := preKeyCount - have
+	start := int(s.data.NextPreKeyID)
+	if start < 1 {
+		start = preKeyCount + 1
+	}
+	keys, err := keyhelper.GeneratePreKeys(start, need, s.ser.PreKeyRecord)
+	if err != nil {
+		return false, fmt.Errorf("omemo: replenish prekeys: %w", err)
+	}
+	for _, pk := range keys {
+		priv := pk.KeyPair().PrivateKey().Serialize()
+		s.data.PreKeys[fmt.Sprint(pk.ID().Value)] = b64(priv[:])
+	}
+	s.data.NextPreKeyID = uint32(start + need)
+	return true, s.flushLocked()
 }
 
 // flushLocked writes the whole state to disk atomically. Caller holds s.mu.

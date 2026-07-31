@@ -125,6 +125,24 @@ func (a *Account) Bundle() (Bundle, error) {
 	return b, nil
 }
 
+// ReplenishPreKeys tops the one-time prekey pool back up if it has run low
+// (each new inbound session consumes one). It returns true if keys were added,
+// signalling the caller to republish its bundle to PEP.
+func (a *Account) ReplenishPreKeys() (bool, error) {
+	return a.store.replenishPreKeys()
+}
+
+// WasPreKeyFor reports whether msg's key entry addressed to this device is a
+// prekey message — i.e. decrypting it consumed one of our one-time prekeys.
+func (a *Account) WasPreKeyFor(msg *Message) bool {
+	for _, k := range msg.Keys {
+		if k.RID == a.deviceID {
+			return k.PreKey
+		}
+	}
+	return false
+}
+
 // HasSession reports whether a ratchet session already exists for a device, so
 // the caller can avoid a needless bundle fetch.
 func (a *Account) HasSession(jid string, dev uint32) bool {

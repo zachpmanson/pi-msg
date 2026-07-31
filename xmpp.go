@@ -142,6 +142,11 @@ type XMPPBridge struct {
 	avatarType string // image MIME type, e.g. "image/png"
 	avatarB64  string // base64 of the raw image bytes (vCard <BINVAL>)
 	avatarHash string // lowercase hex SHA-1 of the raw bytes (presence photo hash)
+
+	// omemo is the OMEMO (XEP-0384) manager, non-nil only when the account has
+	// omemo enabled and the key store loaded. When set, 1:1 messages with the
+	// owner are end-to-end encrypted.
+	omemo *omemoManager
 }
 
 // NewXMPPBridge constructs a bridge. onMsg is called for each message that
@@ -163,6 +168,14 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		selfNick:  make(map[string]string),
 	}
 	b.loadAvatar()
+	if acct.OMEMO {
+		mgr, err := newOMEMOManager(b)
+		if err != nil {
+			b.log("error", "omemo disabled: "+err.Error())
+		} else {
+			b.omemo = mgr
+		}
+	}
 	return b
 }
 
@@ -277,6 +290,17 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 			} else {
 				b.log("info", "avatar vCard published")
 			}
+		}()
+	}
+
+	// Publish the OMEMO bundle + devicelist once the read loop is up to route
+	// the PEP IQ results, so the owner's clients can discover this device and
+	// establish sessions.
+	if b.omemo != nil {
+		go func() {
+			bootCtx, cancel := context.WithTimeout(keepaliveCtx, 30*time.Second)
+			defer cancel()
+			b.omemo.bootstrap(bootCtx, session)
 		}()
 	}
 
@@ -432,6 +456,20 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 		_, m.delay = element(toks, "urn:xmpp:delay", "delay")
 		_, m.wantReceipt = element(toks, receiptsNS, "request")
 		_, m.markable = element(toks, chatMarkersNS, "markable")
+		// OMEMO: a 1:1 <encrypted> message from the owner is decrypted in place,
+		// replacing the fallback body with plaintext, before the dispatch guards
+		// run. Encrypted stanzas from anyone else (or in a room) are ignored to
+		// avoid spending one-time prekeys on unsolicited sessions.
+		if b.omemo != nil && m.typ != "groupchat" && bareJid(m.from) == b.ownerBare {
+			if enc, ok := parseEncrypted(toks); ok {
+				plain, err := b.omemo.decryptInbound(bareJid(m.from), enc)
+				if err != nil {
+					b.log("warning", "omemo: decrypt from owner failed: "+err.Error())
+					return nil
+				}
+				m.body = plain
+			}
+		}
 		b.dispatch(m)
 		return nil
 	case "presence":
@@ -643,12 +681,24 @@ func (b *XMPPBridge) seenDuplicate(id string) bool {
 func (b *XMPPBridge) Send(text string) { b.SendChatTo(b.acct.Owner, text) }
 
 // SendChatTo posts a 1:1 chat message to an arbitrary JID, splitting long text.
+// When OMEMO is enabled and the recipient is the owner, each part is
+// end-to-end encrypted; if encryption can't be completed (e.g. the owner has no
+// published OMEMO device yet) it falls back to plaintext with a loud warning so
+// the bot stays usable during setup.
 func (b *XMPPBridge) SendChatTo(to, text string) {
 	if b.currentSession() == nil {
 		b.log("warning", "send skipped: not online")
 		return
 	}
+	omemoTo := b.omemo != nil && bareJid(to) == b.ownerBare
 	for _, part := range chunk(text, maxBody) {
+		if omemoTo {
+			if err := b.sendEncrypted(to, part); err != nil {
+				b.log("warning", "omemo: encrypt failed, sending plaintext: "+err.Error())
+			} else {
+				continue
+			}
+		}
 		if err := b.encodeChat(to, part, stanza.ChatMessage); err != nil {
 			b.log("error", "send failed: "+err.Error())
 			break
