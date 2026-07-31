@@ -16,9 +16,9 @@ import (
 	"sync"
 
 	"go.mau.fi/libsignal/ecc"
+	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/keys/identity"
 	"go.mau.fi/libsignal/protocol"
-	groupRecord "go.mau.fi/libsignal/groups/state/record"
 	"go.mau.fi/libsignal/serialize"
 	"go.mau.fi/libsignal/state/record"
 	"go.mau.fi/libsignal/util/keyhelper"
@@ -38,7 +38,7 @@ import (
 // verify. Recomputing the public key from the private key is exact.
 type persisted struct {
 	RegistrationID   uint32            `json:"registration_id"`
-	IdentityPriv     string            `json:"identity_priv"`      // 32-byte curve25519 seed
+	IdentityPriv     string            `json:"identity_priv"` // 32-byte curve25519 seed
 	SignedPreKeyID   uint32            `json:"signed_prekey_id"`
 	SignedPreKeyPriv string            `json:"signed_prekey_priv"` // 32-byte private key
 	SignedPreKeySig  string            `json:"signed_prekey_sig"`  // 64-byte signature

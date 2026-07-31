@@ -7,3 +7,6 @@ dist/
 result
 result-*
 .direnv/
+
+# OMEMO integration-test certs (generated)
+testdata/omemo/certs/

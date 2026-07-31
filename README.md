@@ -88,9 +88,39 @@ Per-account fields:
 | `pingInterval` | no | `60s` | keepalive cadence (Go duration): XEP-0199 server ping + XEP-0410 MUC self-ping; `0` disables |
 | `reactions` | no | `false` | XEP-0444 emoji reactions on 1:1 owner messages: lifecycle → 👀 picked up / ✅ done / ⛔ aborted, and enables the agent-driven `send_reaction` tool (see [Agent tools](#agent-tools)) |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
+| `omemo` | no | `false` | end-to-end encrypt 1:1 messages with the owner via OMEMO (XEP-0384 v0.3); see [OMEMO encryption](#omemo-encryption) |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
 `PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
+
+## OMEMO encryption
+
+Set `"omemo": true` on an account to end-to-end encrypt the 1:1 conversation
+with the owner using **legacy OMEMO** (XEP-0384 v0.3, the
+`eu.siacs.conversations.axolotl` namespace that Conversations and Converse
+interoperate on). On connect the bot generates a device identity, publishes its
+bundle and device id to PEP, encrypts each reply to **every** device the owner
+has published (phone, laptop, …), and decrypts incoming encrypted messages.
+
+- **Scope (v1):** 1:1 with the owner only. Group chat and encrypted file
+  transfer (`aesgcm://`) are **not** covered — those stay plaintext.
+- **Trust:** blind-trust-before-verification (BTBV) — a new owner device is
+  trusted automatically; a *changed* key on a known device is rejected. The
+  device fingerprint is logged on startup for out-of-band verification.
+- **Opportunistic:** if the owner hasn't published any OMEMO device yet (or a
+  bundle can't be fetched), the bot logs a loud warning and sends **plaintext**
+  so messaging still works during setup. Once the owner's client advertises
+  OMEMO, replies encrypt automatically.
+- **Keys** persist under `$XDG_STATE_HOME/pi-msg/omemo/<account>` (override the
+  base with `PI_MSG_STATE_DIR`). They must survive restarts — deleting them
+  makes every peer see an untrusted new device.
+- **Switching clients** is supported (OMEMO is multi-device), but a newly added
+  client can't read messages sent before it existed — OMEMO has no shared
+  history. The bot always fans out to all of the owner's current devices.
+
+Built on [`go.mau.fi/libsignal`](https://pkg.go.dev/go.mau.fi/libsignal) for the
+Signal double-ratchet; the XEP-0384 stanza/PEP layer is in this repo
+(`omemo_wire.go`, `omemo_pep.go`, `internal/omemo/`).
 
 ## Group chat (MUC)
 
