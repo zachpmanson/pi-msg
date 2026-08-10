@@ -162,7 +162,7 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		roomBares:  roomBares,
 		onMsg:      onMsg,
 		logf:       logf,
-		presence:   "listening (" + nowStamp() + ")",
+		presence:   "awake (" + nowStamp() + ")",
 		seen:       make(map[string]struct{}),
 		occupants:  make(map[string]map[string]string),
 		selfNick:   make(map[string]string),
@@ -242,6 +242,10 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	b.mu.Lock()
 	b.session = session
 	b.online = true
+	// Re-assert the fresh-start status on every (re)connect so the roster shows
+	// "awake" rather than a stale idle label from a previous session.
+	b.show = ""
+	b.presence = "awake (" + nowStamp() + ")"
 	show, status := b.show, b.presence
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
 	b.occupants = make(map[string]map[string]string)
