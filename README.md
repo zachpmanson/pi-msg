@@ -85,6 +85,7 @@ Per-account fields:
 | `nick` | no | JID localpart | occupant nickname used in the room(s) |
 | `roomTrigger` | no | `nick` | address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`) |
 | `uploadService` | no | auto-probed | XEP-0363 upload component JID for file transfer (e.g. `upload.chat.example.com`) |
+| `errorRoom` | no | — | write-only MUC dumping ground for dropped/unrouteable agent replies (see below) |
 | `pingInterval` | no | `60s` | keepalive cadence (Go duration): XEP-0199 server ping + XEP-0410 MUC self-ping; `0` disables |
 | `reactions` | no | `false` | XEP-0444 emoji reactions on 1:1 owner messages: lifecycle → 👀 picked up / ✅ done / ⛔ aborted, and enables the agent-driven `send_reaction` tool (see [Agent tools](#agent-tools)) |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
@@ -156,6 +157,19 @@ automatically (`upload.<domain>` / `httpupload.<domain>`) or set explicitly via 
 optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous
 room real JIDs are hidden, so the owner can't be distinguished and every message falls
 through to the untrusted/ambient tiers.
+
+**Errors dumping ground (`errorRoom`).** Set `errorRoom` to a bare MUC JID (e.g.
+`errors@muc.chat.example.com`) and pi-msg uses it as a *write-only* dumping ground for
+agent replies it can't route (no `to:` line, text before the first `to:`, or a
+non-allowlisted destination). This lets you mute the room and only check it when you need
+to recover something — without the dropped content spamming your 1:1.
+
+The bridge joins the room at the **XMPP layer** (so groupchat sends are accepted and the
+keepalive covers it), but deliberately keeps it **out of the agent-visible room set**: it is
+never dispatched to the agent, never appears in the reply/file allowlist, and isn't tracked
+for occupants. So the agent can't read the room or route anything to it — it's write-only by
+construction, which keeps multiple agents from acting on each other's rejected output. If
+`errorRoom` is unset, unrouteable replies fall back to the owner's 1:1 as before.
 
 ## Agent tools
 

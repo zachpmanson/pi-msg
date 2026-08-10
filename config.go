@@ -87,6 +87,14 @@ type Account struct {
 	// detect silent disconnects. A Go duration string ("60s", "2m"). Defaults
 	// to "60s"; "0" disables keepalive.
 	PingInterval string `json:"pingInterval,omitempty"`
+	// ErrorRoom, when set, is a bare MUC JID (e.g.
+	// "errors@muc.chat.example.com") used as a write-only dumping ground for
+	// dropped/unrouteable agent replies. The bridge joins it at the XMPP layer
+	// so it can send groupchat there, but it is deliberately NOT exposed to the
+	// agent (not a readable room, not in the reply/send allowlist), so the
+	// agents can't read each other's rejected output or act on it. If unset,
+	// unrouteable replies fall back to the owner's 1:1.
+	ErrorRoom string `json:"errorRoom,omitempty"`
 	// Avatar is a path to a local image (PNG/JPEG/GIF) published as the bot's
 	// XEP-0153 vCard avatar on connect. Optional; a missing/invalid file is a
 	// logged warning, not fatal.
@@ -108,17 +116,18 @@ type ResolvedAccount struct {
 	Owner         string
 	Service       string
 	Resource      string
-	ToolActivity   bool
-	Reactions      bool
-	RoomReactions  bool
-	Model          string
-	Workdir        string
-	Rooms          []string
+	ToolActivity  bool
+	Reactions     bool
+	RoomReactions bool
+	Model         string
+	Workdir       string
+	Rooms         []string
 	Nick          string
 	RoomTrigger   string
 	UploadService string
 	PingInterval  time.Duration
 	Avatar        string
+	ErrorRoom     string
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
@@ -265,10 +274,10 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		Owner:         acct.Owner,
 		Service:       service,
 		Resource:      resource,
-		ToolActivity:   acct.ToolActivity,
-		Reactions:      acct.Reactions,
-		RoomReactions:  acct.RoomReactions,
-		Model:          acct.Model,
+		ToolActivity:  acct.ToolActivity,
+		Reactions:     acct.Reactions,
+		RoomReactions: acct.RoomReactions,
+		Model:         acct.Model,
 		Workdir:       acct.Workdir,
 		Rooms:         rooms,
 		Nick:          nick,
@@ -276,6 +285,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		UploadService: strings.TrimSpace(acct.UploadService),
 		PingInterval:  pingInterval,
 		Avatar:        strings.TrimSpace(acct.Avatar),
+		ErrorRoom:     strings.TrimSpace(acct.ErrorRoom),
 	}, nil
 }
 

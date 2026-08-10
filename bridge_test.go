@@ -156,6 +156,28 @@ func TestClassifyDest(t *testing.T) {
 	}
 }
 
+// TestErrorRoomInvisibleToAgent verifies the write-only error room is NOT in
+// roomBares (so dispatch ignores it) and is NOT an allowed reply/send
+// destination — agents can't read it or route to it.
+func TestErrorRoomInvisibleToAgent(t *testing.T) {
+	x := NewXMPPBridge(
+		ResolvedAccount{Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", Owner: "zach@x"},
+		func(InboundMessage) {}, func(string, string) {},
+	)
+	if x.isRoomJID("errors@muc.x") {
+		t.Error("error room must NOT be an agent-visible (dispatched) room")
+	}
+	if !x.isRoomJID("team@muc.x") {
+		t.Error("normal room should still be agent-visible")
+	}
+	if got := x.classifyDest("errors@muc.x"); got != destBlocked {
+		t.Errorf("error room should be blocked for replies, got %v", got)
+	}
+	if got := x.classifyDest("team@muc.x"); got != destRoom {
+		t.Errorf("normal room should remain an allowed destination, got %v", got)
+	}
+}
+
 func TestRoutingNudgeBound(t *testing.T) {
 	b := NewBridge(ResolvedAccount{}, false)
 	for i := 1; i <= maxRoutingNudges; i++ {

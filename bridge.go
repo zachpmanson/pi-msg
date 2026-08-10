@@ -37,8 +37,8 @@ type Bridge struct {
 	reactID        string // stanza id of that message (XEP-0444 target); "" disables
 	turnDest       string // reply destination for the current turn (owner or room jid)
 
-	lifecycleReactTo  string // snapshot of reactTo at run start, for lifecycle auto-reacts
-	lifecycleReactID  string // snapshot of reactID at run start; never overwritten by deliverReply
+	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
+	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
 
 	typingMu   sync.Mutex
 	typingStop chan struct{}
@@ -850,10 +850,21 @@ const maxRoutingNudges = 2
 // line. The nudge is a steering message, so it isn't confused for a real user.
 func (b *Bridge) rejectReply(body, reason string) {
 	b.log("warning", "agent reply not routed: "+reason)
-	b.xmpp.Send(fmt.Sprintf("⚠️ malformed message: %s\n\n%s", reason, body))
+	b.routeDropped(fmt.Sprintf("⚠️ malformed message: %s\n\n%s", reason, body))
 	if b.bumpRoutingNudge() {
 		b.rpc.Prompt(fmt.Sprintf("Your previous message was NOT delivered to anyone in the chat: %s. Every reply MUST begin with a line \"to: <jid>\" naming the destination (e.g. \"to: %s\" for the owner, or a room/person jid). Resend your message now with a valid \"to:\" line.", reason, b.acct.Owner), b.steerBehavior())
 	}
+}
+
+// routeDropped sends dropped/unrouteable output to the write-only error room
+// (Change #15) when one is configured, falling back to the owner's 1:1
+// otherwise so nothing is silently lost. The agent never reads the error room.
+func (b *Bridge) routeDropped(text string) {
+	if errRoom := b.acct.ErrorRoom; errRoom != "" {
+		b.xmpp.SendRoomTo(bareJid(errRoom), text)
+		return
+	}
+	b.xmpp.Send(text)
 }
 
 // bumpRoutingNudge increments the per-turn nudge counter and reports whether a

@@ -261,6 +261,17 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 		}
 		b.log("info", fmt.Sprintf("joined room %s as %s", room, b.acct.Nick))
 	}
+	// The error room is joined at the XMPP layer (so groupchat sends are
+	// accepted and keepalive covers it) but it is deliberately NOT added to
+	// roomBares, so it stays invisible to the agent: no dispatch, no occupants,
+	// no allowlist. Write-only by construction.
+	if b.acct.ErrorRoom != "" {
+		if err := b.joinRoom(b.acct.ErrorRoom); err != nil {
+			b.setOffline()
+			return fmt.Errorf("join error room %s: %w", b.acct.ErrorRoom, err)
+		}
+		b.log("info", fmt.Sprintf("joined write-only error room %s as %s", b.acct.ErrorRoom, b.acct.Nick))
+	}
 	b.log("info", fmt.Sprintf("online as %s, relaying to %s", b.acct.JID, b.ownerBare))
 	if onConnected != nil {
 		onConnected()
@@ -340,6 +351,9 @@ func (b *XMPPBridge) keepalive(ctx context.Context, session *xmpp.Session) {
 		}
 		for _, room := range b.acct.Rooms {
 			b.selfPing(ctx, session, room)
+		}
+		if errRoom := b.acct.ErrorRoom; errRoom != "" {
+			b.selfPing(ctx, session, errRoom)
 		}
 	}
 }

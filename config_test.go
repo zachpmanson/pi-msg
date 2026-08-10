@@ -188,3 +188,16 @@ func TestRoomConfigParsing(t *testing.T) {
 		t.Errorf("resolved Rooms = %v, want [a@muc.x b@muc.x]", got.Rooms)
 	}
 }
+
+func TestResolveAccountErrorRoom(t *testing.T) {
+	got, err := resolveAccount(&Config{Accounts: map[string]Account{
+		"default": {JID: "pi@x", Password: "p", Owner: "o@x",
+			ErrorRoom: " errors@muc.x "},
+	}}, "")
+	if err != nil {
+		t.Fatalf("resolveAccount: %v", err)
+	}
+	if got.ErrorRoom != "errors@muc.x" {
+		t.Errorf("ErrorRoom = %q, want %q", got.ErrorRoom, "errors@muc.x")
+	}
+}
