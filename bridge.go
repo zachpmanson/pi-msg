@@ -1325,7 +1325,7 @@ func (b *Bridge) fireResumeTurn() {
 	b.setTurnDest(b.acct.Owner)
 	b.rpc.Prompt(
 		"Startup: your session was resumed (continued from a previous process). "+
-			"You may volunteer one brief message to the owner now, beginning with a line \"to: <jid>\". "+
+			"You may volunteer to continue the conversation or task from the previous session. "+
 			"If you have nothing worth volunteering, reply with nothing at all.",
 		b.steerBehavior())
 	b.xmpp.SetPresence("dnd", "thinking…")
