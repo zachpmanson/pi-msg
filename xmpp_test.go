@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBareJid(t *testing.T) {
@@ -237,5 +239,80 @@ func TestVCardXUpdateMarshal(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("vcard x:update = %q, missing %q", got, want)
 		}
+	}
+}
+
+func TestReplayInSwapWindow(t *testing.T) {
+	b := &XMPPBridge{}
+	start := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	if !b.SetReplayWindow(start) {
+		t.Fatal("SetReplayWindow should arm")
+	}
+	if !b.inSwapWindow(start.Add(time.Second)) {
+		t.Errorf("stamp inside window should be buffered")
+	}
+	if !b.inSwapWindow(start) {
+		t.Errorf("stamp at window start should be buffered")
+	}
+	if !b.inSwapWindow(start.Add(-time.Second)) {
+		t.Errorf("stamp within slack before start should be buffered")
+	}
+	if b.inSwapWindow(start.Add(-replaySlack - time.Second)) {
+		t.Errorf("stamp well before window start should be dropped")
+	}
+	if b.inSwapWindow(time.Time{}) {
+		t.Errorf("missing stamp should be dropped")
+	}
+	if b.SetReplayWindow(time.Time{}) {
+		t.Errorf("zero window start should not arm")
+	}
+}
+
+func TestReplaySwapWindowActive(t *testing.T) {
+	b := &XMPPBridge{}
+	b.replayActive = true
+	b.replayGraceEnd = time.Now().Add(time.Second)
+	if !b.swapWindowActive() {
+		t.Errorf("open window should report active")
+	}
+	b.replayGraceEnd = time.Now().Add(-time.Second)
+	if b.swapWindowActive() {
+		t.Errorf("expired window should report inactive")
+	}
+	b.replayActive = false
+	b.replayGraceEnd = time.Now().Add(time.Second)
+	if b.swapWindowActive() {
+		t.Errorf("unarmed window should report inactive")
+	}
+}
+
+func TestReplayBufferDrain(t *testing.T) {
+	b := &XMPPBridge{}
+	b.replayStart = time.Now().Add(-time.Minute)
+	b.replayArmed = true
+	b.replayLit = true
+	b.replayActive = true
+	b.replayGraceEnd = time.Now().Add(50 * time.Millisecond)
+	b.bufferReplay(InboundMessage{Body: "first", Direct: true})
+	b.bufferReplay(InboundMessage{Body: "second", Direct: true})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got := b.DrainReplay(ctx)
+	if len(got) != 2 || got[0].Body != "first" || got[1].Body != "second" {
+		t.Errorf("drain = %v, want both buffered messages in order", got)
+	}
+	if b.replayActive {
+		t.Errorf("window should be closed after drain")
+	}
+	if again := b.DrainReplay(context.Background()); again != nil {
+		t.Errorf("second drain = %v, want nil", again)
+	}
+}
+
+func TestReplayDrainNotArmed(t *testing.T) {
+	b := &XMPPBridge{}
+	if got := b.DrainReplay(context.Background()); got != nil {
+		t.Errorf("unarmed drain = %v, want nil", got)
 	}
 }

@@ -226,6 +226,68 @@ func TestSessionStateRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReplayWindowMarkers(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	t.Setenv("PI_MSG_CONFIG", cfg)
+	ts := time.Date(2026, 8, 11, 12, 34, 56, 0, time.UTC)
+	var logged []string
+	logf := func(level, msg string) { logged = append(logged, level+": "+msg) }
+
+	// Nothing written → no window, and reads are empty.
+	if start, ok := replayWindowStart("slippy"); ok || !start.IsZero() {
+		t.Fatalf("no markers, got (%v,%v)", start, ok)
+	}
+	if got := readSwapStart("slippy"); got != "" {
+		t.Fatalf("no swapstart, got %q", got)
+	}
+
+	// swapstart is one-shot: read once, consumed.
+	markSwapStart(logf, "slippy", ts)
+	if got := readSwapStart("slippy"); got != ts.UTC().Format(time.RFC3339) {
+		t.Errorf("swapstart read = %q", got)
+	}
+	if got := readSwapStart("slippy"); got != "" {
+		t.Errorf("swapstart should be consumed on first read, got %q", got)
+	}
+
+	// lastout is persistent: read does not consume it.
+	markLastOut(logf, "slippy", ts)
+	if got := readLastOut("slippy"); got != ts.UTC().Format(time.RFC3339) {
+		t.Errorf("lastout read = %q", got)
+	}
+	if got := readLastOut("slippy"); got != ts.UTC().Format(time.RFC3339) {
+		t.Errorf("lastout should persist across reads, got %q", got)
+	}
+
+	// replayWindowStart prefers swapstart over lastout.
+	later := ts.Add(5 * time.Minute)
+	markSwapStart(logf, "slippy", later)
+	markLastOut(logf, "slippy", ts)
+	start, ok := replayWindowStart("slippy")
+	if !ok || !start.UTC().Equal(later) {
+		t.Errorf("replayWindowStart = (%v,%v), want swapstart %v", start, ok, later)
+	}
+
+	// Once the swapstart is consumed, lastout is the fallback.
+	markLastOut(logf, "slippy", later)
+	start, ok = replayWindowStart("slippy")
+	if !ok || !start.UTC().Equal(later) {
+		t.Errorf("replayWindowStart fallback = (%v,%v), want lastout %v", start, ok, later)
+	}
+
+	// Invalid swapstart is treated as absent and consumed.
+	if err := os.WriteFile(windowMarkerPath("slippy", "swapstart"), []byte("bogus\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSwapStart("slippy"); got != "" {
+		t.Errorf("invalid swapstart should be ignored+consumed, got %q", got)
+	}
+	if len(logged) != 0 {
+		t.Errorf("unexpected warnings: %v", logged)
+	}
+}
+
 func TestStartDirectiveRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "config.json")

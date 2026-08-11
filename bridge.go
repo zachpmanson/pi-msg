@@ -34,9 +34,11 @@ type Bridge struct {
 	// Start-directive / volunteer-turn state. On a restart the operator CLIs
 	// write a one-shot directive ("proactive" → fire a volunteer turn on resume,
 	// "idle" → stay silent); the bridge reads and consumes it at startup.
-	resumed    bool   // a saved, usable session was resumed this launch
-	startDir   string // directive consumed at startup: "proactive", "idle", or ""
-	volunteered bool  // whether the proactive volunteer turn has been fired
+	resumed           bool   // a saved, usable session was resumed this launch
+	startDir          string // directive consumed at startup: "proactive", "idle", or ""
+	volunteered       bool   // whether the proactive volunteer turn has been fired
+	volunteerPending  bool   // proactive volunteer turn deferred until replay completes
+	replayWindowArmed bool   // a restart replay window was armed at startup
 
 	mu             sync.Mutex
 	streamingRun   bool
@@ -126,9 +128,22 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}
 
 	// Bring up XMPP first so we can report problems, then start pi.
+	// Restart-gap inbound replay: recover messages that arrived while this
+	// account was offline during a restart. Window start = graceful swapstart
+	// marker when present (consumed), else last-outbound fallback (kept). The
+	// XMPP layer buffers replay-window messages and hands them to the resumed
+	// session after the grace period (see onXMPPConnected).
+	if start, ok := replayWindowStart(b.acct.Name); ok {
+		if b.xmpp.SetReplayWindow(start) {
+			b.replayWindowArmed = true
+			b.log("info", "replay window armed from "+start.UTC().Format(time.RFC3339))
+		}
+	}
+
 	// No connect callback: the bot appearing online (presence "listening") is
-	// the startup signal now, in place of a chat banner.
-	go b.xmpp.Run(ctx, nil)
+	// the startup signal now, in place of a chat banner. The callback is used to
+	// trigger the buffered-message replay once the connection is up.
+	go b.xmpp.Run(ctx, b.onXMPPConnected)
 	if err := b.rpc.Start(); err != nil {
 		return err
 	}
@@ -143,9 +158,15 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// it (an --proactive start directive). This must happen here, not on an RPC
 	// session_start event: pi does NOT emit session_start over the RPC event
 	// stream (it's an extension lifecycle hook, not an RPC event), so a hook in
-	// handleRPCEvent would never run.
+	// handleRPCEvent would never run. When a replay window is armed, defer the
+	// volunteer turn until the buffered messages have been handed over (see
+	// replayInbound) so the real content lands first.
 	if b.resumed && b.startDir == StartProactive && !b.volunteered {
-		b.fireResumeTurn()
+		if b.replayWindowArmed {
+			b.volunteerPending = true
+		} else {
+			b.fireResumeTurn()
+		}
 	}
 
 	for {
@@ -223,6 +244,9 @@ func (b *Bridge) shutdown(reason string) {
 	// Clear the typing indicator (sends chat-state "active") while still online,
 	// so the owner isn't left seeing "typing…" against an offline bot.
 	b.stopTyping()
+	// Record the instant we go offline so the next launch's replay window can
+	// recover messages that arrive during the swap.
+	markSwapStart(b.log, b.acct.Name, time.Now())
 	b.xmpp.GoOffline(fmt.Sprintf("offline — session ended (%s) at %s", reason, nowStamp()))
 	// Save the session file pi is currently on so the next launch resumes it.
 	b.refreshSessionFile()
@@ -1334,6 +1358,40 @@ func (b *Bridge) fireResumeTurn() {
 			"If you have nothing worth volunteering, reply with nothing at all.",
 		b.steerBehavior())
 	b.xmpp.SetPresence("dnd", "thinking…")
+}
+
+// onXMPPConnected runs on the XMPP goroutine after the first successful connect
+// and presence/room setup. When a restart-gap replay window is armed, it kicks
+// off the drain so buffered swap-window messages are handed to the resumed
+// session once the grace period elapses.
+func (b *Bridge) onXMPPConnected() {
+	if !b.replayWindowArmed {
+		return
+	}
+	b.replayWindowArmed = false
+	go b.replayInbound()
+}
+
+// replayInbound blocks until the replay windows closes, then hands any buffered
+// swap-window messages to the resumed session (banner first), followed by a
+// deferred proactive volunteer turn. Runs on its own goroutine; the drain
+// itself is bounded by the grace period and ctx.
+func (b *Bridge) replayInbound() {
+	msgs := b.xmpp.DrainReplay(b.ctx)
+	if len(msgs) > 0 && b.ctx.Err() == nil {
+		b.reply(fmt.Sprintf("Back online, catching up on %d messages", len(msgs)))
+		for _, m := range msgs {
+			if m.Direct {
+				b.handleCanonical(m.Body, b.acct.Owner, "", m.From, m.ID)
+			} else {
+				b.handleRoom(m)
+			}
+		}
+	}
+	if b.volunteerPending {
+		b.volunteerPending = false
+		b.fireResumeTurn()
+	}
 }
 
 // --- pure helpers ---

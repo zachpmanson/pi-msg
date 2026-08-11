@@ -243,6 +243,89 @@ func writeStartDirective(log func(level, msg string), acct string, v string) {
 	}
 }
 
+// windowMarkerPath returns the per-account replay-window marker file, stored
+// alongside the config as <config-dir>/<account>.<kind>. Two kinds exist:
+// "swapstart" (one-shot, written on graceful shutdown) and "lastout"
+// (persistent floor, updated on every outbound message).
+func windowMarkerPath(acct, kind string) string {
+	return filepath.Join(filepath.Dir(configPath()), acct+"."+kind)
+}
+
+// writeWindowMarker writes an RFC3339 window marker for an account. Best-effort
+// like the session/start directive writers: errors are logged, never fatal.
+func writeWindowMarker(log func(level, msg string), acct, kind string, t time.Time) {
+	p := windowMarkerPath(acct, kind)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		if log != nil {
+			log("warning", "replay window: mkdir: "+err.Error())
+		}
+		return
+	}
+	if err := os.WriteFile(p, []byte(t.UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+		if log != nil {
+			log("warning", "replay window: write: "+err.Error())
+		}
+	}
+}
+
+// markSwapStart records the instant the account went offline for a graceful
+// restart. One-shot: the next launch reads and consumes it to open its replay
+// window, so it never leaks into a later, unrelated restart.
+func markSwapStart(log func(level, msg string), acct string, t time.Time) {
+	writeWindowMarker(log, acct, "swapstart", t)
+}
+
+// markLastOut updates the persistent last-outbound floor — the time the bridge
+// last emitted a chat message. Kept (never consumed) so an ungraceful crash can
+// still bound its replay window: any inbound stamped after the last outbound
+// cannot have been answered, hence was never processed.
+func markLastOut(log func(level, msg string), acct string, t time.Time) {
+	writeWindowMarker(log, acct, "lastout", t)
+}
+
+// readSwapStart reads and consumes the graceful-swap marker, returning its
+// RFC3339 timestamp or "" when absent. Invalid contents are treated as absent
+// and the file is removed.
+func readSwapStart(acct string) string {
+	p := windowMarkerPath(acct, "swapstart")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	_ = os.Remove(p)
+	v := strings.TrimSpace(string(raw))
+	if _, err := time.Parse(time.RFC3339, v); err != nil {
+		return ""
+	}
+	return v
+}
+
+// readLastOut reads the persistent last-outbound floor without consuming it.
+func readLastOut(acct string) string {
+	raw, err := os.ReadFile(windowMarkerPath(acct, "lastout"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// replayWindowStart resolves the inbound-replay window start at startup: the
+// graceful-swap marker when present (consumed), else the last-outbound fallback
+// (kept). Returns the resolved start time and whether a window is active.
+func replayWindowStart(acct string) (time.Time, bool) {
+	if s := readSwapStart(acct); s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t, true
+		}
+	}
+	if s := readLastOut(acct); s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
 // errNoConfig is returned by loadConfig when the config file does not exist,
 // so main can distinguish "not set up" from a real read/parse error.
 var errNoConfig = errors.New("pi-msg: no config file")

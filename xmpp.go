@@ -34,6 +34,20 @@ import (
 // stanzas.
 const maxBody = 50000
 
+// Restart-gap inbound replay: messages the server replayed (offline storage /
+// MUC history) that carry a delay stamp inside the swap window are buffered and
+// handed to the resumed session instead of being dropped as stale backfill.
+const (
+	// replayGracePeriod is how long after (re)connect the bridge accepts
+	// server-replayed (delayed) messages as belonging to the restart gap. The
+	// offline/MUC backlog lands within a moment of connect; this lets it all
+	// arrive while keeping the window tight.
+	replayGracePeriod = 3 * time.Second
+	// replaySlack tolerates clock skew when matching a message's delay stamp to
+	// the swap window.
+	replaySlack = 2 * time.Second
+)
+
 const chatStatesNS = "http://jabber.org/protocol/chatstates"
 
 // Receipt namespaces: XEP-0184 message delivery receipts and XEP-0333 chat
@@ -152,6 +166,18 @@ type XMPPBridge struct {
 	// send_reaction can target arbitrary messages by ID. Capped at 500 entries;
 	// oldest is evicted when full.
 	msgHistory map[string]msgHistoryEntry
+
+	// Restart-gap replay state. replayStart is the swap-window start (when the
+	// account went offline); replayArmed is set once at startup when a window
+	// marker exists; on the first successful connect the window is "lit" and
+	// delayed messages stamped within it are buffered into replayBuf until
+	// replayGraceEnd. DrainReplay hands the buffer to the resumed session.
+	replayStart    time.Time
+	replayArmed    bool
+	replayLit      bool // replay window armed on the first connect only
+	replayActive   bool // currently collecting swap-window messages
+	replayGraceEnd time.Time
+	replayBuf      []InboundMessage
 }
 
 // NewXMPPBridge constructs a bridge. onMsg is called for each message that
@@ -162,17 +188,17 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		roomBares[bareJid(room)] = true
 	}
 	b := &XMPPBridge{
-		acct:       acct,
-		ownerBare:  bareJid(acct.Owner),
-		roomBares:  roomBares,
-		onMsg:      onMsg,
-		logf:       logf,
-		presence:   "awake (" + nowStamp() + ")",
+		acct:        acct,
+		ownerBare:   bareJid(acct.Owner),
+		roomBares:   roomBares,
+		onMsg:       onMsg,
+		logf:        logf,
+		presence:    "awake (" + nowStamp() + ")",
 		startStatus: "awake",
-		seen:       make(map[string]struct{}),
-		occupants:  make(map[string]map[string]string),
-		selfNick:   make(map[string]string),
-		msgHistory: make(map[string]msgHistoryEntry),
+		seen:        make(map[string]struct{}),
+		occupants:   make(map[string]map[string]string),
+		selfNick:    make(map[string]string),
+		msgHistory:  make(map[string]msgHistoryEntry),
 	}
 	b.loadAvatar()
 	return b
@@ -284,6 +310,17 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 		b.log("info", fmt.Sprintf("joined write-only error room %s as %s", b.acct.ErrorRoom, b.acct.Nick))
 	}
 	b.log("info", fmt.Sprintf("online as %s, relaying to %s", b.acct.JID, b.ownerBare))
+	// Open the restart-gap replay window on this (the first) connection. The
+	// offline/MUC backlog is delivered right after presence/join, so any delayed
+	// message stamped within the swap window gets buffered until the grace
+	// window closes.
+	b.mu.Lock()
+	if b.replayArmed && !b.replayLit {
+		b.replayLit = true
+		b.replayActive = true
+		b.replayGraceEnd = time.Now().Add(replayGracePeriod)
+	}
+	b.mu.Unlock()
 	if onConnected != nil {
 		onConnected()
 	}
@@ -324,6 +361,80 @@ func (b *XMPPBridge) setOffline() {
 	b.online = false
 	b.session = nil
 	b.mu.Unlock()
+}
+
+// SetReplayWindow arms inbound replay for the restart gap. Call before Run;
+// start is the swap-window start (the time the account went offline). Returns
+// true when a window was armed.
+func (b *XMPPBridge) SetReplayWindow(start time.Time) bool {
+	if start.IsZero() {
+		return false
+	}
+	b.mu.Lock()
+	b.replayStart = start
+	b.replayArmed = true
+	b.mu.Unlock()
+	return true
+}
+
+// swapWindowActive reports whether the replay window is currently open (armed,
+// lit on the first connect, and still inside its grace period).
+func (b *XMPPBridge) swapWindowActive() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.replayActive && time.Now().Before(b.replayGraceEnd)
+}
+
+// inSwapWindow reports whether a delayed message's stamp falls within the swap
+// window (allowing clock skew).
+func (b *XMPPBridge) inSwapWindow(stamp time.Time) bool {
+	if stamp.IsZero() {
+		return false
+	}
+	b.mu.Lock()
+	start := b.replayStart
+	b.mu.Unlock()
+	return !stamp.Add(replaySlack).Before(start)
+}
+
+// bufferReplay appends a swap-window message to the restart replay buffer,
+// preserving delivery order.
+func (b *XMPPBridge) bufferReplay(m InboundMessage) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.replayBuf = append(b.replayBuf, m)
+}
+
+// DrainReplay blocks until the replay-window grace period has elapsed after the
+// first connection, then returns (and clears) the buffered swap-window messages.
+// It returns nil immediately if no window was armed, and nil on ctx cancel.
+func (b *XMPPBridge) DrainReplay(ctx context.Context) []InboundMessage {
+	b.mu.Lock()
+	active, end := b.replayActive, b.replayGraceEnd
+	b.mu.Unlock()
+	if !active {
+		return nil
+	}
+	if d := time.Until(end); d > 0 {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(d):
+		}
+	}
+	b.mu.Lock()
+	buf := b.replayBuf
+	b.replayBuf = nil
+	b.replayActive = false
+	b.mu.Unlock()
+	return buf
+}
+
+// markOutbound updates the persistent last-outbound floor so an ungraceful
+// crash can still bound its replay window. Called whenever a chat message is
+// actually sent.
+func (b *XMPPBridge) markOutbound() {
+	markLastOut(b.logf, b.acct.Name, time.Now())
 }
 
 // pingTimeout bounds each keepalive ping's round trip.
@@ -441,9 +552,10 @@ type incomingMsg struct {
 	typ         string
 	body        string
 	id          string
-	delay       bool // carried an XEP-0203 <delay/> (server-replayed history)
-	wantReceipt bool // carried a XEP-0184 <request/> (delivery receipt)
-	markable    bool // carried a XEP-0333 <markable/> (chat marker)
+	delay       bool      // carried a XEP-0203 <delay/> (server-replayed history)
+	delayStamp  time.Time // the <delay stamp> attr, zero if absent/unparsable
+	wantReceipt bool      // carried a XEP-0184 <request/> (delivery receipt)
+	markable    bool      // carried a XEP-0333 <markable/> (chat marker)
 }
 
 // handle is the mellium read-loop callback for one inbound stanza.
@@ -460,7 +572,14 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 			id:   attr(start.Attr, "id"),
 			body: childText(toks, "body"),
 		}
-		_, m.delay = element(toks, "urn:xmpp:delay", "delay")
+		if d, ok := element(toks, "urn:xmpp:delay", "delay"); ok {
+			m.delay = true
+			if s := attr(d.Attr, "stamp"); s != "" {
+				if t, err := time.Parse(time.RFC3339, s); err == nil {
+					m.delayStamp = t
+				}
+			}
+		}
 		_, m.wantReceipt = element(toks, receiptsNS, "request")
 		_, m.markable = element(toks, chatMarkersNS, "markable")
 		b.dispatch(m)
@@ -539,9 +658,16 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if strings.TrimSpace(m.body) == "" {
 		return // chat-states, receipts, empty
 	}
-	// Drop server-replayed history (offline / MAM catch-up on reconnect) so a
-	// blip doesn't reprocess old messages.
+	// Drop server-replayed history (offline / MAM catch-up on reconnect) unless
+	// it falls inside the restart swap window — then buffer it for the resumed
+	// session instead of silently dropping it.
 	if m.delay {
+		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
+			b.bufferReplay(InboundMessage{
+				Body: m.body, RealJID: b.ownerBare, FromOwner: true,
+				Direct: true, ID: m.id, From: m.from,
+			})
+		}
 		return
 	}
 	if m.id != "" && b.seenDuplicate(m.id) {
@@ -574,7 +700,21 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 		return // our own echo
 	}
 	if m.delay {
-		return // replayed history
+		// Replayed MUC history: buffer only what falls inside the restart swap
+		// window for the resumed session; drop the rest as stale backfill.
+		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
+			real := b.occupantRealJID(room, nick)
+			b.bufferReplay(InboundMessage{
+				Body:      m.body,
+				Nick:      nick,
+				RealJID:   real,
+				FromOwner: real != "" && real == b.ownerBare,
+				Room:      room,
+				ID:        m.id,
+				From:      m.from,
+			})
+		}
+		return
 	}
 	if strings.TrimSpace(m.body) == "" {
 		return // subject-only, chat-states, empty
@@ -698,6 +838,9 @@ func (b *XMPPBridge) SendChatTo(to, text string) string {
 			break
 		}
 		lastID = id
+	}
+	if lastID != "" {
+		b.markOutbound()
 	}
 	return lastID
 }
@@ -1150,6 +1293,9 @@ func (b *XMPPBridge) SendRoomTo(room, text string) string {
 			break
 		}
 		lastID = id
+	}
+	if lastID != "" {
+		b.markOutbound()
 	}
 	return lastID
 }
