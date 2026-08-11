@@ -31,6 +31,13 @@ type Bridge struct {
 	// restart resumes it (only /new resets context).
 	sessionFile string
 
+	// Start-directive / volunteer-turn state. On a restart the operator CLIs
+	// write a one-shot directive ("proactive" → fire a volunteer turn on resume,
+	// "idle" → stay silent); the bridge reads and consumes it at startup.
+	resumed    bool   // a saved, usable session was resumed this launch
+	startDir   string // directive consumed at startup: "proactive", "idle", or ""
+	volunteered bool  // whether the proactive volunteer turn has been fired
+
 	mu             sync.Mutex
 	streamingRun   bool
 	repliedThisRun bool
@@ -97,15 +104,19 @@ func (b *Bridge) Run(ctx context.Context) error {
 	tools := []string{"file", "reaction"}
 	b.rpc.env = []string{"PI_MSG_TOOLS=" + strings.Join(tools, ",")}
 
-	// Session persistence: if we saved a session file on a previous run and it
-	// still exists (non-empty) on disk, resume it so a restart continues the
-	// conversation — only /new resets context. Missing/deleted files fall back
-	// to a fresh session.
-	// The presence label distinguishes the two: "resumed" for a continuation,
+	// Session persistence: we always continue from the last session when one is
+	// usable. If we saved a session file on a previous run and it still exists
+	// (non-empty) on disk, resume it so a restart continues the conversation —
+	// only /new resets context, and a "fresh" restart is never requested via the
+	// CLI (the choice is proactive vs idle, not fresh). Missing/deleted files
+	// fall back to a fresh session.
+	// The presence label reflects the outcome: "resumed" for a continuation,
 	// "awake" for a fresh start.
+	b.startDir = loadStartDirective(b.acct.Name)
 	if prev := loadSessionState(b.acct.Name); prev != "" && sessionFileUsable(prev) {
 		b.rpc.sessionPath = prev
-		b.log("info", fmt.Sprintf("resuming session %s", prev))
+		b.log("info", fmt.Sprintf("resuming session %s (start=%s)", prev, startLabel(b.startDir)))
+		b.resumed = true
 		b.xmpp.SetStartupStatus("resumed")
 	} else {
 		if prev != "" {
@@ -234,9 +245,10 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.firePendingNudge()
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
-		if !b.replied() {
+		if !b.replied() && !b.volunteered {
 			b.reply("✅ done (no reply) — your turn")
 		}
+		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
 	case "message_update":
 		b.handleStreamDelta(ev)
 	case "tool_execution_start":
@@ -253,6 +265,12 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// Session swapped (startup, /new, /resume, /fork): record the now-active
 		// file so a restart resumes it. Only /new actually resets context.
 		b.refreshSessionFile()
+		// Only fire the proactive volunteer turn once, on a resumed session that
+		// requested it (the CLI wrote a "proactive" start directive). session_start
+		// guarantees pi is fully initialized before we inject a prompt.
+		if b.resumed && b.startDir == StartProactive && !b.volunteered {
+			b.fireResumeTurn()
+		}
 	case "message_end":
 		msg := ev.Obj("message")
 		if msg == nil || msg.Str("role") != "assistant" {
@@ -1285,6 +1303,32 @@ func (b *Bridge) steerBehavior() string {
 		return "steer"
 	}
 	return ""
+}
+
+// startLabel renders a human-readable directive value for logs.
+func startLabel(v string) string {
+	switch v {
+	case StartProactive:
+		return "proactive"
+	case StartIdle:
+		return "idle"
+	}
+	return "auto (idle default)"
+}
+
+// fireResumeTurn injects a single synthetic prompt so the resumed agent can
+// volunteer a line to the owner (start directive "proactive"). If it has
+// nothing to volunteer it replies with nothing, and agent_settled stays silent.
+func (b *Bridge) fireResumeTurn() {
+	b.volunteered = true
+	b.setLifecycleReactTarget("", "")
+	b.setTurnDest(b.acct.Owner)
+	b.rpc.Prompt(
+		"Startup: your session was resumed (continued from a previous process). "+
+			"You may volunteer one brief message to the owner now, beginning with a line \"to: <jid>\". "+
+			"If you have nothing worth volunteering, reply with nothing at all.",
+		b.steerBehavior())
+	b.xmpp.SetPresence("dnd", "thinking…")
 }
 
 // --- pure helpers ---

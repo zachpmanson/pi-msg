@@ -192,6 +192,57 @@ func saveSessionState(log func(level, msg string), acct, path string) {
 	}
 }
 
+// StartDirective is the per-restart choice of whether the resumed agent should
+// proactively trigger a reply ("proactive") or stay silent ("idle"). The
+// operator CLIs (deploy-service, persona-ctl) write it to a directive file
+// before restarting; the bridge reads and consumes it once at startup.
+const (
+	StartProactive = "proactive" // resume + fire a volunteer turn (agent offers a line)
+	StartIdle      = "idle"      // resume + stay silent (just the resumed presence)
+)
+
+// startDirectivePath returns the per-account restart-directive file, stored
+// alongside the session state as <config-dir>/<account>.start.
+func startDirectivePath(acct string) string {
+	return filepath.Join(filepath.Dir(configPath()), acct+".start")
+}
+
+// loadStartDirective reads and consumes the per-account restart directive,
+// returning "proactive", "idle", or "" when none is present. The directive is
+// a one-shot handoff from the operator CLI: it is removed once read so it never
+// leaks into a later, unrelated restart. Invalid contents are treated as
+// absent and the file is removed.
+func loadStartDirective(acct string) string {
+	p := startDirectivePath(acct)
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	_ = os.Remove(p)
+	v := strings.TrimSpace(string(raw))
+	if v != StartProactive && v != StartIdle {
+		return ""
+	}
+	return v
+}
+
+// writeStartDirective records a restart directive so the next launch behaves
+// accordingly. Errors are logged, not fatal.
+func writeStartDirective(log func(level, msg string), acct string, v string) {
+	p := startDirectivePath(acct)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		if log != nil {
+			log("warning", "start directive: mkdir: "+err.Error())
+		}
+		return
+	}
+	if err := os.WriteFile(p, []byte(v+"\n"), 0o600); err != nil {
+		if log != nil {
+			log("warning", "start directive: write: "+err.Error())
+		}
+	}
+}
+
 // errNoConfig is returned by loadConfig when the config file does not exist,
 // so main can distinguish "not set up" from a real read/parse error.
 var errNoConfig = errors.New("pi-msg: no config file")

@@ -225,3 +225,42 @@ func TestSessionStateRoundTrip(t *testing.T) {
 		t.Errorf("different account read %q, want empty", got)
 	}
 }
+
+func TestStartDirectiveRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	t.Setenv("PI_MSG_CONFIG", cfg)
+
+	// Nothing written → no directive, and the call is a no-op.
+	if got := loadStartDirective("slippy"); got != "" {
+		t.Fatalf("no directive written, got %q", got)
+	}
+	var logged []string
+	logf := func(level, msg string) { logged = append(logged, level+": "+msg) }
+
+	writeStartDirective(logf, "slippy", StartProactive)
+	if got := loadStartDirective("slippy"); got != StartProactive {
+		t.Errorf("after write, load = %q, want %q", got, StartProactive)
+	}
+	// The directive is one-shot: consumed when read.
+	if got := loadStartDirective("slippy"); got != "" {
+		t.Errorf("directive should be consumed on first read, got %q", got)
+	}
+
+	// Idle round-trips too.
+	writeStartDirective(logf, "slippy", StartIdle)
+	if got := loadStartDirective("slippy"); got != StartIdle {
+		t.Errorf("idle directive, load = %q", got)
+	}
+
+	// Invalid contents are treated as absent and consumed (no error).
+	if err := os.WriteFile(startDirectivePath("slippy"), []byte("bogus\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadStartDirective("slippy"); got != "" {
+		t.Errorf("invalid directive should be ignored, got %q", got)
+	}
+	if len(logged) != 0 {
+		t.Errorf("unexpected warnings: %v", logged)
+	}
+}
