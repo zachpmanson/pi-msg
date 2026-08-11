@@ -153,6 +153,45 @@ func configPath() string {
 	return filepath.Join(home, ".config", "pi-msg", "config.json")
 }
 
+// sessionStatePath returns the per-account session state file (the absolute
+// path of the pi session to resume on the next launch), stored alongside the
+// config file as <config-dir>/<account>.session.
+func sessionStatePath(acct string) string {
+	return filepath.Join(filepath.Dir(configPath()), acct+".session")
+}
+
+// loadSessionState reads the persisted pi session file path for an account,
+// returning "" when none is saved.
+func loadSessionState(acct string) string {
+	raw, err := os.ReadFile(sessionStatePath(acct))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// saveSessionState writes the account's pi session file path so a restart can
+// resume it, or removes the state file when path is empty (defensive; the
+// bridge never explicitly clears it). Errors are logged, not fatal.
+func saveSessionState(log func(level, msg string), acct, path string) {
+	p := sessionStatePath(acct)
+	if path == "" {
+		_ = os.Remove(p)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		if log != nil {
+			log("warning", "session persistence: mkdir: "+err.Error())
+		}
+		return
+	}
+	if err := os.WriteFile(p, []byte(strings.TrimSpace(path)+"\n"), 0o600); err != nil {
+		if log != nil {
+			log("warning", "session persistence: write: "+err.Error())
+		}
+	}
+}
+
 // errNoConfig is returned by loadConfig when the config file does not exist,
 // so main can distinguish "not set up" from a real read/parse error.
 var errNoConfig = errors.New("pi-msg: no config file")

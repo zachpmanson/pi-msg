@@ -58,8 +58,11 @@ type RPCClient struct {
 	model   string
 	cwd     string
 	extPath string       // optional companion extension to load via `-e`
-	env     []string     // extra environment ("KEY=value") for the pi process
-	stderr  func(string) // optional per-line stderr sink
+	// sessionPath, when set, resumes that session file on launch via
+	// `--session`. Set before Start().
+	sessionPath string
+	env         []string // extra environment ("KEY=value") for the pi process
+	stderr      func(string) // optional per-line stderr sink
 
 	events chan Event
 	done   chan struct{} // closed once pi exits
@@ -116,6 +119,9 @@ func (c *RPCClient) Start() error {
 	}
 	if c.extPath != "" {
 		args = append(args, "-e", c.extPath)
+	}
+	if c.sessionPath != "" {
+		args = append(args, "--session", c.sessionPath)
 	}
 	cmd := exec.Command(c.bin, args...)
 	cmd.Dir = c.cwd

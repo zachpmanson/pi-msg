@@ -201,3 +201,27 @@ func TestResolveAccountErrorRoom(t *testing.T) {
 		t.Errorf("ErrorRoom = %q, want %q", got.ErrorRoom, "errors@muc.x")
 	}
 }
+
+func TestSessionStateRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	t.Setenv("PI_MSG_CONFIG", cfg)
+
+	if got := loadSessionState("slippy"); got != "" {
+		t.Fatalf("no state saved, got %q", got)
+	}
+	var logged []string
+	logf := func(level, msg string) { logged = append(logged, level+": "+msg) }
+
+	saveSessionState(logf, "slippy", "/some/path/session.jsonl")
+	if got := loadSessionState("slippy"); got != "/some/path/session.jsonl" {
+		t.Errorf("after save, load = %q", got)
+	}
+	if len(logged) != 0 {
+		t.Errorf("unexpected warnings: %v", logged)
+	}
+	// Per-account isolation.
+	if got := loadSessionState("beltino"); got != "" {
+		t.Errorf("different account read %q, want empty", got)
+	}
+}

@@ -27,6 +27,10 @@ type Bridge struct {
 	rpc  *RPCClient
 	ctx  context.Context
 
+	// sessionFile is the active pi session file, persisted per-account so a
+	// restart resumes it (only /new resets context).
+	sessionFile string
+
 	mu             sync.Mutex
 	streamingRun   bool
 	repliedThisRun bool
@@ -93,6 +97,17 @@ func (b *Bridge) Run(ctx context.Context) error {
 	tools := []string{"file", "reaction"}
 	b.rpc.env = []string{"PI_MSG_TOOLS=" + strings.Join(tools, ",")}
 
+	// Session persistence: if we saved a session file on a previous run and it
+	// still exists (non-empty) on disk, resume it so a restart continues the
+	// conversation — only /new resets context. Missing/deleted files fall back
+	// to a fresh session.
+	if prev := loadSessionState(b.acct.Name); prev != "" && sessionFileUsable(prev) {
+		b.rpc.sessionPath = prev
+		b.log("info", fmt.Sprintf("resuming session %s", prev))
+	} else if prev != "" {
+		b.log("info", "saved session file missing or empty; starting fresh")
+	}
+
 	// Bring up XMPP first so we can report problems, then start pi.
 	// No connect callback: the bot appearing online (presence "listening") is
 	// the startup signal now, in place of a chat banner.
@@ -101,6 +116,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		return err
 	}
 	b.log("info", fmt.Sprintf("bridging account %q (%s) to owner %s", b.acct.Name, b.acct.JID, b.acct.Owner))
+	// Record which session pi is now on (fresh or resumed) so a future restart
+	// can resume it.
+	b.refreshSessionFile()
 
 	for {
 		select {
@@ -136,6 +154,32 @@ func (b *Bridge) onPiExit() error {
 	return fmt.Errorf("pi exited unexpectedly")
 }
 
+// sessionFileUsable reports whether path is a plausible, non-empty pi session
+// file that a /new launch can safely resume.
+func sessionFileUsable(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir() && fi.Size() > 0
+}
+
+// refreshSessionFile asks pi which session file is active and persists it to
+// the account's state file so a restart can resume the same conversation. It
+// is best-effort: errors are logged, never fatal.
+func (b *Bridge) refreshSessionFile() {
+	res, err := b.rpc.GetState(b.ctx)
+	if err != nil {
+		b.log("warning", "session persistence: get_state failed: "+err.Error())
+		return
+	}
+	p := res.Obj("data").Str("sessionFile")
+	if p == "" {
+		b.log("warning", "session persistence: get_state returned no session file")
+		return
+	}
+	b.sessionFile = p
+	saveSessionState(b.log, b.acct.Name, p)
+	b.log("info", "session: "+p)
+}
+
 // nowStamp is a short local timestamp for presence status lines.
 func nowStamp() string { return time.Now().Format("2006-01-02 15:04:05 MST") }
 
@@ -152,6 +196,8 @@ func (b *Bridge) shutdown(reason string) {
 	// so the owner isn't left seeing "typing…" against an offline bot.
 	b.stopTyping()
 	b.xmpp.GoOffline(fmt.Sprintf("offline — session ended (%s) at %s", reason, nowStamp()))
+	// Save the session file pi is currently on so the next launch resumes it.
+	b.refreshSessionFile()
 	b.rpc.Stop()
 }
 
@@ -197,6 +243,10 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.xmpp.SetPresence("dnd", "retrying (transient error)…")
 	case "auto_retry_end":
 		b.xmpp.SetPresence("dnd", "thinking…")
+	case "session_start":
+		// Session swapped (startup, /new, /resume, /fork): record the now-active
+		// file so a restart resumes it. Only /new actually resets context.
+		b.refreshSessionFile()
 	case "message_end":
 		msg := ev.Obj("message")
 		if msg == nil || msg.Str("role") != "assistant" {

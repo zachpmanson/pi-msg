@@ -14,6 +14,13 @@ command layer).
 
 ## How it works
 
+Conversations are persisted across restarts: pi-msg records the pi session file
+(`<config-dir>/<account>.session`) on startup, whenever the session changes
+(`/new`, `/resume`, `/fork`), and on shutdown — then resumes it on the next
+launch via `pi --session <file>`. A bridge restart therefore **continues the
+previous conversation**; only `/new` resets context. If the saved session file
+is missing or empty, pi-msg starts a fresh session instead.
+
 ```mermaid
 sequenceDiagram
     participant You as You (XMPP client)
