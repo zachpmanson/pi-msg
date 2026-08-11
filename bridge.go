@@ -134,8 +134,19 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}
 	b.log("info", fmt.Sprintf("bridging account %q (%s) to owner %s", b.acct.Name, b.acct.JID, b.acct.Owner))
 	// Record which session pi is now on (fresh or resumed) so a future restart
-	// can resume it.
+	// can resume it. refreshSessionFile does a get_state Request round-trip, which
+	// also confirms pi is live and reading stdin — a safe point to inject the
+	// proactive volunteer turn.
 	b.refreshSessionFile()
+
+	// Fire the proactive volunteer turn once, on a resumed session that requested
+	// it (an --proactive start directive). This must happen here, not on an RPC
+	// session_start event: pi does NOT emit session_start over the RPC event
+	// stream (it's an extension lifecycle hook, not an RPC event), so a hook in
+	// handleRPCEvent would never run.
+	if b.resumed && b.startDir == StartProactive && !b.volunteered {
+		b.fireResumeTurn()
+	}
 
 	for {
 		select {
@@ -265,12 +276,6 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// Session swapped (startup, /new, /resume, /fork): record the now-active
 		// file so a restart resumes it. Only /new actually resets context.
 		b.refreshSessionFile()
-		// Only fire the proactive volunteer turn once, on a resumed session that
-		// requested it (the CLI wrote a "proactive" start directive). session_start
-		// guarantees pi is fully initialized before we inject a prompt.
-		if b.resumed && b.startDir == StartProactive && !b.volunteered {
-			b.fireResumeTurn()
-		}
 	case "message_end":
 		msg := ev.Obj("message")
 		if msg == nil || msg.Str("role") != "assistant" {
