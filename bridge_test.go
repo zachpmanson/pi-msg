@@ -194,6 +194,58 @@ func TestRoutingNudgeBound(t *testing.T) {
 	}
 }
 
+// TestStagedNudgeLifecycle verifies issue #16's core flow: rejectReply stages
+// a correction that is only fired at settle if a later message didn't route.
+func TestStagedNudgeLifecycle(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+
+	// Nothing staged → nothing to fire.
+	if got := b.takeStagedNudge(); got != "" {
+		t.Errorf("empty staged nudge → got %q, want empty", got)
+	}
+
+	// Stage a correction (as rejectReply does), then a later message routes
+	// fine → the staged nudge is cleared and never fires.
+	b.stageNudge("dropped body", "no to: line")
+	b.clearPendingNudge()
+	if got := b.takeStagedNudge(); got != "" {
+		t.Errorf("staged nudge after clear → got %q, want empty", got)
+	}
+
+	// Stage a correction and fire at settle → reason fires exactly once.
+	b.stageNudge("dropped body", "no to: line")
+	if got := b.takeStagedNudge(); got != "no to: line" {
+		t.Errorf("settled nudge reason = %q, want %q", got, "no to: line")
+	}
+	if got := b.takeStagedNudge(); got != "" {
+		t.Errorf("staged nudge should fire once, got %q on second take", got)
+	}
+
+	// Later staging replaces earlier — only the final reason is nudged.
+	b.stageNudge("a", "reason one")
+	b.stageNudge("b", "reason two")
+	if got := b.takeStagedNudge(); got != "reason two" {
+		t.Errorf("latest staged reason = %q, want %q", got, "reason two")
+	}
+}
+
+// TestStagedNudgeRespectsBudget verifies the per-turn cap still bounds the
+// settle-time reminder even with a single staging point.
+func TestStagedNudgeRespectsBudget(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	b.stageNudge("a", "r1")
+	b.stageNudge("b", "r2")
+	if got := b.takeStagedNudge(); got != "r2" {
+		t.Fatalf("first staged nudge = %q, want r2", got)
+	}
+	// Both staged nudges consumed the budget now; a fresh turn resets it.
+	b.resetRoutingNudges()
+	b.stageNudge("c", "r3")
+	if got := b.takeStagedNudge(); got != "r3" {
+		t.Errorf("post-reset staged nudge = %q, want r3", got)
+	}
+}
+
 func TestPrettyDump(t *testing.T) {
 	jsonl := strings.Join([]string{
 		`{"type":"session","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/proj"}`,

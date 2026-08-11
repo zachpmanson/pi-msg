@@ -31,11 +31,12 @@ type Bridge struct {
 	streamingRun   bool
 	repliedThisRun bool
 	shuttingDown   bool
-	directTurn     bool   // active turn arrived as a 1:1 owner DM (drives typing)
-	routingNudges  int    // mis-routed-reply corrections sent this user turn (bounded)
-	reactTo        string // full JID of the owner message the current run reacts to
-	reactID        string // stanza id of that message (XEP-0444 target); "" disables
-	turnDest       string // reply destination for the current turn (owner or room jid)
+	directTurn     bool          // active turn arrived as a 1:1 owner DM (drives typing)
+	routingNudges  int           // mis-routed-reply corrections sent this user turn (bounded)
+	pendingNudge   *pendingNudge // staged routing correction, decided at agent_settled (#16)
+	reactTo        string        // full JID of the owner message the current run reacts to
+	reactID        string        // stanza id of that message (XEP-0444 target); "" disables
+	turnDest       string        // reply destination for the current turn (owner or room jid)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -166,6 +167,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 	case "agent_start":
 		b.setStreaming(true)
 		b.setReplied(false)
+		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
 		b.xmpp.SetPresence("dnd", "thinking…")
 		b.lifecycleReact("👀") // picked up (opt-in via the reactions flag)
 	case "agent_settled":
@@ -173,6 +175,11 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.stopTyping()
 		b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
 		b.lifecycleReact("✅") // done
+		// The routing reminder decision happens here (issue #16): mid-run
+		// malformed commentary drops silently, and the agent is only nudged if
+		// the run's FINAL message was malformed (pending nudge set AND nothing
+		// successfully delivered after it). Not before.
+		b.firePendingNudge()
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		if !b.replied() {
@@ -827,6 +834,12 @@ func (b *Bridge) deliverReply(text string) {
 			} else {
 				stanzaID = b.xmpp.SendChatTo(s.dest, s.body)
 			}
+			// A message routed successfully — any staged correction no longer
+			// applies (#16: nudge only if the FINAL message was malformed, and
+			// "a later message routed fine" discards the staged nudge).
+			if stanzaID != "" {
+				b.clearPendingNudge()
+			}
 			// Update reaction target to the last-segment message so subsequent
 			// send_reaction calls target the agent's own most recent message.
 			if stanzaID != "" {
@@ -840,20 +853,73 @@ func (b *Bridge) deliverReply(text string) {
 	}
 }
 
-// maxRoutingNudges bounds how many times per user turn we ask the agent to fix
-// a mis-routed reply, so a stubbornly-malformed agent can't loop forever.
+// maxRoutingNudges bounds how many routing reminders we send per user turn, so
+// a stubbornly-malformed agent can't loop forever. Applied at settle time (the
+// only point a reminder can fire, per #16).
 const maxRoutingNudges = 2
 
+// pendingNudge is a malformed room-mode reply staged while the agent streams.
+// The routing reminder is only sent at agent_settled if the run's FINAL
+// message was malformed (issue #16) — mid-run commentary drops silently, and a
+// message that later routes fine clears the staged correction.
+type pendingNudge struct {
+	body   string
+	reason string
+}
+
 // rejectReply handles a room-mode reply that couldn't be routed: it forwards the
-// text to the owner with a note that it was dropped from its intended
-// destination, then (bounded) nudges the agent to resend with a valid "to:"
-// line. The nudge is a steering message, so it isn't confused for a real user.
+// text to the write-only error room (falling back to the owner's 1:1 if unset),
+// then stages a routing correction. The actual nudge prompt is deferred to
+// agent_settled (firePendingNudge, issue #16), so mid-stream thinking
+// commentary never triggers a routing reminder.
 func (b *Bridge) rejectReply(body, reason string) {
 	b.log("warning", "agent reply not routed: "+reason)
 	b.routeDropped(fmt.Sprintf("⚠️ malformed message: %s\n\n%s", reason, body))
-	if b.bumpRoutingNudge() {
-		b.rpc.Prompt(fmt.Sprintf("Your previous message was NOT delivered to anyone in the chat: %s. Every reply MUST begin with a line \"to: <jid>\" naming the destination (e.g. \"to: %s\" for the owner, or a room/person jid). Resend your message now with a valid \"to:\" line.", reason, b.acct.Owner), b.steerBehavior())
+	b.stageNudge(body, reason)
+}
+
+// stageNudge remembers the most recent malformed reply for the settle-time
+// decision. Later staging replaces earlier ones; a successful delivery or a
+// new run clears it.
+func (b *Bridge) stageNudge(body, reason string) {
+	b.mu.Lock()
+	b.pendingNudge = &pendingNudge{body: body, reason: reason}
+	b.mu.Unlock()
+}
+
+// clearPendingNudge discards any staged routing correction: called when a
+// later message routes successfully, when a new run starts, or when a run is
+// reset locally (abort/new), so stale corrections never survive their run.
+func (b *Bridge) clearPendingNudge() {
+	b.mu.Lock()
+	b.pendingNudge = nil
+	b.mu.Unlock()
+}
+
+// takeStagedNudge consumes the staged correction (if any) and reports the
+// reason to nudge about, bounded by the per-turn budget. Returns "" when
+// nothing is staged or the budget is exhausted — the reminder is silently
+// dropped in both cases (the text already reached the error room).
+func (b *Bridge) takeStagedNudge() string {
+	b.mu.Lock()
+	p := b.pendingNudge
+	b.pendingNudge = nil
+	b.mu.Unlock()
+	if p == nil || !b.bumpRoutingNudge() {
+		return ""
 	}
+	return p.reason
+}
+
+// firePendingNudge sends the staged routing reminder, if the run settled on a
+// malformed final message. Called from agent_settled only; the reminder is a
+// prompt, so it isn't confused for a real user.
+func (b *Bridge) firePendingNudge() {
+	reason := b.takeStagedNudge()
+	if reason == "" {
+		return
+	}
+	b.rpc.Prompt(fmt.Sprintf("Your previous message was NOT delivered to anyone in the chat: %s. Every reply MUST begin with a line \"to: <jid>\" naming the destination (e.g. \"to: %s\" for the owner, or a room/person jid). Resend your message now with a valid \"to:\" line.", reason, b.acct.Owner), b.steerBehavior())
 }
 
 // routeDropped sends dropped/unrouteable output to the write-only error room
@@ -1081,6 +1147,7 @@ func (b *Bridge) settleLocally() {
 	b.setStreaming(false)
 	b.stopTyping()
 	b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
+	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
 }
 
 // --- small state accessors ---
