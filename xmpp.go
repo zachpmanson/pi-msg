@@ -127,6 +127,11 @@ type XMPPBridge struct {
 	show     string // presence <show>: "" (available) or "dnd"/"away"/… (availability axis)
 	presence string // presence <status> free text (activity axis)
 
+	// startStatus is the presence <status> announced on (re)connect, before any
+	// activity occurs. The bridge sets it to distinguish a fresh start ("awake")
+	// from a resumed continuation ("resumed"); it falls back to "awake".
+	startStatus string
+
 	seen      map[string]struct{}
 	seenOrder []string
 
@@ -163,6 +168,7 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		onMsg:      onMsg,
 		logf:       logf,
 		presence:   "awake (" + nowStamp() + ")",
+		startStatus: "awake",
 		seen:       make(map[string]struct{}),
 		occupants:  make(map[string]map[string]string),
 		selfNick:   make(map[string]string),
@@ -242,10 +248,11 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	b.mu.Lock()
 	b.session = session
 	b.online = true
-	// Re-assert the fresh-start status on every (re)connect so the roster shows
-	// "awake" rather than a stale idle label from a previous session.
+	// Re-assert the startup status on every (re)connect so the roster shows the
+	// correct label (fresh start "awake" vs resumed "resumed") rather than a
+	// stale idle label from a previous session.
 	b.show = ""
-	b.presence = "awake (" + nowStamp() + ")"
+	b.presence = b.startStatus + " (" + nowStamp() + ")"
 	show, status := b.show, b.presence
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
 	b.occupants = make(map[string]map[string]string)
@@ -739,6 +746,18 @@ func (b *XMPPBridge) isOccupant(bare string) bool {
 		}
 	}
 	return false
+}
+
+// SetStartupStatus sets the presence <status> label announced on (re)connect,
+// before any activity run. Call it before Run to distinguish a fresh start
+// ("awake") from a resumed continuation ("resumed"). It falls back to "awake".
+func (b *XMPPBridge) SetStartupStatus(status string) {
+	if status == "" {
+		status = "awake"
+	}
+	b.mu.Lock()
+	b.startStatus = status
+	b.mu.Unlock()
 }
 
 // SetPresence announces presence with a show (availability axis: "" = available,

@@ -101,11 +101,17 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// still exists (non-empty) on disk, resume it so a restart continues the
 	// conversation — only /new resets context. Missing/deleted files fall back
 	// to a fresh session.
+	// The presence label distinguishes the two: "resumed" for a continuation,
+	// "awake" for a fresh start.
 	if prev := loadSessionState(b.acct.Name); prev != "" && sessionFileUsable(prev) {
 		b.rpc.sessionPath = prev
 		b.log("info", fmt.Sprintf("resuming session %s", prev))
-	} else if prev != "" {
-		b.log("info", "saved session file missing or empty; starting fresh")
+		b.xmpp.SetStartupStatus("resumed")
+	} else {
+		if prev != "" {
+			b.log("info", "saved session file missing or empty; starting fresh")
+		}
+		b.xmpp.SetStartupStatus("awake")
 	}
 
 	// Bring up XMPP first so we can report problems, then start pi.
