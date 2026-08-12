@@ -59,6 +59,11 @@ type Bridge struct {
 
 	ambientMu sync.Mutex
 	ambient   []ambientMsg
+
+	// cascadeMu guards cascade, the count of consecutive agent-to-agent turns
+	// taken with no owner message in between (#23).
+	cascadeMu sync.Mutex
+	cascade   int
 }
 
 // ambientMsg is one buffered non-triggering room message.
@@ -68,6 +73,13 @@ type ambientMsg struct {
 
 // ambientCap bounds the in-memory ambient buffer; oldest entries are dropped.
 const ambientCap = 50
+
+// cascadeCap bounds consecutive commentary-triggered turns with no intervening
+// owner (canonical) message, so two agents addressing each other cannot loop
+// indefinitely with no human in the path. Beyond the cap a commentary trigger
+// degrades to ambient: the content is still buffered as context for the next
+// real turn, it just doesn't fire one. Any canonical message resets the count.
+const cascadeCap = 3
 
 // NewBridge constructs a bridge for the resolved account.
 func NewBridge(acct ResolvedAccount, debug bool) *Bridge {
@@ -464,6 +476,18 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string) {
 // trigger; anything else → buffered ambient (no turn).
 func (b *Bridge) handleRoom(m InboundMessage) {
 	action, body := b.classify(m)
+	// Cascade bound (#23): an owner message resets the budget; agent-to-agent
+	// turns spend it. When exhausted, the trigger degrades to ambient so the
+	// content is kept as context but takes no turn.
+	switch action {
+	case actionCanonical:
+		b.resetCascade()
+	case actionCommentary:
+		if !b.spendCascade() {
+			b.log("warning", fmt.Sprintf("cascade cap (%d) reached; buffering %q as ambient instead of taking a turn", cascadeCap, m.Nick))
+			action = actionAmbient
+		}
+	}
 	switch action {
 	case actionCanonical:
 		// Room reactions enabled → use the room JID and stanza ID so auto-reacts
@@ -791,9 +815,10 @@ func compactArgs(args Event) string {
 }
 
 // routingHint tells the agent, when the account has room access, that every
-// reply must begin with an explicit "to: <jid>" line, and how to choose it.
+// reply must begin with an explicit "to: <jid>" line, how to choose it, how to
+// stay silent (#20), and how to address another agent (#21).
 func (b *Bridge) routingHint() string {
-	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above; to DM the person who sent it, use their \"sender:\" jid (if shown); to reach your owner, use to: %s. You may include several \"to: <jid>\" blocks in one reply to send different parts to different destinations — each \"to:\" line starts a new message.]", b.acct.Owner)
+	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above; to DM the person who sent it, use their \"sender:\" jid (if shown); to reach your owner, use to: %s. You may include several \"to: <jid>\" blocks in one reply to send different parts to different destinations — each \"to:\" line starts a new message. If this message needs no response from you, reply with exactly \"to: %s\" and nothing else — that sends nothing at all, and is preferred over saying you have nothing to add. To address another agent in a room, write \"@their-name\" inline; a name mentioned without the @ does not reach them.]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -834,22 +859,115 @@ func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender
 	return sb.String()
 }
 
-// matchTrigger reports whether body addresses the bot by its room trigger
-// (e.g. "pi:" / "pi,") and returns the remaining text with the prefix removed.
+// matchTrigger reports whether body addresses the bot by its room trigger and
+// returns the text to prompt with. Three forms are accepted:
+//
+//	"pi: …" / "pi, …"  at the start   → addressed; the prefix is stripped
+//	"… pi: …"          anywhere       → addressed; body kept intact
+//	"… @pi …"          anywhere       → addressed; body kept intact
+//
+// Agents address each other mid-message far more often than at position 0, so
+// restricting to the leading form drops most handoffs on the floor (#21). Only
+// the colon form is honoured away from the start: "name," occurs constantly in
+// ordinary prose ("roster shows peppy, replaytest and slippy") and matching it
+// anywhere produces false triggers, whereas "name:" does not.
+//
+// Fenced code blocks and quoted lines are excluded before scanning, so a pasted
+// transcript or log containing "beltino: …" cannot trigger an agent.
 func (b *Bridge) matchTrigger(body string) (bool, string) {
-	t := strings.TrimSpace(body)
 	trig := b.acct.RoomTrigger
-	if trig == "" || len(t) <= len(trig) {
+	if trig == "" {
 		return false, ""
 	}
-	if !strings.EqualFold(t[:len(trig)], trig) {
-		return false, ""
+	t := strings.TrimSpace(body)
+	// Leading form: strip the prefix so the agent sees only the instruction.
+	if len(t) > len(trig) && strings.EqualFold(t[:len(trig)], trig) {
+		switch t[len(trig)] {
+		case ':', ',':
+			return true, strings.TrimSpace(t[len(trig)+1:])
+		}
 	}
-	switch t[len(trig)] {
-	case ':', ',':
-		return true, strings.TrimSpace(t[len(trig)+1:])
+	// Inline forms: the address is part of the sentence, so the body is passed
+	// through unchanged — stripping would discard content.
+	if scan := stripUnquoted(t); scan != "" {
+		if containsAddress(scan, trig) {
+			return true, t
+		}
 	}
 	return false, ""
+}
+
+// containsAddress reports whether scan addresses trig somewhere other than the
+// start, as "trig:" or "@trig". Matching is case-insensitive and requires a
+// word boundary before the trigger so "pilot:" does not match "pi".
+func containsAddress(scan, trig string) bool {
+	lower := strings.ToLower(scan)
+	lt := strings.ToLower(trig)
+	for i := 0; ; {
+		j := strings.Index(lower[i:], lt)
+		if j < 0 {
+			return false
+		}
+		at := i + j
+		i = at + len(lt)
+		// Require a non-word character before the trigger, or an "@" sigil.
+		var prev byte
+		if at > 0 {
+			prev = lower[at-1]
+		}
+		if at > 0 && prev != '@' && isWordByte(prev) {
+			continue
+		}
+		if i >= len(lower) {
+			continue
+		}
+		if lower[i] == ':' || prev == '@' {
+			return true
+		}
+	}
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// stripUnquoted removes fenced code blocks and "> " quoted lines so that
+// pasted transcripts and command output cannot address an agent.
+func stripUnquoted(t string) string {
+	var sb strings.Builder
+	fenced := false
+	for _, line := range strings.Split(t, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			fenced = !fenced
+			continue
+		}
+		if fenced || strings.HasPrefix(strings.TrimSpace(line), ">") {
+			continue
+		}
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+// resetCascade clears the agent-to-agent turn budget; called on any canonical
+// (owner) message, since a human in the loop means this isn't a runaway.
+func (b *Bridge) resetCascade() {
+	b.cascadeMu.Lock()
+	b.cascade = 0
+	b.cascadeMu.Unlock()
+}
+
+// spendCascade consumes one unit of the agent-to-agent turn budget, reporting
+// whether a turn may be taken. False means the cap is reached.
+func (b *Bridge) spendCascade() bool {
+	b.cascadeMu.Lock()
+	defer b.cascadeMu.Unlock()
+	if b.cascade >= cascadeCap {
+		return false
+	}
+	b.cascade++
+	return true
 }
 
 // bufferAmbient records a non-triggering room message for later context.
@@ -875,7 +993,7 @@ func (b *Bridge) drainAmbient() string {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("[room commentary since your last turn — non-canonical, FYI, no need to respond]")
+	sb.WriteString("[room commentary since your last turn — non-canonical. You need not reply, but if any claim here looks wrong, say so.]")
 	for _, a := range b.ambient {
 		fmt.Fprintf(&sb, "\n  %s: %s", a.nick, a.body)
 	}
@@ -925,6 +1043,15 @@ func (b *Bridge) deliverReply(text string) {
 		b.rejectReply(leading, "this text came before the first \"to:\" line, so it had no destination")
 	}
 	for _, s := range segs {
+		// "to: noop" — the agent deliberately has nothing to send. Drop the body
+		// without emitting a stanza, and count it as having replied so the
+		// "done (no reply)" nudge doesn't turn room silence into DM noise.
+		if strings.EqualFold(s.dest, destNoopName) {
+			b.log("info", "agent chose silence (to: noop)")
+			b.clearPendingNudge()
+			b.setReplied(true)
+			continue
+		}
 		kind := b.xmpp.classifyDest(s.dest)
 		if kind == destBlocked {
 			b.rejectReply(s.body, fmt.Sprintf("%q is not an allowed destination", s.dest))
@@ -1099,11 +1226,21 @@ func routeLine(line string) (dest, inline string, ok bool) {
 	if i := strings.IndexAny(after, " \t"); i >= 0 {
 		jid, inline = after[:i], strings.TrimSpace(after[i:])
 	}
+	// "to: noop" is a real destination meaning "send nothing" (#20). It must be
+	// recognized here rather than falling through to the reject path, or an
+	// agent's attempt at silence would be dumped to the error room AND nudged
+	// for a resend — generating the very turn it was trying to avoid.
+	if strings.EqualFold(jid, destNoopName) {
+		return destNoopName, inline, true
+	}
 	if !strings.Contains(jid, "@") {
 		return "", "", false
 	}
 	return jid, inline, true
 }
+
+// destNoopName is the reserved "discard this segment" routing destination.
+const destNoopName = "noop"
 
 func (b *Bridge) setDirectTurn(v bool) { b.mu.Lock(); b.directTurn = v; b.mu.Unlock() }
 func (b *Bridge) isDirectTurn() bool   { b.mu.Lock(); defer b.mu.Unlock(); return b.directTurn }
