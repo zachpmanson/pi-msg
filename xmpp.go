@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -789,6 +790,25 @@ func (b *XMPPBridge) ownNick(room string) string {
 		return n
 	}
 	return b.acct.Nick
+}
+
+// OccupantNicks returns a snapshot of the room's occupant nicks. Empty when the
+// room is unknown or nobody has been seen yet; callers must treat that as "no
+// information" rather than "nobody is addressable", since the map is populated
+// asynchronously from presence and is empty for a moment after every join.
+func (b *XMPPBridge) OccupantNicks(room string) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	m := b.occupants[room]
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for nick := range m {
+		out = append(out, nick)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // occupantRealJID returns the bare real JID mapped to nick in room, or "".

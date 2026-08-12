@@ -250,3 +250,73 @@ func TestCascadeNoticeDoesNotAddress(t *testing.T) {
 		t.Errorf("cascade notice addresses an agent: %q", notice)
 	}
 }
+
+// A mistyped mention is inert -- it addresses nobody and reports nothing -- so
+// the bridge has to spot it. Live evidence: "@zbeltino" was written 8 times
+// against "@beltino" 5, i.e. most attempts to address that agent went nowhere.
+func TestUnknownHandles(t *testing.T) {
+	b := roomBridge()
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	x.occupants["team@muc.x.com"] = map[string]string{
+		"beltino": "beltino@x.com",
+		"peppy":   "peppy@x.com",
+	}
+	b.xmpp = x
+	const room = "team@muc.x.com"
+
+	cases := []struct {
+		body string
+		want []string
+	}{
+		{"@zbeltino picking Philippines", []string{"zbeltino"}},
+		{"@beltino ok, yours", nil},
+		{"@peppy and @zbeltino, sort it out", []string{"zbeltino"}},
+		{"@zbeltino @zbeltino @zbeltino", []string{"zbeltino"}}, // deduped
+		{"thanks @zach", nil},                                   // owner localpart
+		{"mail me at bob@example.com", nil},                     // domain, not a mention
+		{"ping beltino@x.com directly", nil},                    // bare JID
+		{"```\n@nobody: do it\n```", nil},                       // fenced
+		{"> @nobody said so", nil},                              // quoted
+		{"no mentions at all", nil},
+	}
+	for _, c := range cases {
+		got, valid := b.unknownHandles(room, c.body)
+		if len(got) != len(c.want) {
+			t.Errorf("unknownHandles(%q) = %v, want %v", c.body, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("unknownHandles(%q) = %v, want %v", c.body, got, c.want)
+			}
+		}
+		if len(got) > 0 && len(valid) == 0 {
+			t.Errorf("unknownHandles(%q) reported unknowns with no valid list to suggest", c.body)
+		}
+	}
+
+	// With no occupant roster we cannot tell a typo from a valid absent user, so
+	// nothing is reported -- a wrong warning is worse than none.
+	b2 := roomBridge()
+	b2.xmpp = NewXMPPBridge(b2.acct, func(InboundMessage) {}, func(_, _ string) {})
+	if got, _ := b2.unknownHandles(room, "@zbeltino hello"); got != nil {
+		t.Errorf("empty roster produced warnings: %v", got)
+	}
+}
+
+// The warning fires at most once per run, so a stubbornly-misspelling agent
+// can't be nudged in a loop.
+func TestHandleWarnOncePerRun(t *testing.T) {
+	b := roomBridge()
+	if b.handleWarned() {
+		t.Fatal("fresh run already marked warned")
+	}
+	b.setHandleWarned(true)
+	if !b.handleWarned() {
+		t.Error("warned flag did not stick")
+	}
+	b.setHandleWarned(false)
+	if b.handleWarned() {
+		t.Error("warned flag did not clear at run start")
+	}
+}
