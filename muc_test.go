@@ -304,6 +304,74 @@ func TestUnknownHandles(t *testing.T) {
 	}
 }
 
+// Tagging yourself is inert: the bridge drops our own room echo before
+// dispatch, so "@pi" written by pi notifies nobody. Observed live: slippy wrote
+// "@slippy — good, Japan confirmed for you" twice where it meant another agent,
+// so that agent never heard about the work handed to it. The unknown-handle
+// check can't catch this, since our own nick IS a valid occupant handle.
+func TestSelfTagHandle(t *testing.T) {
+	b := roomBridge() // nick "pi", owner zach@x.com
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	x.occupants["team@muc.x.com"] = map[string]string{
+		"pi":      "pi@x.com",
+		"beltino": "beltino@x.com",
+		"peppy":   "peppy@x.com",
+	}
+	b.xmpp = x
+	const room = "team@muc.x.com"
+
+	cases := []struct {
+		body        string
+		wantUnknown []string
+		wantSelf    string
+	}{
+		{"@pi — good, Japan confirmed for you", nil, "pi"},
+		{"@PI case-insensitive", nil, "PI"},
+		{"@beltino ok, yours", nil, ""},
+		{"@pi and @zbeltino both", []string{"zbeltino"}, "pi"},
+		{"no mentions at all", nil, ""},
+		{"```\n@pi do it\n```", nil, ""}, // fenced, not a real mention
+	}
+	for _, c := range cases {
+		unknown, self, valid := b.handleIssues(room, c.body)
+		if self != c.wantSelf {
+			t.Errorf("handleIssues(%q) selfTag = %q, want %q", c.body, self, c.wantSelf)
+		}
+		if len(unknown) != len(c.wantUnknown) {
+			t.Errorf("handleIssues(%q) unknown = %v, want %v", c.body, unknown, c.wantUnknown)
+			continue
+		}
+		for i := range unknown {
+			if unknown[i] != c.wantUnknown[i] {
+				t.Errorf("handleIssues(%q) unknown = %v, want %v", c.body, unknown, c.wantUnknown)
+			}
+		}
+		// Suggesting our own handle back to ourselves would re-teach the bug.
+		for _, v := range valid {
+			if strings.EqualFold(v, "pi") {
+				t.Errorf("handleIssues(%q) offered our own handle %q as addressable", c.body, v)
+			}
+		}
+		if len(valid) != 2 {
+			t.Errorf("handleIssues(%q) valid = %v, want the two peers", c.body, valid)
+		}
+	}
+
+	// A self-tag must never be reported as an unknown handle: it is a real
+	// occupant handle, just an inert one to use on yourself.
+	if got, _ := b.unknownHandles(room, "@pi hello"); got != nil {
+		t.Errorf("self-tag reported as unknown handle: %v", got)
+	}
+
+	// No roster → no information, so neither problem is reported.
+	b2 := roomBridge()
+	b2.xmpp = NewXMPPBridge(b2.acct, func(InboundMessage) {}, func(_, _ string) {})
+	unknown, self, valid := b2.handleIssues(room, "@pi and @zbeltino hello")
+	if unknown != nil || self != "" || valid != nil {
+		t.Errorf("empty roster produced %v / %q / %v, want nothing at all", unknown, self, valid)
+	}
+}
+
 // The warning fires at most once per run, so a stubbornly-misspelling agent
 // can't be nudged in a loop.
 func TestHandleWarnOncePerRun(t *testing.T) {

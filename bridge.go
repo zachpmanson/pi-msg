@@ -1024,16 +1024,38 @@ var handleRe = regexp.MustCompile(`@([A-Za-z0-9_-]+)`)
 // we cannot tell a typo from a valid absent user, and a wrong warning is worse
 // than none.
 func (b *Bridge) unknownHandles(room, body string) (unknown, valid []string) {
+	unknown, _, valid = b.handleIssues(room, body)
+	return unknown, valid
+}
+
+// handleIssues inspects the "@name" mentions in body for the two ways a mention
+// can silently reach nobody: a handle no occupant answers to, and a mention of
+// our own handle. Tagging yourself is inert because the bridge drops our own
+// room echo before dispatch (xmpp.go, "our own echo"), so a self-tag intended
+// for someone else leaves that someone else un-notified with no error anywhere.
+// valid lists the handles that would have worked, excluding our own.
+//
+// Everything is empty when the occupant map is unpopulated: with no roster to
+// check against we cannot tell a typo from a valid absent user, and a wrong
+// warning is worse than none.
+func (b *Bridge) handleIssues(room, body string) (unknown []string, selfTag string, valid []string) {
 	if b.xmpp == nil || room == "" {
-		return nil, nil
+		return nil, "", nil
 	}
-	valid = b.xmpp.OccupantNicks(room)
-	if len(valid) == 0 {
-		return nil, nil
+	occupants := b.xmpp.OccupantNicks(room)
+	if len(occupants) == 0 {
+		return nil, "", nil
 	}
-	known := make(map[string]struct{}, len(valid)+1)
-	for _, n := range valid {
+	me := b.xmpp.ownNick(room)
+	if me == "" {
+		me = b.acct.Nick
+	}
+	known := make(map[string]struct{}, len(occupants)+1)
+	for _, n := range occupants {
 		known[strings.ToLower(n)] = struct{}{}
+		if !strings.EqualFold(n, me) {
+			valid = append(valid, n)
+		}
 	}
 	// The owner is addressable by localpart even when not seen as an occupant.
 	if i := strings.IndexByte(b.acct.Owner, '@'); i > 0 {
@@ -1046,6 +1068,10 @@ func (b *Bridge) unknownHandles(room, body string) (unknown, valid []string) {
 		if m[3] < len(body) && (body[m[3]] == '.' || body[m[3]] == '@') {
 			continue
 		}
+		if me != "" && strings.EqualFold(name, me) {
+			selfTag = name
+			continue
+		}
 		if _, ok := known[strings.ToLower(name)]; ok {
 			continue
 		}
@@ -1055,28 +1081,65 @@ func (b *Bridge) unknownHandles(room, body string) (unknown, valid []string) {
 		seen[strings.ToLower(name)] = struct{}{}
 		unknown = append(unknown, name)
 	}
-	return unknown, valid
+	return unknown, selfTag, valid
 }
 
-// warnUnknownHandles tells the agent, at most once per run, that it addressed a
-// handle nobody in the room answers to. A mistyped mention is silently inert --
-// it neither triggers the intended agent nor reports a failure -- so without
-// this the sender believes a handoff landed when it did not. Observed live:
-// "@zbeltino" was written 8 times against "@beltino" 5, i.e. most attempts to
-// address that agent went nowhere.
-func (b *Bridge) warnUnknownHandles(room, body string) {
+// warnHandleProblems tells the agent, at most once per run, that a mention in
+// its last message reached nobody. Two ways that happens, both silent:
+//
+//   - an unknown handle — a mistyped mention neither triggers the intended
+//     agent nor reports a failure, so the sender believes a handoff landed when
+//     it did not. Observed live: "@zbeltino" was written 8 times against
+//     "@beltino" 5, i.e. most attempts to address that agent went nowhere.
+//   - a self-tag — the bridge drops our own room echo before dispatch (xmpp.go,
+//     "our own echo"), so "@slippy" written by slippy notifies nobody. Observed
+//     live: slippy wrote "@slippy — good, Japan confirmed for you" twice where
+//     it plainly meant another agent, which therefore never heard about the
+//     work it had just been handed.
+//
+// Both problems in one message produce one combined warning, and the whole
+// thing is bounded to a single warning per run so a stubbornly-misaddressing
+// agent can't be nudged in a loop.
+func (b *Bridge) warnHandleProblems(room, body string) {
 	if b.handleWarned() {
 		return
 	}
-	unknown, valid := b.unknownHandles(room, body)
-	if len(unknown) == 0 {
+	unknown, selfTag, valid := b.handleIssues(room, body)
+	if len(unknown) == 0 && selfTag == "" {
 		return
 	}
 	b.setHandleWarned(true)
-	b.log("warning", fmt.Sprintf("reply addressed unknown handle(s) %v; addressable: %v", unknown, valid))
-	b.rpc.Prompt(fmt.Sprintf(
-		"[routing: your last message used @%s, which matches nobody in this room, so nobody was addressed by it. The handles that work here right now are: %s. If you meant to hand work to someone, resend addressing one of those exactly; if you didn't, ignore this and reply \"to: %s\".]",
-		strings.Join(unknown, ", @"), "@"+strings.Join(valid, ", @"), destNoopName), b.steerBehavior())
+
+	logMsg := "reply"
+	if len(unknown) > 0 {
+		logMsg += fmt.Sprintf(" addressed unknown handle(s) %v", unknown)
+	}
+	if selfTag != "" {
+		if len(unknown) > 0 {
+			logMsg += " and"
+		}
+		logMsg += fmt.Sprintf(" tagged itself (@%s), which addresses nobody", selfTag)
+	}
+	b.log("warning", fmt.Sprintf("%s; addressable: %v", logMsg, valid))
+
+	var sb strings.Builder
+	sb.WriteString("[routing:")
+	if len(unknown) > 0 {
+		fmt.Fprintf(&sb, " your last message used @%s, which matches nobody in this room, so nobody was addressed by it.",
+			strings.Join(unknown, ", @"))
+	}
+	if selfTag != "" {
+		fmt.Fprintf(&sb, " Your last message tagged @%s, which is you. A self-mention addresses nobody, so if you meant to hand this to another agent, they were NOT notified.",
+			selfTag)
+	}
+	if len(valid) > 0 {
+		fmt.Fprintf(&sb, " The handles that work here right now are: @%s.", strings.Join(valid, ", @"))
+	} else {
+		sb.WriteString(" No other handle is addressable in this room right now.")
+	}
+	fmt.Fprintf(&sb, " If you meant to hand work to someone, resend addressing one of those exactly; if you didn't, ignore this and reply \"to: %s\".]",
+		destNoopName)
+	b.rpc.Prompt(sb.String(), b.steerBehavior())
 }
 
 func (b *Bridge) setHandleWarned(v bool) { b.mu.Lock(); b.handleWarnedRun = v; b.mu.Unlock() }
@@ -1181,9 +1244,10 @@ func (b *Bridge) deliverReply(text string) {
 			var stanzaID string
 			if kind == destRoom {
 				stanzaID = b.xmpp.SendRoomTo(bareJid(s.dest), s.body)
-				// A mistyped mention is inert: it addresses nobody and reports
-				// nothing, so the sender believes the handoff landed.
-				b.warnUnknownHandles(bareJid(s.dest), s.body)
+				// A mistyped mention — or a self-tag — is inert: it addresses
+				// nobody and reports nothing, so the sender believes the
+				// handoff landed.
+				b.warnHandleProblems(bareJid(s.dest), s.body)
 			} else {
 				stanzaID = b.xmpp.SendChatTo(s.dest, s.body)
 			}
