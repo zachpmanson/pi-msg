@@ -1235,17 +1235,35 @@ func (b *XMPPBridge) encodePresence(show, status string) error {
 }
 
 // presenceTargets returns the occupant JIDs (room@service/nick) that should
-// receive directed presence updates: every agent-visible joined room, using the
-// server-confirmed nick where one is known.
+// receive directed presence updates.
 //
-// The error room is deliberately excluded. It is a write-only dumping ground
-// kept out of the agent-visible room set, nothing reads presence there, and
-// leaving it out keeps this consistent with the rest of the room handling.
+// Only rooms whose join we have *confirmed* are included, keyed on selfNick,
+// which is populated when the service echoes our own occupant presence with MUC
+// status code 110. This is not tidiness. Presence sent to room@service/nick
+// WITHOUT an <x xmlns='http://jabber.org/protocol/muc'/> child is, per XEP-0045,
+// a legacy "groupchat 1.0" join — and Run announces presence *before* joining
+// any room, so targeting un-joined rooms would legacy-join every one of them a
+// moment before the real join. A legacy join yields no status code 110 and no
+// muc#user items, so occupants[] never learns real JIDs, FromOwner is never true
+// in a room, and the owner silently stops being recognised. Gating on 110 makes
+// that sequence impossible.
+//
+// Between joinRoom and the 110 echo, room presence is skipped; joinRoom carries
+// the current show/status itself, so no state is lost in that window.
+//
+// The error room is excluded by construction — it is never in acct.Rooms, being
+// a write-only dumping ground kept out of the agent-visible room set.
 func (b *XMPPBridge) presenceTargets() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	targets := make([]string, 0, len(b.acct.Rooms))
 	for _, room := range b.acct.Rooms {
 		bare := bareJid(room)
-		targets = append(targets, bare+"/"+b.ownNick(bare))
+		nick := b.selfNick[bare]
+		if nick == "" {
+			continue // not joined, or join not yet confirmed — see above
+		}
+		targets = append(targets, bare+"/"+nick)
 	}
 	return targets
 }

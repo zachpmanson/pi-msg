@@ -330,8 +330,25 @@ func TestPresenceTargets(t *testing.T) {
 		ErrorRoom: "errors@muc.x.com",
 	}, func(InboundMessage) {}, func(_, _ string) {})
 
+	// Before any join is confirmed there must be NO targets. Run announces
+	// presence before joining, and directed presence to room@service/nick with
+	// no MUC <x/> child is a legacy groupchat-1.0 join (XEP-0045) — which would
+	// join every room in legacy mode a moment before the real join, losing
+	// status code 110 and the muc#user real JIDs the owner check depends on.
+	if got := b.presenceTargets(); len(got) != 0 {
+		t.Fatalf("presenceTargets() before join = %v, want none", got)
+	}
+
+	// The service echoes our own occupant presence with status code 110; that
+	// is what marks a room joined, and it carries the nick actually assigned
+	// (which may differ from the configured one after a nick conflict).
+	b.mu.Lock()
+	b.selfNick["team@muc.x.com"] = "pi"
+	b.selfNick["ops@muc.x.com"] = "pi2"
+	b.mu.Unlock()
+
 	got := b.presenceTargets()
-	want := []string{"team@muc.x.com/pi", "ops@muc.x.com/pi"}
+	want := []string{"team@muc.x.com/pi", "ops@muc.x.com/pi2"}
 	if len(got) != len(want) {
 		t.Fatalf("presenceTargets() = %v, want %v", got, want)
 	}
@@ -342,20 +359,22 @@ func TestPresenceTargets(t *testing.T) {
 	}
 
 	// The error room is write-only and out of the agent-visible set; nothing
-	// reads presence there, so it must not be targeted.
-	for _, tgt := range got {
+	// reads presence there, so it must not be targeted even once joined.
+	b.mu.Lock()
+	b.selfNick["errors@muc.x.com"] = "pi"
+	b.mu.Unlock()
+	for _, tgt := range b.presenceTargets() {
 		if strings.HasPrefix(tgt, "errors@") {
 			t.Errorf("error room was targeted: %q", tgt)
 		}
 	}
 
-	// Once the server confirms our nick (MUC status code 110), that nick is used
-	// rather than the configured one — a nick conflict would otherwise send
-	// presence to an occupant JID we do not occupy.
+	// A reconnect clears selfNick, so targets must drop back to none until the
+	// rooms are re-joined and re-confirmed.
 	b.mu.Lock()
-	b.selfNick["team@muc.x.com"] = "pi2"
+	b.selfNick = make(map[string]string)
 	b.mu.Unlock()
-	if got := b.presenceTargets(); got[0] != "team@muc.x.com/pi2" {
-		t.Errorf("server-confirmed nick ignored: got %q, want team@muc.x.com/pi2", got[0])
+	if got := b.presenceTargets(); len(got) != 0 {
+		t.Errorf("presenceTargets() after reconnect reset = %v, want none", got)
 	}
 }
