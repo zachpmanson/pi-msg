@@ -1207,19 +1207,66 @@ func (b *XMPPBridge) avatarUpdate() *vcardXUpdate {
 }
 
 // encodePresence announces presence with an optional show and status, carrying
-// the XEP-0153 avatar hash when one is configured. An empty "to" broadcasts
-// (roster-wide) presence.
+// the XEP-0153 avatar hash when one is configured. It sends the roster-wide
+// broadcast AND directed presence to every joined room, so the agent's state
+// reads the same in a room as it does in the owner's 1:1.
+//
+// Both are required. A broadcast presence reaches roster subscribers only — the
+// MUC service does not relay it into rooms (XEP-0045 scopes an occupant's
+// presence to room@service/nick). Without the directed copies a room roster
+// keeps showing whatever state was current at join time, forever, while the
+// owner's 1:1 tracks every change.
 func (b *XMPPBridge) encodePresence(show, status string) error {
 	session := b.currentSession()
 	if session == nil {
 		return fmt.Errorf("not online")
 	}
+	// Broadcast first: the owner's 1:1 is the primary channel, so it should not
+	// be delayed behind per-room stanzas if one of them is slow.
+	err := b.encodePresenceTo(session, "", show, status)
+	for _, occupant := range b.presenceTargets() {
+		// A room that rejects our presence must not stop the others updating,
+		// so failures are logged and skipped rather than returned.
+		if e := b.encodePresenceTo(session, occupant, show, status); e != nil {
+			b.log("warning", "room presence failed for "+occupant+": "+e.Error())
+		}
+	}
+	return err
+}
+
+// presenceTargets returns the occupant JIDs (room@service/nick) that should
+// receive directed presence updates: every agent-visible joined room, using the
+// server-confirmed nick where one is known.
+//
+// The error room is deliberately excluded. It is a write-only dumping ground
+// kept out of the agent-visible room set, nothing reads presence there, and
+// leaving it out keeps this consistent with the rest of the room handling.
+func (b *XMPPBridge) presenceTargets() []string {
+	targets := make([]string, 0, len(b.acct.Rooms))
+	for _, room := range b.acct.Rooms {
+		bare := bareJid(room)
+		targets = append(targets, bare+"/"+b.ownNick(bare))
+	}
+	return targets
+}
+
+// currentPresence returns the current <show>/<status> pair under the lock.
+func (b *XMPPBridge) currentPresence() (show, status string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.show, b.presence
+}
+
+// encodePresenceTo sends one presence stanza. An empty "to" broadcasts
+// (roster-wide); otherwise it is directed at that JID.
+func (b *XMPPBridge) encodePresenceTo(session *xmpp.Session, to, show, status string) error {
 	p := struct {
 		XMLName xml.Name `xml:"presence"`
+		To      string   `xml:"to,attr,omitempty"`
 		Show    string   `xml:"show,omitempty"`
 		Status  string   `xml:"status,omitempty"`
 		VCard   *vcardXUpdate
-	}{Show: show, Status: status, VCard: b.avatarUpdate()}
+	}{To: to, Show: show, Status: status, VCard: b.avatarUpdate()}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return session.Encode(ctx, p)
@@ -1469,9 +1516,14 @@ func (b *XMPPBridge) joinRoom(room string) error {
 		return fmt.Errorf("not online")
 	}
 	occupant := room + "/" + b.acct.Nick
+	// Carry <show> as well as <status>, so an agent that joins mid-run appears
+	// busy in the room rather than idle. Read both under the lock; they are
+	// mutated from the bridge's goroutine via SetPresence.
+	show, status := b.currentPresence()
 	join := struct {
 		XMLName xml.Name `xml:"presence"`
 		To      string   `xml:"to,attr"`
+		Show    string   `xml:"show,omitempty"`
 		Status  string   `xml:"status,omitempty"`
 		X       struct {
 			XMLName xml.Name `xml:"http://jabber.org/protocol/muc x"`
@@ -1481,7 +1533,7 @@ func (b *XMPPBridge) joinRoom(room string) error {
 			} `xml:"history"`
 		} `xml:"x"`
 		VCard *vcardXUpdate // XEP-0153 avatar hash, so it shows in the room roster
-	}{To: occupant, Status: b.presence, VCard: b.avatarUpdate()}
+	}{To: occupant, Show: show, Status: status, VCard: b.avatarUpdate()}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return session.Encode(ctx, join)

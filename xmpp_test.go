@@ -316,3 +316,46 @@ func TestReplayDrainNotArmed(t *testing.T) {
 		t.Errorf("unarmed drain = %v, want nil", got)
 	}
 }
+
+// Presence must reach every joined room, not just the roster. A broadcast
+// presence is not relayed into MUCs by the service (XEP-0045 scopes an
+// occupant's presence to room@service/nick), so without directed copies a room
+// roster shows the agent's join-time state forever while the owner's 1:1 tracks
+// every change.
+func TestPresenceTargets(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{
+		Owner:     "zach@x.com",
+		Nick:      "pi",
+		Rooms:     []string{"team@muc.x.com", "Ops@MUC.x.com"},
+		ErrorRoom: "errors@muc.x.com",
+	}, func(InboundMessage) {}, func(_, _ string) {})
+
+	got := b.presenceTargets()
+	want := []string{"team@muc.x.com/pi", "ops@muc.x.com/pi"}
+	if len(got) != len(want) {
+		t.Fatalf("presenceTargets() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("presenceTargets()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// The error room is write-only and out of the agent-visible set; nothing
+	// reads presence there, so it must not be targeted.
+	for _, tgt := range got {
+		if strings.HasPrefix(tgt, "errors@") {
+			t.Errorf("error room was targeted: %q", tgt)
+		}
+	}
+
+	// Once the server confirms our nick (MUC status code 110), that nick is used
+	// rather than the configured one — a nick conflict would otherwise send
+	// presence to an occupant JID we do not occupy.
+	b.mu.Lock()
+	b.selfNick["team@muc.x.com"] = "pi2"
+	b.mu.Unlock()
+	if got := b.presenceTargets(); got[0] != "team@muc.x.com/pi2" {
+		t.Errorf("server-confirmed nick ignored: got %q, want team@muc.x.com/pi2", got[0])
+	}
+}
