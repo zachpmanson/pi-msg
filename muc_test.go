@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -203,16 +204,49 @@ func TestNoopIsNotRejected(t *testing.T) {
 func TestCascadeCap(t *testing.T) {
 	b := roomBridge()
 	for i := 0; i < cascadeCap; i++ {
-		if !b.spendCascade() {
+		ok, announce := b.spendCascade()
+		if !ok {
 			t.Fatalf("turn %d denied, want allowed (cap is %d)", i+1, cascadeCap)
 		}
+		if announce {
+			t.Errorf("turn %d announced, want silent while under cap", i+1)
+		}
 	}
-	if b.spendCascade() {
-		t.Errorf("turn %d allowed, want denied at cap", cascadeCap+1)
+	// First refusal announces; later ones stay quiet so one stall produces one
+	// notice rather than a stream of them.
+	ok, announce := b.spendCascade()
+	if ok || !announce {
+		t.Errorf("first refusal = (ok %v, announce %v), want (false, true)", ok, announce)
 	}
-	// An owner message puts a human back in the loop and restores the budget.
+	ok, announce = b.spendCascade()
+	if ok || announce {
+		t.Errorf("second refusal = (ok %v, announce %v), want (false, false)", ok, announce)
+	}
+	// An owner message puts a human back in the loop and restores the budget,
+	// including the right to announce again on a later episode.
 	b.resetCascade()
-	if !b.spendCascade() {
+	if ok, _ := b.spendCascade(); !ok {
 		t.Errorf("turn denied after reset, want allowed")
+	}
+	for i := 1; i < cascadeCap; i++ {
+		b.spendCascade()
+	}
+	if ok, announce := b.spendCascade(); ok || !announce {
+		t.Errorf("post-reset refusal = (ok %v, announce %v), want (false, true)", ok, announce)
+	}
+}
+
+// The cascade notice must never contain an "@mention", or reporting a cascade
+// would itself trigger another agent and extend it.
+func TestCascadeNoticeDoesNotAddress(t *testing.T) {
+	b := roomBridge()
+	notice := fmt.Sprintf(
+		"⚠️ %s is no longer answering agent handoffs — %d consecutive agent-to-agent turns with no message from the owner. Further handoffs are being kept as context but not acted on. A message from the owner resumes normal operation.",
+		b.acct.Nick, cascadeCap)
+	if strings.Contains(notice, "@") {
+		t.Errorf("cascade notice contains an @mention: %q", notice)
+	}
+	if addressed, _ := b.matchTrigger(notice); addressed {
+		t.Errorf("cascade notice addresses an agent: %q", notice)
 	}
 }

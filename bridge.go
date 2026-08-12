@@ -61,9 +61,11 @@ type Bridge struct {
 	ambient   []ambientMsg
 
 	// cascadeMu guards cascade, the count of consecutive agent-to-agent turns
-	// taken with no owner message in between (#23).
-	cascadeMu sync.Mutex
-	cascade   int
+	// taken with no owner message in between (#23), and cascadeNotified, which
+	// keeps the room notice to one per episode.
+	cascadeMu       sync.Mutex
+	cascade         int
+	cascadeNotified bool
 }
 
 // ambientMsg is one buffered non-triggering room message.
@@ -79,7 +81,16 @@ const ambientCap = 50
 // indefinitely with no human in the path. Beyond the cap a commentary trigger
 // degrades to ambient: the content is still buffered as context for the next
 // real turn, it just doesn't fire one. Any canonical message resets the count.
-const cascadeCap = 3
+//
+// This is a runaway backstop, NOT a pacing mechanism. It was originally 3,
+// which silently stalled real multi-agent work twice in one session: the budget
+// went on claim negotiation, then the handoffs that would have started the
+// actual task were dropped, and the fleet sat mute until the owner prodded it.
+// Legitimate rounds ran 8-12 agent messages, so the cap must sit far above
+// that. Reaching it now also announces itself in the room (announceCascadeStop)
+// rather than failing silently, since neither the sender nor the recipient can
+// otherwise distinguish a dropped handoff from a peer still thinking.
+const cascadeCap = 25
 
 // NewBridge constructs a bridge for the resolved account.
 func NewBridge(acct ResolvedAccount, debug bool) *Bridge {
@@ -483,8 +494,11 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	case actionCanonical:
 		b.resetCascade()
 	case actionCommentary:
-		if !b.spendCascade() {
+		if ok, announce := b.spendCascade(); !ok {
 			b.log("warning", fmt.Sprintf("cascade cap (%d) reached; buffering %q as ambient instead of taking a turn", cascadeCap, m.Nick))
+			if announce {
+				b.announceCascadeStop(m.Room)
+			}
 			action = actionAmbient
 		}
 	}
@@ -955,19 +969,43 @@ func stripUnquoted(t string) string {
 func (b *Bridge) resetCascade() {
 	b.cascadeMu.Lock()
 	b.cascade = 0
+	b.cascadeNotified = false
 	b.cascadeMu.Unlock()
 }
 
-// spendCascade consumes one unit of the agent-to-agent turn budget, reporting
-// whether a turn may be taken. False means the cap is reached.
-func (b *Bridge) spendCascade() bool {
+// spendCascade consumes one unit of the agent-to-agent turn budget. ok reports
+// whether a turn may be taken; announce is true exactly once per episode, on
+// the first refusal, so the room is told the first time this agent goes quiet
+// rather than on every subsequent dropped handoff.
+func (b *Bridge) spendCascade() (ok, announce bool) {
 	b.cascadeMu.Lock()
 	defer b.cascadeMu.Unlock()
 	if b.cascade >= cascadeCap {
-		return false
+		if b.cascadeNotified {
+			return false, false
+		}
+		b.cascadeNotified = true
+		return false, true
 	}
 	b.cascade++
-	return true
+	return true, false
+}
+
+// announceCascadeStop posts a visible notice in the room when this agent stops
+// answering peer handoffs, so a stall is diagnosable from the chat itself. The
+// notice deliberately contains no "@name", so it cannot trigger another agent
+// and extend the cascade it is reporting.
+func (b *Bridge) announceCascadeStop(room string) {
+	if b.xmpp == nil || room == "" {
+		return
+	}
+	who := b.acct.Nick
+	if who == "" {
+		who = b.acct.RoomTrigger
+	}
+	b.xmpp.SendRoomTo(bareJid(room), fmt.Sprintf(
+		"⚠️ %s is no longer answering agent handoffs — %d consecutive agent-to-agent turns with no message from the owner. Further handoffs are being kept as context but not acted on. A message from the owner resumes normal operation.",
+		who, cascadeCap))
 }
 
 // bufferAmbient records a non-triggering room message for later context.
