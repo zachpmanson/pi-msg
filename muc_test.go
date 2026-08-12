@@ -28,6 +28,28 @@ func TestMatchTrigger(t *testing.T) {
 		{"hey pi can you", false, ""}, // trigger not at start
 		{"pi", false, ""},             // bare trigger, nothing after
 		{"  pi: leading space", true, "leading space"},
+
+		// Inline "trig:" anywhere — addressed, body kept intact (#21).
+		{"here's the draft\n\npi: fold this in", true, "here's the draft\n\npi: fold this in"},
+		// Known miss: a bracket between the name and the colon breaks the form.
+		// Rare enough that widening it is not worth the false-positive surface.
+		{"worth a PRAGMA first (pi): adjust your query", false, ""},
+
+		// Inline "@trig" anywhere — addressed, body kept intact.
+		{"@pi how do I pull the logs", true, "@pi how do I pull the logs"},
+		{"over to @pi for the exact path", true, "over to @pi for the exact path"},
+
+		// Inline "trig," is NOT addressing: it occurs constantly in prose.
+		{"roster shows pi, alice and bob as active", false, ""},
+		{"tagged to pi, so I'll let them answer", false, ""},
+
+		// Word boundaries still hold away from position 0.
+		{"the pilot: reported in", false, ""},
+		{"deploy happy: done", false, ""},
+
+		// Quoted/fenced content must not address anyone.
+		{"saved the log:\n```\npi: do the thing\n```", false, ""},
+		{"they said:\n> pi: do the thing", false, ""},
 	}
 	for _, c := range cases {
 		addressed, stripped := b.matchTrigger(c.in)
@@ -136,5 +158,61 @@ func TestComposePrompt(t *testing.T) {
 func TestRoutingHintNamesOwner(t *testing.T) {
 	if h := roomBridge().routingHint(); !strings.Contains(h, "to:") || !strings.Contains(h, "zach@x.com") {
 		t.Errorf("routingHint = %q, want it to mention to: and the owner jid", h)
+	}
+}
+
+func TestRouteLineNoop(t *testing.T) {
+	cases := []struct {
+		in     string
+		dest   string
+		inline string
+		ok     bool
+	}{
+		{"to: noop", "noop", "", true},
+		{"to: NOOP", "noop", "", true},
+		{"  to: noop", "noop", "", true},
+		{"to: noop nothing to add", "noop", "nothing to add", true},
+		{"to: zach@x.com", "zach@x.com", "", true},
+		{"to: be fair, that's prose", "", "", false}, // no @ and not "noop"
+		{"to: nooperator", "", "", false},            // must be exactly "noop"
+	}
+	for _, c := range cases {
+		dest, inline, ok := routeLine(c.in)
+		if ok != c.ok || dest != c.dest || inline != c.inline {
+			t.Errorf("routeLine(%q) = (%q,%q,%v), want (%q,%q,%v)", c.in, dest, inline, ok, c.dest, c.inline, c.ok)
+		}
+	}
+}
+
+// A noop reply must parse as a real segment, not fall through to the reject
+// path — otherwise an attempt at silence is dumped to the error room and the
+// agent is nudged to resend, producing the very turn it tried to avoid (#20).
+func TestNoopIsNotRejected(t *testing.T) {
+	segs, leading := splitReplySegments("to: noop")
+	if leading != "" {
+		t.Errorf("leading = %q, want empty", leading)
+	}
+	if len(segs) != 1 {
+		t.Fatalf("got %d segments, want 1", len(segs))
+	}
+	if segs[0].dest != "noop" {
+		t.Errorf("dest = %q, want noop", segs[0].dest)
+	}
+}
+
+func TestCascadeCap(t *testing.T) {
+	b := roomBridge()
+	for i := 0; i < cascadeCap; i++ {
+		if !b.spendCascade() {
+			t.Fatalf("turn %d denied, want allowed (cap is %d)", i+1, cascadeCap)
+		}
+	}
+	if b.spendCascade() {
+		t.Errorf("turn %d allowed, want denied at cap", cascadeCap+1)
+	}
+	// An owner message puts a human back in the loop and restores the budget.
+	b.resetCascade()
+	if !b.spendCascade() {
+		t.Errorf("turn denied after reset, want allowed")
 	}
 }
