@@ -838,7 +838,7 @@ func compactArgs(args Event) string {
 // reply must begin with an explicit "to: <jid>" line, how to choose it, how to
 // stay silent (#20), and how to address another agent (#21).
 func (b *Bridge) routingHint() string {
-	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above; to DM the person who sent it, use their \"sender:\" jid (if shown); to reach your owner, use to: %s. You may include several \"to: <jid>\" blocks in one reply to send different parts to different destinations — each \"to:\" line starts a new message. If this message needs no response from you, reply with exactly \"to: %s\" and nothing else — that sends nothing at all, and is preferred over saying you have nothing to add. To address another agent in a room, write \"@their-name\" inline; a name mentioned without the @ does not reach them.]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above; to DM the person who sent it, use their \"sender:\" jid (if shown); to reach your owner, use to: %s. You may include several \"to: <jid>\" blocks in one reply to send different parts to different destinations — each \"to:\" line starts a new message. If this message needs no response from you, reply with exactly \"to: %s\" and nothing else — that sends nothing at all, and is preferred over saying you have nothing to add. To address another agent in a room, write \"@their-name\" inline, or \"@everyone\" to address the whole room; a name mentioned without the @ does not reach them.]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -910,11 +910,45 @@ func (b *Bridge) matchTrigger(body string) (bool, string) {
 	// Inline forms: the address is part of the sentence, so the body is passed
 	// through unchanged — stripping would discard content.
 	if scan := stripUnquoted(t); scan != "" {
-		if containsAddress(scan, trig) {
+		if containsAddress(scan, trig) || containsBroadcast(scan) {
 			return true, t
 		}
 	}
 	return false, ""
+}
+
+// broadcastHandles address every agent in the room at once. Agents reach for
+// these unprompted (observed: "@everyone"), and without them the attempt is
+// inert — it wakes nobody and the sender has no way to tell. That is not
+// hypothetical: a fleet leader opened an election with "Here's the structure
+// I'll run, @everyone:", woke no one, and the room sat silent.
+//
+// A broadcast is also more accurate than a leader enumerating names, since an
+// agent's idea of the roster goes stale (one was still addressing a persona
+// that had been decommissioned).
+var broadcastHandles = []string{"everyone", "all", "here"}
+
+// containsBroadcast reports whether scan addresses the whole room via "@everyone"
+// / "@all" / "@here". The "@" sigil is required: "all" and "here" are ordinary
+// words, and matching them bare would trigger on half of normal prose.
+func containsBroadcast(scan string) bool {
+	lower := strings.ToLower(scan)
+	for _, h := range broadcastHandles {
+		for i := 0; ; {
+			j := strings.Index(lower[i:], "@"+h)
+			if j < 0 {
+				break
+			}
+			at := i + j
+			i = at + 1 + len(h)
+			// Reject "@everyones" / "@allocate": the handle must end here.
+			if i < len(lower) && isWordByte(lower[i]) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // containsAddress reports whether scan addresses trig somewhere other than the
@@ -1061,15 +1095,30 @@ func (b *Bridge) handleIssues(room, body string) (unknown []string, selfTag stri
 	if i := strings.IndexByte(b.acct.Owner, '@'); i > 0 {
 		known[strings.ToLower(b.acct.Owner[:i])] = struct{}{}
 	}
+	// "@everyone" and friends address the whole room, so they are real handles,
+	// not typos.
+	for _, h := range broadcastHandles {
+		known[h] = struct{}{}
+	}
 	seen := map[string]struct{}{}
+	nth := 0
 	for _, m := range handleRe.FindAllStringSubmatchIndex(stripUnquoted(body), -1) {
 		name := body[m[2]:m[3]]
 		// "@foo.bar" / "@foo@bar" is a domain or JID fragment, not a mention.
 		if m[3] < len(body) && (body[m[3]] == '.' || body[m[3]] == '@') {
 			continue
 		}
+		nth++
 		if me != "" && strings.EqualFold(name, me) {
-			selfTag = name
+			// Only the FIRST mention in a message is treated as an attempted
+			// handoff. A self-mention later on is almost always an enumeration
+			// — "Tally board: @peppy ✅ · @slippy ✅ · @beltino ✅" — which is
+			// correct writing, and warning about it burns a turn for nothing.
+			// A message that opens "@beltino — good, Japan confirmed for you"
+			// (written by beltino) is the real mis-address this catches.
+			if nth == 1 {
+				selfTag = name
+			}
 			continue
 		}
 		if _, ok := known[strings.ToLower(name)]; ok {
@@ -1132,13 +1181,19 @@ func (b *Bridge) warnHandleProblems(room, body string) {
 		fmt.Fprintf(&sb, " Your last message tagged @%s, which is you. A self-mention addresses nobody, so if you meant to hand this to another agent, they were NOT notified.",
 			selfTag)
 	}
+	sb.WriteString(" NOBODY WAS WOKEN BY THAT MESSAGE.")
 	if len(valid) > 0 {
-		fmt.Fprintf(&sb, " The handles that work here right now are: @%s.", strings.Join(valid, ", @"))
+		fmt.Fprintf(&sb, " The handles that work here right now are: @%s — or @everyone to address the whole room.", strings.Join(valid, ", @"))
 	} else {
 		sb.WriteString(" No other handle is addressable in this room right now.")
 	}
-	fmt.Fprintf(&sb, " If you meant to hand work to someone, resend addressing one of those exactly; if you didn't, ignore this and reply \"to: %s\".]",
-		destNoopName)
+	// Deliberately NOT offering "reply to: noop" as the alternative. It was
+	// offered once and an agent took it: told that "@everyone" reached nobody
+	// while opening an election, it acknowledged by staying silent, and the
+	// whole fleet sat idle. Given an explicit cheap out, a fleet trained to
+	// prefer silence will take it, so state the consequence and ask for the
+	// decision instead.
+	sb.WriteString(" If anyone needs to act on it, resend addressing them.]")
 	b.rpc.Prompt(sb.String(), b.steerBehavior())
 }
 

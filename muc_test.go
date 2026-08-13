@@ -388,3 +388,63 @@ func TestHandleWarnOncePerRun(t *testing.T) {
 		t.Error("warned flag did not clear at run start")
 	}
 }
+
+// "@everyone" must wake the room. Agents reach for it unprompted, and without
+// support the attempt is inert: a fleet leader opened an election with "Here's
+// the structure I'll run, @everyone:", woke nobody, and the room sat silent for
+// six minutes.
+func TestBroadcastHandles(t *testing.T) {
+	b := roomBridge() // trigger "pi"
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"@everyone stage 1 is open", true},
+		{"here's the structure I'll run, @everyone:", true},
+		{"@all please report", true},
+		{"@here quick sync", true},
+		{"@EVERYONE caps still counts", true},
+		{"everyone should report in", false},  // no sigil — ordinary prose
+		{"that's all from me", false},         // ditto
+		{"we're all here", false},             // ditto
+		{"@everyones opinion differs", false}, // handle must end at the word
+		{"@allocate the budget", false},       // ditto
+		{"```\n@everyone in a fence\n```", false},
+		{"> @everyone in a quote", false},
+	}
+	for _, c := range cases {
+		if got, _ := b.matchTrigger(c.in); got != c.want {
+			t.Errorf("matchTrigger(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// A broadcast handle is a real address, not a typo, so it must not be reported
+// as unknown. And a self-mention only counts as a mis-addressed handoff when it
+// is the FIRST mention: later ones are enumerations ("Tally board: @peppy ✅ ·
+// @beltino ✅"), which are correct writing and must not burn a warning turn.
+func TestHandleIssuesBroadcastAndEnumeration(t *testing.T) {
+	b := roomBridge()
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	x.occupants["team@muc.x.com"] = map[string]string{
+		"pi": "pi@x.com", "peppy": "peppy@x.com", "slippy": "slippy@x.com",
+	}
+	b.xmpp = x
+	const room = "team@muc.x.com"
+
+	if unknown, self, _ := b.handleIssues(room, "@everyone stage 1 is open"); len(unknown) != 0 || self != "" {
+		t.Errorf("broadcast flagged: unknown=%v self=%q", unknown, self)
+	}
+	// Self first → a real mis-address.
+	if _, self, _ := b.handleIssues(room, "@pi — good, Japan confirmed for you"); self != "pi" {
+		t.Errorf("leading self-tag not caught: %q", self)
+	}
+	// Self later → an enumeration, not a handoff.
+	if _, self, _ := b.handleIssues(room, "Tally board: @peppy ✅ · @slippy ✅ · @pi ✅ (officer)"); self != "" {
+		t.Errorf("enumerated self-mention warned: %q", self)
+	}
+	// A genuine unknown handle is still caught alongside an enumeration.
+	if unknown, self, _ := b.handleIssues(room, "@peppy and @zbeltino, sort it out"); len(unknown) != 1 || unknown[0] != "zbeltino" || self != "" {
+		t.Errorf("unknown=%v self=%q, want [zbeltino] and no self-tag", unknown, self)
+	}
+}
