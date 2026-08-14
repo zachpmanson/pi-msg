@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -629,24 +630,53 @@ func (b *Bridge) dumpSession(arg string) {
 		b.reply("📄 session is empty")
 		return
 	}
-	if strings.EqualFold(strings.TrimSpace(arg), "pretty") {
-		b.reply(fmt.Sprintf("📄 session dump (pretty) — %s", path))
-		pretty := prettyDump(raw)
-		// When the dump is too large to fit in one message, the transport
-		// splits it at newline/word boundaries — which can split the code fence
-		// markers, breaking markdown rendering on the receiving client.  Split
-		// into multiple self-contained code blocks instead.
-		if len(pretty) <= maxBody {
-			b.reply(pretty)
-		} else {
-			for _, chunk := range splitPrettyDump(pretty) {
-				b.reply(chunk)
-			}
-		}
+	// Dumps are transferred as an uploaded file (XEP-0363) rather than inline:
+	// huge inline code blocks trip the markdown renderer on chat clients
+	// (RenderLoopBoundary crash rendering /dump output). Falls back to inline
+	// if the upload path fails for any reason.
+	pretty := strings.EqualFold(strings.TrimSpace(arg), "pretty")
+	content := raw
+	name := "session-" + b.acct.Name + "-raw.jsonl"
+	if pretty {
+		content = []byte(prettyDump(raw))
+		name = "session-" + b.acct.Name + "-pretty.md"
+	}
+	if pretty {
+		b.reply(fmt.Sprintf("📄 session dump (pretty) — %s — uploading…", path))
+	} else {
+		b.reply(fmt.Sprintf("📄 raw session dump — %s (%d bytes) — uploading…", path, len(raw)))
+	}
+	b.sendDumpFile(name, content)
+}
+
+// sendDumpFile writes content to a temp file and uploads it to the current
+// turn's destination (falling back to the owner) via XEP-0363, so the dump
+// lands as a downloadable file rather than inline code. The upload is a
+// network round-trip, so it runs off the event loop; if it fails, the content
+// is sent inline instead (self-contained code blocks for a fenced pretty dump).
+func (b *Bridge) sendDumpFile(name string, content []byte) {
+	p := filepath.Join(os.TempDir(), fmt.Sprintf("pi-msg-%s-%d-%s", b.acct.Name, time.Now().UnixNano(), name))
+	if err := os.WriteFile(p, content, 0o600); err != nil {
+		b.reply("⚠️ /dump: cannot write temp file: " + err.Error())
 		return
 	}
-	b.reply(fmt.Sprintf("📄 raw session dump — %s (%d bytes)", path, len(raw)))
-	b.reply(string(raw))
+	dest := b.currentTurnDest()
+	if dest == "" || b.xmpp.classifyDest(dest) == destBlocked {
+		dest = b.acct.Owner
+	}
+	go func() {
+		if err := b.xmpp.SendFile(dest, p); err != nil {
+			b.reply(fmt.Sprintf("⚠️ /dump: file upload failed (%v); sending inline", err))
+			if strings.HasPrefix(string(content), "```\n") && len(content) > maxBody {
+				for _, chunk := range splitPrettyDump(string(content)) {
+					b.reply(chunk)
+				}
+			} else {
+				b.reply(string(content))
+			}
+		}
+		_ = os.Remove(p)
+	}()
 }
 
 // prettyDump reformats a session's JSONL into a compact table — one row per
