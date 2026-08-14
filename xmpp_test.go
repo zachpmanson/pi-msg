@@ -6,9 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -376,5 +379,68 @@ func TestPresenceTargets(t *testing.T) {
 	b.mu.Unlock()
 	if got := b.presenceTargets(); len(got) != 0 {
 		t.Errorf("presenceTargets() after reconnect reset = %v, want none", got)
+	}
+}
+
+func TestIsTransportError(t *testing.T) {
+	// A wedged/broken TCP write surfaces as a *net.OpError (which implements
+	// net.Error) wrapping a timeout — the exact "write tcp …: i/o timeout" from
+	// issue #31.
+	timeout := &net.OpError{Op: "write", Net: "tcp", Err: &timeoutErr{}}
+	reset := syscall.ECONNRESET
+	pipe := syscall.EPIPE
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"timeout (net.Error)", timeout, true},
+		{"connection reset", reset, true},
+		{"broken pipe", pipe, true},
+		{"not online", fmt.Errorf("not online"), false},
+		{"invalid recipient", fmt.Errorf("invalid recipient %q", "x"), false},
+		{"plain error", fmt.Errorf("some stanza problem"), false},
+	}
+	for _, c := range cases {
+		if got := isTransportError(c.err); got != c.want {
+			t.Errorf("isTransportError(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// timeoutErr is a minimal error implementing net.Error so it can sit inside a
+// *net.OpError as the wrapped cause, mimicking how mellium reports a write that
+// exceeded its context deadline on a wedged socket.
+type timeoutErr struct{}
+
+func (*timeoutErr) Error() string   { return "i/o timeout" }
+func (*timeoutErr) Timeout() bool   { return true }
+func (*timeoutErr) Temporary() bool { return true }
+
+// TestKickDebounced verifies kick() is a safe no-op when offline and fires at
+// most once per second when online, so a burst of wedged-socket writes triggers
+// a single reconnect rather than a Close storm.
+func TestKickDebounced(t *testing.T) {
+	b := &XMPPBridge{}
+
+	// Offline: kick must not panic and must not touch anything.
+	b.kick()
+	if b.lastKick != (time.Time{}) {
+		t.Errorf("offline kick recorded a timestamp: %v", b.lastKick)
+	}
+
+	// Online, no real session: first kick records a timestamp (Close is skipped
+	// because the session is nil), a second immediate kick is debounced.
+	b.online = true
+	b.kick()
+	first := b.lastKick
+	if first.IsZero() {
+		t.Fatalf("online kick did not record a timestamp")
+	}
+	b.kick()
+	if !b.lastKick.Equal(first) {
+		t.Errorf("kicks within the debounce window advanced lastKick: %v -> %v", first, b.lastKick)
 	}
 }

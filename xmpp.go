@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -18,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"mellium.im/sasl"
@@ -141,6 +143,11 @@ type XMPPBridge struct {
 	online   bool
 	show     string // presence <show>: "" (available) or "dnd"/"away"/… (availability axis)
 	presence string // presence <status> free text (activity axis)
+
+	// lastKick debounces forced reconnects (issue #31): a wedged socket makes
+	// every write fail at once, so we Close the session at most once per second
+	// instead of once per failing write.
+	lastKick time.Time
 
 	// startStatus is the presence <status> announced on (re)connect, before any
 	// activity occurs. The bridge sets it to distinguish a fresh start ("awake")
@@ -507,6 +514,52 @@ func (b *XMPPBridge) selfPing(ctx context.Context, session *xmpp.Session, room s
 	}
 }
 
+// encode writes v to the XMPP session, and on a transport-level failure forces
+// a reconnection of the whole bridge (issue #31). mellium's session.Encode
+// reports timeouts/broken-connection errors when the underlying TCP socket is
+// wedged (writes timing out while the read loop stays open), and without this
+// the reconnect loop in Run() never fires because serve() only returns when the
+// read side errors. Kicking the session unblocks session.Serve -> serve()
+// returns -> Run re-dials with exponential backoff.
+func (b *XMPPBridge) encode(ctx context.Context, session *xmpp.Session, v any) error {
+	err := session.Encode(ctx, v)
+	if isTransportError(err) {
+		b.kick()
+	}
+	return err
+}
+
+// kick force-closes the active session so the serve() read loop returns and
+// Run() reconnects. It is debounced so a burst of wedged-socket writes (all
+// failing at once) triggers a single reconnect rather than a Close storm; the
+// deferred Close in serve() makes any double-close a harmless no-op.
+func (b *XMPPBridge) kick() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.online || time.Since(b.lastKick) < time.Second {
+		return
+	}
+	b.lastKick = time.Now()
+	if b.session != nil {
+		b.session.Close()
+	}
+}
+
+// isTransportError reports whether err indicates a broken/wedged transport
+// (write i/o timeout, connection reset, broken pipe, etc.) rather than a benign
+// per-stanza error such as "not online" or an invalid recipient. These are the
+// errors that should force a reconnect.
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 // connect dials and negotiates a client session for the account.
 func (b *XMPPBridge) connect(ctx context.Context) (*xmpp.Session, error) {
 	addr := b.acct.JID
@@ -629,7 +682,7 @@ func (b *XMPPBridge) encodePong(to, id string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
 	defer cancel()
-	return session.Encode(ctx, resp)
+	return b.encode(ctx, session, resp)
 }
 
 // dispatch applies delivery policy and forwards a message to onMsg. Routing is
@@ -996,7 +1049,7 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType) (string
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	b.recordMessage(id, to)
-	return id, session.Encode(ctx, msg)
+	return id, b.encode(ctx, session, msg)
 }
 
 func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) error {
@@ -1019,7 +1072,7 @@ func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) e
 	msg.State.XMLName = xml.Name{Space: chatStatesNS, Local: state}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	return b.encode(ctx, session, msg)
 }
 
 // sendReceipts acknowledges an accepted 1:1 owner message: a XEP-0184 delivery
@@ -1069,7 +1122,7 @@ func (b *XMPPBridge) encodeReceipt(to, ns, local, forID string) error {
 	msg.Ack.ID = forID
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	return b.encode(ctx, session, msg)
 }
 
 // msgHistoryEntry records an inbound or outbound message stanza in the
@@ -1185,7 +1238,7 @@ func (b *XMPPBridge) encodeReaction(to, forID string, emojis []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	return b.encode(ctx, session, msg)
 }
 
 // vcardXUpdate is the XEP-0153 <x xmlns='vcard-temp:x:update'> presence child
@@ -1287,7 +1340,7 @@ func (b *XMPPBridge) encodePresenceTo(session *xmpp.Session, to, show, status st
 	}{To: to, Show: show, Status: status, VCard: b.avatarUpdate()}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, p)
+	return b.encode(ctx, session, p)
 }
 
 // encodeUnavailable broadcasts a roster-wide unavailable presence, marking the
@@ -1304,7 +1357,7 @@ func (b *XMPPBridge) encodeUnavailable(status string) error {
 	}{Type: "unavailable", Status: status}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, p)
+	return b.encode(ctx, session, p)
 }
 
 // publishAvatar stores the configured image in the account's vCard via an
@@ -1512,7 +1565,7 @@ func (b *XMPPBridge) encodeOOB(to, url string, typ stanza.MessageType) error {
 	msg.X.URL = url
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	return b.encode(ctx, session, msg)
 }
 
 // domainOf returns the domain part of a JID (after '@', before '/').
@@ -1554,7 +1607,7 @@ func (b *XMPPBridge) joinRoom(room string) error {
 	}{To: occupant, Show: show, Status: status, VCard: b.avatarUpdate()}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, join)
+	return b.encode(ctx, session, join)
 }
 
 // approveSubscription auto-accepts a presence subscription request.
@@ -1569,7 +1622,7 @@ func (b *XMPPBridge) approveSubscription(from string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, stanza.Presence{To: fromJID, Type: stanza.SubscribedPresence})
+	return b.encode(ctx, session, stanza.Presence{To: fromJID, Type: stanza.SubscribedPresence})
 }
 
 // --- token helpers ---
