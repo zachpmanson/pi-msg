@@ -639,7 +639,7 @@ func (b *Bridge) dumpSession(arg string) {
 	name := "session-" + b.acct.Name + "-raw.jsonl"
 	if pretty {
 		content = []byte(prettyDump(raw))
-		name = "session-" + b.acct.Name + "-pretty.md"
+		name = "session-" + b.acct.Name + "-pretty.tsv"
 	}
 	if pretty {
 		b.reply(fmt.Sprintf("📄 session dump (pretty) — %s — uploading…", path))
@@ -653,7 +653,8 @@ func (b *Bridge) dumpSession(arg string) {
 // turn's destination (falling back to the owner) via XEP-0363, so the dump
 // lands as a downloadable file rather than inline code. The upload is a
 // network round-trip, so it runs off the event loop; if it fails, the content
-// is sent inline instead (self-contained code blocks for a fenced pretty dump).
+// is sent inline instead (wrapped in a fence and split into self-contained
+// code blocks so it stays render-safe).
 func (b *Bridge) sendDumpFile(name string, content []byte) {
 	p := filepath.Join(os.TempDir(), fmt.Sprintf("pi-msg-%s-%d-%s", b.acct.Name, time.Now().UnixNano(), name))
 	if err := os.WriteFile(p, content, 0o600); err != nil {
@@ -667,26 +668,28 @@ func (b *Bridge) sendDumpFile(name string, content []byte) {
 	go func() {
 		if err := b.xmpp.SendFile(dest, p); err != nil {
 			b.reply(fmt.Sprintf("⚠️ /dump: file upload failed (%v); sending inline", err))
-			if strings.HasPrefix(string(content), "```\n") && len(content) > maxBody {
-				for _, chunk := range splitPrettyDump(string(content)) {
+			inline := string(content)
+			if len(inline) <= maxBody {
+				b.reply(inline)
+			} else {
+				// Wrap in a fence and split into render-safe self-contained blocks.
+				for _, chunk := range splitPrettyDump("```\n" + inline + "\n```") {
 					b.reply(chunk)
 				}
-			} else {
-				b.reply(string(content))
 			}
 		}
 		_ = os.Remove(p)
 	}()
 }
 
-// prettyDump reformats a session's JSONL into a compact table — one row per
-// record with its index, time, kind (message role, or record type), and a
-// one-line detail preview. Wrapped in a code fence so styling-aware clients
-// render it monospace.
+// prettyDump reformats a session's JSONL into a real TSV — one record per row
+// with its index, time, kind (message role, or record type), and a one-line
+// detail preview. Tab-separated with a header row, so the delivered file opens
+// directly in a spreadsheet. Detail whitespace/newlines are collapsed so each
+// record stays a single field.
 func prettyDump(raw []byte) string {
-	type row struct{ idx, tm, kind, detail string }
-	var rows []row
-	kindW := len("KIND")
+	var sb strings.Builder
+	sb.WriteString("#\tTIME\tKIND\tDETAIL\n")
 	i := 0
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
@@ -698,24 +701,19 @@ func prettyDump(raw []byte) string {
 			continue
 		}
 		tm, kind, detail := recordRow(Event(obj))
-		if len(kind) > kindW {
-			kindW = len(kind)
-		}
-		// Collapse whitespace/newlines so each record stays one row, but keep the
-		// full detail (no truncation).
-		rows = append(rows, row{strconv.Itoa(i), tm, kind, strings.Join(strings.Fields(detail), " ")})
+		// Collapse whitespace/newlines so each record stays one row/field, but
+		// keep the full detail (no truncation).
+		detail = strings.Join(strings.Fields(detail), " ")
+		sb.WriteString(strconv.Itoa(i))
+		sb.WriteString("\t")
+		sb.WriteString(tm)
+		sb.WriteString("\t")
+		sb.WriteString(kind)
+		sb.WriteString("\t")
+		sb.WriteString(detail)
+		sb.WriteString("\n")
 		i++
 	}
-	if len(rows) == 0 {
-		return "(no records)"
-	}
-	var sb strings.Builder
-	sb.WriteString("```\n")
-	fmt.Fprintf(&sb, "%3s  %-8s  %-*s  %s\n", "#", "TIME", kindW, "KIND", "DETAIL")
-	for _, r := range rows {
-		fmt.Fprintf(&sb, "%3s  %-8s  %-*s  %s\n", r.idx, r.tm, kindW, r.kind, r.detail)
-	}
-	sb.WriteString("```")
 	return sb.String()
 }
 
