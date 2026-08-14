@@ -327,8 +327,11 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 	case "auto_retry_end":
 		b.xmpp.SetPresence("dnd", "thinking…")
 	case "session_start":
-		// Session swapped (startup, /new, /resume, /fork): record the now-active
-		// file so a restart resumes it. Only /new actually resets context.
+		// Defensive only: pi does NOT emit a session_start event over the RPC
+		// stream (it's an extension lifecycle hook, so this case never fires).
+		// Session-swap pointer refreshes happen explicitly: at startup in Run(),
+		// and after /new in the command handler. Kept here in case a future pi
+		// starts emitting it.
 		b.refreshSessionFile()
 	case "message_end":
 		msg := ev.Obj("message")
@@ -579,6 +582,16 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.settleLocally()
 		res, err := b.rpc.NewSession(b.ctx)
 		b.reportResult(err, res, "🆕 new session ready", "/new")
+		if err == nil {
+			// /new swaps to a brand-new session, but pi does NOT emit a
+			// session_start event over the RPC stream (it's a lifecycle hook the
+			// extension sees via pi.on(), not an event the bridge receives — the
+			// session_start case in handleRPCEvent is effectively dead code). So
+			// the saved resume pointer would otherwise go stale, and the next
+			// restart would resume an OLD conversation. Persist the new session
+			// file now so a restart continues this conversation instead.
+			b.refreshSessionFile()
+		}
 	case "compact":
 		res, err := b.rpc.Compact(b.ctx, arg)
 		b.reportResult(err, res, "🗜️ context compacted", "/compact")
