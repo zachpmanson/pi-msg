@@ -604,8 +604,8 @@ func (b *Bridge) handleCommand(t string) bool {
 
 // dumpSession sends the current session's transcript to the owner, straight
 // from disk — no LLM turn. It reads the session file path from pi's get_state,
-// then relays the file: verbatim JSONL by default, or record-by-record indented
-// JSON with role/type headers when arg is "pretty".
+// then relays the file: verbatim JSONL by default, or a tab-separated table
+// (one record per row) when arg is "table" (or "pretty", its former name).
 func (b *Bridge) dumpSession(arg string) {
 	res, err := b.rpc.GetState(b.ctx)
 	if err != nil {
@@ -634,15 +634,15 @@ func (b *Bridge) dumpSession(arg string) {
 	// huge inline code blocks trip the markdown renderer on chat clients
 	// (RenderLoopBoundary crash rendering /dump output). Falls back to inline
 	// if the upload path fails for any reason.
-	pretty := strings.EqualFold(strings.TrimSpace(arg), "pretty")
+	table := strings.EqualFold(strings.TrimSpace(arg), "table") || strings.EqualFold(strings.TrimSpace(arg), "pretty")
 	content := raw
 	name := "session-" + b.acct.Name + "-raw.jsonl"
-	if pretty {
+	if table {
 		content = []byte(prettyDump(raw))
-		name = "session-" + b.acct.Name + "-pretty.tsv"
+		name = "session-" + b.acct.Name + "-table.tsv"
 	}
-	if pretty {
-		b.reply(fmt.Sprintf("📄 session dump (pretty) — %s — uploading…", path))
+	if table {
+		b.reply(fmt.Sprintf("📄 session dump (table) — %s — uploading…", path))
 	} else {
 		b.reply(fmt.Sprintf("📄 raw session dump — %s (%d bytes) — uploading…", path, len(raw)))
 	}
