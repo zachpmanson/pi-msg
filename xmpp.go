@@ -64,6 +64,62 @@ const (
 // message with emoji (e.g. 👀 picked up, ✅ done, ⛔ aborted).
 const reactionsNS = "urn:xmpp:reactions:0"
 
+// discoInfoNS is XEP-0030 service discovery: the bridge answers disco#info
+// queries so contacts can resolve its XEP-0115 capabilities hash.
+const discoInfoNS = "http://jabber.org/protocol/disco#info"
+
+// idleNS is XEP-0319 user idle time: the bridge advertises when the agent
+// last interacted in every presence stanza.
+const idleNS = "urn:xmpp:idle:1"
+
+// capsNS is XEP-0115 entity capabilities: a presence child that lets contacts
+// cache the agent's feature set instead of probing disco#info every time.
+const capsNS = "http://jabber.org/protocol/caps"
+
+// XEP-0115 entity capabilities payload. capsNode identifies the pi-msg client
+// and capsIdentity is the disco identity hashed into the verification string
+// (category/type/lang/name with '/' separators; lang is empty here). Both are
+// stable per build — bump capsVer by editing either.
+const (
+	capsNode     = "http://pi-msg"
+	capsIdentity = "client/bot//pi-msg"
+)
+
+// discoFeatures is exactly what the bridge implements, for both the disco#info
+// reply and the XEP-0115 caps hash — keep in sync with the codebase.
+var discoFeatures = []string{
+	"http://jabber.org/protocol/caps",
+	"http://jabber.org/protocol/chatstates",
+	discoInfoNS,
+	"http://jabber.org/protocol/muc",
+	"urn:xmpp:chat-markers:0",
+	"urn:xmpp:http:upload:0",
+	idleNS,
+	"urn:xmpp:ping",
+	"urn:xmpp:reactions:0",
+	"urn:xmpp:receipts",
+	"vcard-temp",
+	"vcard-temp:x:update",
+}
+
+// capsVer is the XEP-0115 verification string pi-msg announces in presence.
+var capsVer = capsVerFor(capsIdentity, discoFeatures)
+
+// capsVerFor implements the XEP-0115 §5.2 algorithm: SHA-1 over the identity
+// string (category/type/lang/name joined with '/', then '<') followed by the
+// alphabetically sorted feature vars, each terminated by '<', base64-encoded.
+// Cross-checked against the spec's golden test vector in xmpp_test.go.
+func capsVerFor(identity string, features []string) string {
+	h := sha1.New()
+	io.WriteString(h, identity+"<")
+	feats := append([]string(nil), features...)
+	sort.Strings(feats)
+	for _, f := range feats {
+		io.WriteString(h, f+"<")
+	}
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
 // newStanzaID generates a random stanza id.
 func newStanzaID() string {
 	b := make([]byte, 8)
@@ -221,8 +277,8 @@ type InboundMessage struct {
 
 	// Reactions is a non-nil emoji set when this is an inbound XEP-0444 reaction
 	// (no body). ReactionID is the stanza id of the message being reacted to.
-	Reactions   []string
-	ReactionID  string
+	Reactions  []string
+	ReactionID string
 }
 
 // XMPPBridge owns a single account's XMPP connection: it maintains a
@@ -241,6 +297,10 @@ type XMPPBridge struct {
 	online   bool
 	show     string // presence <show>: "" (available) or "dnd"/"away"/… (availability axis)
 	presence string // presence <status> free text (activity axis)
+	// idleSince is the XEP-0319 timestamp of the agent's last interaction,
+	// stamped by the bridge (SetIdleSince); zero means currently active. It is
+	// attached to every presence announcement until it changes.
+	idleSince time.Time
 
 	// lastKick debounces forced reconnects (issue #31): a wedged socket makes
 	// every write fail at once, so we Close the session at most once per second
@@ -760,6 +820,11 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 			if _, ok := element(toks, ping.NS, "ping"); ok {
 				return b.encodePong(attr(start.Attr, "from"), attr(start.Attr, "id"))
 			}
+			// Answer XEP-0030 disco#info so contacts that saw our XEP-0115
+			// caps hash can resolve it to the actual feature set.
+			if _, ok := element(toks, discoInfoNS, "query"); ok {
+				return b.encodeDiscoInfo(attr(start.Attr, "from"), attr(start.Attr, "id"))
+			}
 		}
 		return nil
 	default:
@@ -785,6 +850,52 @@ func (b *XMPPBridge) encodePong(to, id string) error {
 		resp.To = toJID
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+	defer cancel()
+	return b.encode(ctx, session, resp)
+}
+
+// discoInfoQuery is the payload of a XEP-0030 disco#info IQ result: the
+// bridge's identity and the exact feature set its caps hash was computed over.
+type discoInfoQuery struct {
+	XMLName  xml.Name       `xml:"http://jabber.org/protocol/disco#info query"`
+	Identity discoIdentity  `xml:"identity"`
+	Features []discoFeature `xml:"feature"`
+}
+
+type discoIdentity struct {
+	Category string `xml:"category,attr"`
+	Type     string `xml:"type,attr"`
+	Name     string `xml:"name,attr,omitempty"`
+}
+
+type discoFeature struct {
+	Var string `xml:"var,attr"`
+}
+
+// encodeDiscoInfo replies to a XEP-0030 disco#info query. Contacts that see
+// the XEP-0115 caps child in our presence use this to resolve the hash.
+func (b *XMPPBridge) encodeDiscoInfo(to, id string) error {
+	session := b.currentSession()
+	if session == nil {
+		return fmt.Errorf("not online")
+	}
+	resp := struct {
+		stanza.IQ
+		Query discoInfoQuery
+	}{IQ: stanza.IQ{ID: id, Type: stanza.ResultIQ}}
+	if to != "" {
+		toJID, err := jid.Parse(to)
+		if err != nil {
+			return fmt.Errorf("invalid disco sender %q: %w", to, err)
+		}
+		resp.To = toJID
+	}
+	resp.Query.Identity = discoIdentity{Category: "client", Type: "bot", Name: "pi-msg"}
+	resp.Query.Features = make([]discoFeature, len(discoFeatures))
+	for i, f := range discoFeatures {
+		resp.Query.Features[i] = discoFeature{Var: f}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return b.encode(ctx, session, resp)
 }
@@ -1104,6 +1215,24 @@ func (b *XMPPBridge) SetPresence(show, status string) {
 	}
 }
 
+// SetIdleSince records when the agent last interacted (XEP-0319); pass the
+// zero Time to mark it active. The timestamp rides on every subsequent
+// presence announcement until updated.
+func (b *XMPPBridge) SetIdleSince(t time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.idleSince = t
+}
+
+// idleSinceISO renders a XEP-0319 'since' attribute (UTC RFC-3339); empty for
+// an active agent, which XEP-0319 reads as "interacting now".
+func idleSinceISO(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 // GoOffline broadcasts an unavailable presence so the owner's roster stops
 // showing the bot online, carrying an optional status describing why (e.g.
 // "session ended — …"). Safe to call when already offline (no-op).
@@ -1347,6 +1476,23 @@ func (b *XMPPBridge) encodeReaction(to, forID string, emojis []string) error {
 	return b.encode(ctx, session, msg)
 }
 
+// idleElem is the XEP-0319 <idle/> presence child: 'since' carries the
+// RFC-3339 timestamp of the agent's last interaction when idle; an empty
+// element means the agent is active right now.
+type idleElem struct {
+	XMLName xml.Name `xml:"urn:xmpp:idle:1 idle"`
+	Since   string   `xml:"since,attr,omitempty"`
+}
+
+// capsElem is the XEP-0115 <c/> presence child advertising the client's
+// capabilities hash, so contacts fetch disco#info once and cache the result.
+type capsElem struct {
+	XMLName xml.Name `xml:"http://jabber.org/protocol/caps c"`
+	Hash    string   `xml:"hash,attr"`
+	Node    string   `xml:"node,attr"`
+	Ver     string   `xml:"ver,attr"`
+}
+
 // vcardXUpdate is the XEP-0153 <x xmlns='vcard-temp:x:update'> presence child
 // that advertises the SHA-1 hash of the account's vCard avatar, so clients know
 // to (re)fetch it.
@@ -1437,13 +1583,19 @@ func (b *XMPPBridge) currentPresence() (show, status string) {
 // encodePresenceTo sends one presence stanza. An empty "to" broadcasts
 // (roster-wide); otherwise it is directed at that JID.
 func (b *XMPPBridge) encodePresenceTo(session *xmpp.Session, to, show, status string) error {
+	b.mu.Lock()
+	idle := b.idleSince
+	b.mu.Unlock()
 	p := struct {
-		XMLName xml.Name `xml:"presence"`
-		To      string   `xml:"to,attr,omitempty"`
-		Show    string   `xml:"show,omitempty"`
-		Status  string   `xml:"status,omitempty"`
-		VCard   *vcardXUpdate
-	}{To: to, Show: show, Status: status, VCard: b.avatarUpdate()}
+		XMLName  xml.Name `xml:"presence"`
+		To       string   `xml:"to,attr,omitempty"`
+		Show     string   `xml:"show,omitempty"`
+		Status   string   `xml:"status,omitempty"`
+		Priority int      `xml:"priority"`
+		Idle     idleElem
+		Caps     capsElem
+		VCard    *vcardXUpdate
+	}{To: to, Show: show, Status: status, Priority: 0, Idle: idleElem{Since: idleSinceISO(idle)}, Caps: capsElem{Hash: "sha-1", Node: capsNode, Ver: capsVer}, VCard: b.avatarUpdate()}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return b.encode(ctx, session, p)

@@ -489,3 +489,89 @@ func TestChunkFenceAware(t *testing.T) {
 		}
 	}
 }
+
+func TestCapsVerGoldenVector(t *testing.T) {
+	// XEP-0115 §5.3 worked example: identity client/pc (name "Exodus 0.9.1",
+	// no language) and features caps / disco#info / disco#items / muc hash to
+	// the verification string published in the spec.
+	feats := []string{
+		"http://jabber.org/protocol/caps",
+		"http://jabber.org/protocol/disco#info",
+		"http://jabber.org/protocol/disco#items",
+		"http://jabber.org/protocol/muc",
+	}
+	got := capsVerFor("client/pc//Exodus 0.9.1", feats)
+	const want = "QgayPKawpkPSDYmwT/WM94uAlu0="
+	if got != want {
+		t.Fatalf("caps ver: got %q, want %q", got, want)
+	}
+	// The bridge's own ver must be a stable, non-colliding value.
+	if capsVer == "" || capsVer == want {
+		t.Fatalf("bridge caps ver unexpected: %q", capsVer)
+	}
+}
+
+func TestIdleSinceISO(t *testing.T) {
+	if got := idleSinceISO(time.Time{}); got != "" {
+		t.Fatalf("zero idle: got %q, want empty", got)
+	}
+	// 2026-01-02 03:04:05 +10:00 (AEST) == 2026-01-01 17:04:05 UTC.
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("AEST", 10*3600))
+	if got := idleSinceISO(ts); got != "2026-01-01T17:04:05Z" {
+		t.Fatalf("idle iso: got %q, want 2026-01-01T17:04:05Z", got)
+	}
+}
+
+func TestPresenceChildrenMarshal(t *testing.T) {
+	// idle with timestamp
+	idle := idleElem{Since: "2026-01-01T17:04:05Z"}
+	b, err := xml.Marshal(idle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != `<idle xmlns="urn:xmpp:idle:1" since="2026-01-01T17:04:05Z"></idle>` {
+		t.Fatalf("idle marshal: %s", got)
+	}
+	// idle empty = active
+	b, _ = xml.Marshal(idleElem{})
+	if got := string(b); got != `<idle xmlns="urn:xmpp:idle:1"></idle>` {
+		t.Fatalf("idle empty marshal: %s", got)
+	}
+	// caps
+	c := capsElem{Hash: "sha-1", Node: "http://pi-msg", Ver: capsVer}
+	b, err = xml.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		`xmlns="http://jabber.org/protocol/caps"`,
+		`hash="sha-1"`,
+		`node="http://pi-msg"`,
+		`ver="` + capsVer + `"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("caps marshal missing %q: %s", want, s)
+		}
+	}
+	// full presence shape
+	p := struct {
+		XMLName  xml.Name `xml:"presence"`
+		Show     string   `xml:"show,omitempty"`
+		Status   string   `xml:"status,omitempty"`
+		Priority int      `xml:"priority"`
+		Idle     idleElem
+		Caps     capsElem
+	}{Show: "away", Status: "consulting the entrails", Priority: 0,
+		Idle: idleElem{Since: "2026-01-01T17:04:05Z"}, Caps: c}
+	b, err = xml.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = string(b)
+	for _, want := range []string{"<priority>0</priority>", "urn:xmpp:idle:1", "http://jabber.org/protocol/caps"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("presence missing %q: %s", want, s)
+		}
+	}
+}

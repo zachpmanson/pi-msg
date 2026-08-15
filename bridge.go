@@ -125,9 +125,12 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 	// A fresh or resumed bridge is idle until something prompts it — start the
 	// idle clock now so an unused agent drifts to "away" after the timeout.
+	// The XMPP bridge stamps the same instant into its XEP-0319 idle element.
+	now := time.Now()
 	b.mu.Lock()
-	b.idleSince = time.Now()
+	b.idleSince = now
 	b.mu.Unlock()
+	b.xmpp.SetIdleSince(now)
 	b.loadAwayActivities()
 	go b.idleWatcher(ctx)
 
@@ -320,9 +323,9 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 	case "agent_settled":
 		b.setStreaming(false)
 		b.stopTyping()
+		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
 		b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
 		b.lifecycleReact("✅") // done
-		b.markIdle()          // now idle — arm the away clock
 		// The routing reminder decision happens here (issue #16): mid-run
 		// malformed commentary drops silently, and the agent is only nudged if
 		// the run's FINAL message was malformed (pending nudge set AND nothing
@@ -1821,9 +1824,9 @@ func (b *Bridge) stopTyping() {
 func (b *Bridge) settleLocally() {
 	b.setStreaming(false)
 	b.stopTyping()
+	b.markIdle()
 	b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
 	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
-	b.markIdle()
 }
 
 // idleAwayTimeout is how long the agent may sit idle before its presence
@@ -1883,18 +1886,26 @@ var awayActivities = []string{
 // the idle clock starts now and the watcher flips presence to "away" after
 // idleAwayTimeout of quiet.
 func (b *Bridge) markIdle() {
+	now := time.Now()
 	b.mu.Lock()
-	b.idleSince = time.Now()
+	b.idleSince = now
 	b.mu.Unlock()
+	if b.xmpp != nil {
+		b.xmpp.SetIdleSince(now)
+	}
 }
 
 // markActive clears the idle clock: the agent is working or receiving activity,
-// so it should not drift to "away" until it settles again.
+// so it should not drift to "away" until it settles again. The XMPP bridge
+// drops its XEP-0319 idle stamp, re-announcing active on the next presence.
 func (b *Bridge) markActive() {
 	b.mu.Lock()
 	b.idleSince = time.Time{}
 	b.lastAwayStatus = "" // next away entry picks a fresh activity
 	b.mu.Unlock()
+	if b.xmpp != nil {
+		b.xmpp.SetIdleSince(time.Time{})
+	}
 }
 
 //go:embed away-activities.txt
