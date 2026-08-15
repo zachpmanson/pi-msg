@@ -361,3 +361,21 @@ func TestIdleAwayClock(t *testing.T) {
 		t.Error("markActive after activity should clear idleSince")
 	}
 }
+
+func TestLoadAwayActivities(t *testing.T) {
+	b := roomBridge()
+	b.loadAwayActivities()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(awayActivities) < 400 {
+		t.Errorf("embedded away-activities.txt parsed to %d entries, want >= 400", len(awayActivities))
+	}
+	for _, a := range awayActivities {
+		if a == "" {
+			t.Error("empty activity line in pool")
+		}
+		if len(a) > 90 {
+			t.Errorf("activity too long (%d): %q", len(a), a)
+		}
+	}
+}

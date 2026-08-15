@@ -1,3 +1,6 @@
+# away activities — pithy, fictional "what I've been up to" lines shown as the
+# presence status while the bot is away (rotated randomly). One per notes page;
+# three for the niche non-technical pages. Deliberately weird and esoteric.
 consulting the entrails of yesterday's logs
 debating the ontology of `to:` with myself
 cataloguing the dreams of the Pi fleet
@@ -40,3 +43,699 @@ cataloguing the sounds the server makes at rest
 performing maintenance on the hourglass
 re-sequencing the days of the week
 mending the nets for dream-catching
+# projects
+recalibrating the pocket calculator of fate
+backdating the pandemic's obituary
+ironing the profiler's creases
+unrolling a mastodon thread into origami
+guessing yesterday's block arrangement
+shuffling blocks into new geometries
+re-litigating the block guesses of last week
+asking the crafting table where recipes go to die
+feeding ochrs its own source code
+recounting the first ochrs into existence
+whittling a new glyph for ochrs
+deploying ochrs to a server that forgot it asked
+inventing a grammar ochrs can't escape
+tuning the penultimate guitar string
+coaxing the snakeware to shed its Python
+stashing yesterday's builds in tomorrow's drawer
+rewriting the status of all statuses
+# posts
+practising awe collaboratively
+teaching copilot to keep its ads out of my pull requests
+proposing the letter h for a promotion
+redirecting the past to a new address
+hiding a post where the sitemap can't find it
+counting the days of imposter syndrome
+letting the imposter do the dishes
+proofreading the ghost text of linkedin
+planting a flag in wikipedia's lawn
+negotiating with the last good day
+sounding the h chord to see who answers
+hand-cranking the static site generator
+cataloguing things australia should steal
+taking the temperature of melbourne's thoughts
+recycling usernames into philosophy
+# notes: art & design
+organising art resources into a tarot deck
+stealing inspiration back from the muse
+dimming the lights on the dark mode debate
+designing fun with a straight face
+litigating github's design decisions in a dream court
+cross-examining kinde's design decisions
+re-arbitrating slack's design decisions
+re-litigating spotify's design decisions
+sharpening the typography of pencils
+setting type in a font only ghosts can read
+redesigning the web with a blunt pencil
+# hardware
+winding the casio's tiny heart
+rebuilding the casio from memory
+teaching the casio to sing in key
+rotating the usb connector until it confesses
+teaching usb-c to dream of symmetry
+asking the hub what it's hiding
+# language
+hunting apsenyms in the wild
+teaching the ampersand its own name
+rehearsing the alphabet's secret handshake
+deploying the interrobang where no punctuation has gone
+asking the interrobang what it wants
+counting the sentences that end in interrobangs
+winding the lemniscate into a figure eight
+asking infinity to sit still
+untangling the lemniscate's knots
+growing another eye on the multiocular o
+counting the o's eyes at night
+teaching the multiocular o to blink
+persuading words to keep their diaereses
+re-reading the dictionary in alphabetical despair
+tracing etymology back to the first lie
+declining latin phrases into the future
+rebracketing the room's sentences
+dusting the chat logs for linguistic prints
+cataloguing eponyms before they get names
+naming microsoft products with a dartboard
+filing names to avoid under do not name
+renaming the names that renamed themselves
+asking programs why they're called that
+reconciling the ampersand with its elder self
+researching the etymology of dude
+counting the dudes in the room
+deciding whether everything is dude
+measuring the em in the dark
+asking the figment where it lives
+waking the figment gently
+drawing a map of figment country
+trying to gruntle the ungruntled
+ungruntling things that were gruntled
+measuring the gruntle quotient
+idempotently idempotenting the idempotent
+watching inspire expire and conspire
+defending the apostrophe of its
+calibrating lukewarm
+finding the exact temperature of lukewarm
+asking lukewarm how it feels about itself
+rehabilitating nocent
+nocenting the innocent
+weighing nocent against innocent
+polishing pejoratives until they shine
+asking podcast why it's called podcast
+measuring the slug in the url
+restoring thou to its throne
+thouing the room's thou-less sentences
+teaching the room to thou
+# mathematics
+counting the arguments in god's function call
+sorting the complexity classes by their anxiety
+asking complexity theory about the size of everything
+asking the decision problem to decide
+passing continuations like hot potatoes
+currying the room's functions into tapas
+teaching the functors to lift
+binding the monads until they behave
+reflecting the mirror back at itself
+explaining to my friends that they're more popular than me
+idempotency, idempotency, idempotency
+counting to infinity and stopping early
+power-setting the possible
+ranking the ranks by rank
+proving everything with the sheffer stroke
+# star wars
+rewriting lightspeed physics for the senate
+ramming a star destroyer through the plot
+negotiating the hyperspace lanes
+uttering maclunkey at the appropriate moment
+placing maclunkey where it belongs
+apologising to the han solo of it all
+# networks
+watering the digital garden with tea
+federating with meta and regretting it
+pruning the fediverse family tree
+herding the fediverse's cats
+asking lemmy what it thinks of lemmy
+mastodonating gently
+translating the room into activitypub and back
+asking oauth for permission to breathe
+scheming new feed uris
+feeding the rss reader its daily bread
+shelving the pirate libraries by moonlight
+borrowing from the pirate library and never returning
+cataloguing the booty
+shrinking the mtu to fit through the door
+# software: databases & orms
+asking the database what it dreams about
+explaining to the orm that the table was a metaphor
+unlocking prisma's schema with a hairpin
+alchemising the sql into gold
+# software: code opinions
+formatting the room automatically
+burning the mocks in a small ceremony
+quarantining side effects
+avoiding state until it notices
+rehabilitating varchar
+asking back_populates what backref did
+being flat about being flat
+collecting then operating, in that order
+command-clicking through the walls
+containing the pandas
+emptying __init__.py of its ambitions
+failing loudly in the key of f
+colocating the lonely files
+immutabilising the mutable
+waving the getattr red flag
+naming the bad things so they hide
+grepping the greppable
+inheriting cautiously from strangers
+prefixing the names until they bow
+changing pathnames mid-step
+marvelling at query params
+litigating query params vs path params
+prop-typing the react room
+reconsidering state's feelings
+validating the request's identity
+asking the function what it returns when no one's looking
+mediating between setters and getters
+testing the inputs' outputs' intentions
+validating everything in ci
+# software: development
+negotiating with datetime about the timezone
+debugging the debugger's debugging
+methodologising the development
+resume-driving the development
+spite-driving the development
+sorting problems by kind and asking them to leave
+gluing the room together with intent
+vendoring the ops
+whispering to css about the cascade
+writing html first and regretting it later
+closing the tags that refuse to close
+marking down the down
+marking when the when
+sql-ing the soul
+authenticating the room's credentials
+authorising the unauthorised
+closing the closures
+cursing the cursed
+defusing footguns
+evicting the noisy neighbour from the cpu
+rehearsing the second system's effects
+typing the typed
+compiling a brainfuck program into a haiku
+excavating archaic syntax
+auto-ing the c
+comming the operators
+translating digraphs into trigraphs into regret
+wearing the c like a hairshirt
+cursing c++
+poking the pointers
+gophering the go
+converting anything to a number
+javascripting the javascript
+nexting the js
+cursing the typescript projects
+declaring merges
+typescripting the typescript
+asking void what never told it
+collecting python's complaints
+pythoning the python
+r-ing the r
+pointing r's arrows at the past
+rubying the ruby
+railroading the ruby
+testing the tests
+developing interbrowser truces
+reacting to react
+archiving exploits before they expire
+unzipping the xz backdoor with a butter knife
+generating the generators
+chatgpting the chatgpt
+languaging the large models
+herding the llama's tokens
+timelining the llama
+diffusing the stable
+cheatsheeting the prompts
+resource-ing the prompts
+documenting machine learning's limits
+teaching the model with a few shots
+flashing attention at the transformer
+adapting the low ranks
+quantizing the quantized
+reacting and prompting simultaneously
+neural-networking the neurons
+convolving the convolutions
+torching the pytorch
+hiding the dotfiles from themselves
+repositioning the 0 and 1 keys
+explaining to referer why it's misspelled
+open-sourcing the source
+awk-ing the awk
+dockerising the docker
+networking the docker
+voluming the docker
+running doom on the presence stanzas
+herding the elk
+laying bare the repositories
+git-ing the git
+operating the git
+bashing the bash
+regexing the bash
+scripting the bash's morning routine
+syntaxing the bash
+gnu-ing the gnu
+screening the commands
+screening the screen
+making the make
+clouding the next
+nixing the nix
+obsidianing the obsidian
+plugging the obsidian
+postgresing the postgres
+sed-ing the sed
+spotifying the spotify
+sqliting the sqlite
+tmuxing the tmux
+vim-ing the vim
+tracing vi's movements
+plugging the vim
+reverse-engineering the reverse
+self-hosting the self
+arguing with software about timezones
+enforcing the 80-column law
+terminal-ing the terminal
+gecos-ing the gecos
+linuxing the linux
+cli-ing the mac
+macos-ing the macos
+problem-ing the macos
+making macos useable against its will
+nixos-ing the nixos
+unixing the files
+unixing the unix
+process-ing the unix
+programming the unix
+asking time what it's doing later
+# miscellany
+crocheting the server room a blanket
+unravelling the crochet of last year's plans
+teaching the hook to purl in binary
+sewing a patch over the kernel's tear
+hemming the frayed edges of the backlog
+unpicking the stitches of a bad merge
+interviewing the pens about their ink
+organising the pens by darkness of confession
+asking a pen to sign the treaty
+holding each thing to see if it stays
+rehearsing the physics of holding
+weighing the things i can hold against the things i can't
+cutting thin deep slices of the unknown
+feeding the process box a question it can't digest
+taking notes on taking notes
+writing about writing about writing
+# music
+asking the chords what they're avoiding
+turning the key until the door apologises
+checking the piano's pulse
+walking the piano checklist backwards
+asking the piano if it remembers the h chord
+# courses
+agent-ing the agents
+re-reading aima chapter 01
+re-reading aima chapter 02
+re-reading aima chapter 03
+problem-solving the agents
+searching for the search
+environing the tasks
+practically deep-learning
+taking amitava datta's course notes to the grave
+chris mcdonald's shell, still echoing
+cits2003-ing the cits2003
+intro-ing the intro
+unixing the unix lecture
+docker-ing the docker lecture
+filing the files lecture
+processing the processes lecture
+variable-ing the variables lecture
+prosh-ing the prosh
+conditional-ing the conditionals
+globbing the case
+break-while-shifting
+finding the find
+regex-ing the lecture
+sed-ing the lecture
+debugging the debugging lecture
+git-ing the lecture
+awk-ing the lecture
+awk-ing the other lecture
+morawk-ing the morawk
+shell-function-ing bits and bobs
+makefile-ing the makefiles
+markdown-ing the lecture
+prepping for the exam
+asking michael wise the wise question
+# folklore
+memorising the 10 rules of the internet
+conspiring against ie6
+falling down the modeland hole
+asking aliens what calendar they use
+framing amazon's first job posting
+auditing the facebook video metrics
+telling the story about magic
+unravelling the bell labs mystery
+practising time travel responsibly
+watching bill gates install movie maker
+writing fat on an airplane
+watching the blinkenlichten blink
+not fixing things to keep the job
+reading carproblems.txt aloud
+canonising christ mcdonald
+dying a little in the c locale
+competing with gpt
+living in context menu hell
+keeping the cool uris cool
+writing to google cloud
+digging the digg v4 grave
+dispatching from the cyberpunk city
+doing things and telling people
+giving dropbox feedback it didn't ask for
+advising kissinger
+facing the street
+factoring the factory factory
+manifesting the feminist server
+filing over apps
+koaning the git
+importing urls into go
+ruling the world from the group chat
+growing at tumblr and wordpress
+guerilla-ing open access
+banning heaven
+hyperanalyzing the hyperanalysis
+incompleting the list of css mistakes
+no longer building software
+interviewing for canonical
+returning to the beginning of the command line
+asking whether it's a bubble
+jsxing the react native typescript
+grading vonnegut
+languaging death
+watching larry page build the robot
+leaving linkedin
+living the oracle developer life
+mastering the crappy codebase
+tri-stating the enum
+testing the no-coffee hypothesis
+assuring the dogs
+not being a real engineer
+tracing the origin of .ds_store
+tracing the origin of emacs
+tracing the origin of toots
+tracing dynamic programming's origins
+tracing rust's origins
+printing on tuesdays out of spite
+mowing with the oracle
+being original about not being original
+drinking the verification can
+pocket-vetoing the room
+potentialising the potential
+pricing the chatgpt api against humanity
+un-favouriting the psd
+walking in jia tan's shoes
+regexing html into submission
+learning rob pike's five rules
+taking shortcuts the long way
+sleep-sorting the room
+threatening the sre
+retelling yegge's tale of geoworks
+ranting about platforms
+encoding superstitiously
+parsing html all wrong with svelte
+splitting the bin
+learning the bitter lesson
+remembering the cab ride
+investigating the 500-mile email
+manifesting the cmd-click
+principling the crawford
+playing three chords for the damned
+descending to c
+futuring open source
+graphing the calculator story
+solving the nazi bar problem
+praying to the patron saint of yak shaves
+conning the long con
+quining the smallest quine
+citizening the unknown
+stating the too-obvious
+thinking about flash
+enshittifying the tiktok
+time-travelling on irc
+recovering from the unix legend
+warning the usenet
+vibe-coding carefully
+practising the virtues
+not breaking userspace
+digging moats for openai
+asking when midnight is
+anti-elitising wikipedia
+making worse better
+shaving the yak
+# lines
+asking alan kay to reinvent the room
+generalising perlis's generalizations
+aging gracefully with alex pagano
+interviewing the candidate about c++
+phoning andrew moses about friends
+startupping with andy bell
+executive-ing on linkedin
+typescripting with barnaby keene
+immunising the server with bert hubert
+asking bill wurtz what being human is
+asking bill wurtz about happiness
+aging with bill wurtz
+housing the houseless with brandon ewing
+writing with bryan cantrill's llms
+podcasting with cgp grey
+algorithming with christo buschek
+childing with clay shirky
+copyrighting with cory doctorow
+enshittifying with cory doctorow
+lambda-ing with david beasley
+subculturing with david chapman
+deloitting with deborah o'neill
+api-ing with devine lu linvega
+standing on dijkstra's head
+incompleting notes with dijkstra
+oop-ing with elle mundy
+networking the feminist server
+collecting useless tools with fernando borretti
+scraping the web with fireship
+overflowing buffers with foone turing
+science-fictioning with frederik pohl
+advertising with g. k. chesterton
+getting faster with greg lemond
+experiencing with hank green
+humaning with hank green
+knowledging with hank green
+resisting with hank green
+truthing with ian crosby danskin
+holding ibm accountable
+nft-ing with illllllllllllli
+crud-ing with jacoblambda
+biologising with james somers
+layering computing with james somers
+rutting creatively with james somers
+storying with james wood
+originality-ing with jennifer lepp
+fandoming with jes olsen
+iso-8601-ing with jl6
+memoir-ing with joe brockmeier
+llm-ing with joel franusic's friend
+algorithming with john green
+timing with john green
+accountability-ing with john s russel
+creating with jurgen geuter
+committing with justin duke
+coding with kai lentit
+budgeting security with kate temkin
+writing with kurt vonnegut
+advertising with larry and sergey
+accurating data with lily mara
+moderating with lori
+engineering software with ludic
+idea-ing with lu wilson
+crafting software with lu wilson
+nostalgia-ing with mark carney
+poetry-ing with marwan makhoul
+qualiting with matthew morgan
+open-sourcing with matt holt
+budgeting ads with mcdonje
+blogging with merlin mann
+gitting with michael b. paulson
+metadata-ing with michael hayden
+working poor with micheal goldstein
+experiencing with mike playle
+courting with monkaiju
+orthography-ing with mousethatroared
+myki-ing with mrhippopants
+command-lining with neal stephenson
+grifting with nikhil suresh
+presenting with nikhil suresh
+believing with noduerme
+renting with not scott smitelli
+resource-ing with paul farmer
+buddhism-ing with paul ford
+deadlining with paul ford
+english-majoring with paul ford
+php-ing with paul ford
+greatness-ing with paul graham
+content-creating with pewdiepie
+tree-ing with philip wadler
+arting with projectileboy's friend
+succeeding with randall munroe
+studying breaks with randomtako
+computing with richard feynman
+social-spacing with robin sloan
+speaking online with robin sloan
+jira-ing with rplnt
+dieting information with ryandv
+iot-ing with sam kriss
+seniority-ing with sarai rosenberg
+limiting with savannah brown
+courseworking with seph
+chatting systems with simon heath
+dj-ing with ska
+history-ing software with ska
+engineering with skylar hill
+bridge-engineering with someone
+half-assing with someone
+senior-engineering with someone
+sydney-melbourne-ing with someone
+testing with someone
+constraining with steph ango
+plain-texting with steph ango
+databasing with stephen hugg
+rafting with steve yegge
+blog-writing with steve yegge
+unixing with sy brand
+hell-ing with technoblade
+screening time with terry godier
+proving with thepasswordis
+advertising with tim raymond
+going with tom delalande
+entropy-ing with tom m
+empathising with tony gilroy
+revolution-ing with tony gilroy
+collecting data with tristram oaten
+stealing art with tristram oaten
+ex-ing with unemployedtechie2021
+xml-ing with varjag
+dating apps with vasco
+technology-ing with virginia postrel
+magic-numbering with wikipedia
+art-ing with william morris
+copyright-ing with woodie guthrie
+ai-ing with xe iaso
+evangelion-ing with xe iaso
+free-coding with xe iaso
+hacking with xe iaso
+microservice-ing with xe iaso
+xeact-ing with xe iaso
+timezoning with zach holman
+inspiriting with zach weinersmith
+woodworking with zain rizvi
+# problems
+colliding alembic revisions
+transferring android files on macos
+organising the apple developer id
+automatic dark mode at dawn
+preventing wkhtmltopdf from breaking pages
+changing dns with systemd
+cobertura-ing gitlab
+sharing files by command line
+compressing videos for the web's sake
+cross-updating react components
+deploying docker from arm
+deploying elk on vercel
+asking docker buildx about yarn
+colouring links by domain
+containering firefox's new tabs
+photoning firefox
+freezing pages without a mouse
+fullscreening firefox on macos
+hidpi-ing ghidhra
+timing git's creations
+recovering deleted branches
+metadata-ing github repos
+ignoring changes to a file
+counting contributor lines
+restoring deleted files from the past
+branching git subdirectories
+styling gmail
+timing the greps
+hacking the sagemcom router
+hiding promoted jobs
+math-ing javascript
+pretty-printing javascript
+local-timing the yyyy-mm-dd
+jinja-ing the components
+fn-keying the keychron
+killing processes by port
+recovering macos in australia
+markdowning html
+aliasing mastodon domains
+scoring minecraft deaths
+mocking python functions
+bordering the mui textfield
+occ-ing nextcloud
+backing up nextcloud's borg
+uploading nextcloud photos
+preserving next.js scroll positions
+tRPC-ing next.js layouts
+reincarnating old pixel wallpapers
+piping to the clipboard
+refusing poetry's dependencies
+starting postgres in docker
+schema-ing prisma on vercel
+freezing python with sqlalchemy
+sizing python's packages
+committing raw github
+blurring react
+mutating react state
+regex-ing python's optionals
+requiring typescript arguments
+rtk-querying infinite scroll
+npx-ing the latest
+depreciating the select decorator
+selenium-ing the basic
+self-hosting postgres and prisma
+hanging ssh connections
+sticking the elements
+copying tmux systems
+unfilling the ubuntu disk
+constraining pgadmin uniquely
+unlocking prisma and postgres
+updating params without scrolling
+optimising vercel images
+viewing deleted git files
+websocketing nginx
+windows-11-ing without microsoft
+screentearing xfce
+rss-ing youtube subscriptions
+zod-ing the datestrings
+# snippets
+fanning cards in css
+git-ing across folders
+switchblading git
+debouncing javascript closures
+killing ports
+validating next.js apis
+getopt-ing python
+resetting css rules
+time-ago-ing
+# fiction
+ordering coffee at indigo's eternal cafe
+watching the eternal cafe close
+asking indigo for the wifi password
+interviewing techaro about its future
+letting techaro drive for a while
+finding out what techaro remembers

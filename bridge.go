@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -127,6 +128,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.mu.Lock()
 	b.idleSince = time.Now()
 	b.mu.Unlock()
+	b.loadAwayActivities()
 	go b.idleWatcher(ctx)
 
 	// Materialise the companion extension so pi can register the XMPP tools.
@@ -1892,6 +1894,29 @@ func (b *Bridge) markActive() {
 	b.mu.Lock()
 	b.idleSince = time.Time{}
 	b.lastAwayStatus = "" // next away entry picks a fresh activity
+	b.mu.Unlock()
+}
+
+//go:embed away-activities.txt
+var awayActivitiesFile string
+
+// loadAwayActivities replaces the built-in pool with the embedded file's
+// contents when present (one activity per line; blank lines and # comments are
+// skipped). Called once at startup before the idle watcher starts.
+func (b *Bridge) loadAwayActivities() {
+	pool := make([]string, 0, 64)
+	for _, l := range strings.Split(awayActivitiesFile, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		pool = append(pool, l)
+	}
+	if len(pool) == 0 {
+		return // keep the built-in slice
+	}
+	b.mu.Lock()
+	awayActivities = pool
 	b.mu.Unlock()
 }
 
