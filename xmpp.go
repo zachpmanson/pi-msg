@@ -721,13 +721,17 @@ func (b *XMPPBridge) encode(ctx context.Context, session *xmpp.Session, v any) e
 // deferred Close in serve() makes any double-close a harmless no-op.
 func (b *XMPPBridge) kick() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if !b.online || time.Since(b.lastKick) < time.Second {
+		b.mu.Unlock()
 		return
 	}
 	b.lastKick = time.Now()
-	if b.session != nil {
-		b.session.Close()
+	session := b.session
+	b.mu.Unlock()
+	// closeSession blocks (bounded) on a wedged socket; do it after releasing
+	// mu so other bridge operations aren't stuck behind a slow close too.
+	if session != nil {
+		closeSession(b, session)
 	}
 }
 
