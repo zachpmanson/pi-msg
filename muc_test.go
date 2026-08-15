@@ -120,6 +120,7 @@ func TestAmbientCap(t *testing.T) {
 
 func TestComposePrompt(t *testing.T) {
 	b := roomBridge() // owner zach@x.com, room team@muc.x.com
+	b.routingSeeded = true // this test exercises the non-seeding path
 
 	// Owner DM turn: "from:" is the owner, body follows directly (no sender
 	// line). No routing hint is appended (removed per issue #33).
@@ -149,6 +150,27 @@ func TestComposePrompt(t *testing.T) {
 	got = b.composePrompt("do it", true, "", "team@muc.x.com", "zach@x.com", "", "")
 	if !strings.Contains(got, "room commentary") || !strings.Contains(got, "do it") {
 		t.Errorf("canonical+ambient wrong: %q", got)
+	}
+}
+
+func TestRoutingSeedOnce(t *testing.T) {
+	b := roomBridge() // room-mode account
+	// First prompt seeds the contract (once); room-mode only.
+	got1 := b.composePrompt("go", true, "", "team@muc.x.com", "zach@x.com", "", "")
+	if !strings.Contains(got1, "routing (pi-msg)") {
+		t.Errorf("first prompt should seed the routing contract: %q", got1)
+	}
+	// Subsequent prompts must NOT re-seed.
+	got2 := b.composePrompt("again", true, "", "team@muc.x.com", "zach@x.com", "", "")
+	if strings.Contains(got2, "routing (pi-msg)") {
+		t.Errorf("second prompt re-seeded the contract: %q", got2)
+	}
+
+	// A non-room (1:1) account never seeds.
+	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	got := b1.composePrompt("hi", true, "", "zach@x.com", "", "", "")
+	if strings.Contains(got, "routing (pi-msg)") {
+		t.Errorf("1:1 account should not seed the routing contract: %q", got)
 	}
 }
 

@@ -52,6 +52,7 @@ type Bridge struct {
 	reactTo        string        // full JID of the owner message the current run reacts to
 	reactID        string        // stanza id of that message (XEP-0444 target); "" disables
 	turnDest       string        // reply destination for the current turn (owner or room jid)
+	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -148,6 +149,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		b.rpc.sessionPath = prev
 		b.log("info", fmt.Sprintf("resuming session %s (start=%s)", prev, startLabel(b.startDir)))
 		b.resumed = true
+		// A resumed session's context already contains the routing contract (it
+		// was seeded when the session began), so don't re-seed it now.
+		b.routingSeeded = true
 		b.xmpp.SetStartupStatus("resumed")
 	} else {
 		if prev != "" {
@@ -591,6 +595,9 @@ func (b *Bridge) handleCommand(t string) bool {
 			// restart would resume an OLD conversation. Persist the new session
 			// file now so a restart continues this conversation instead.
 			b.refreshSessionFile()
+			// A fresh session has no routing contract in context yet — re-seed
+			// it on the next prompt (once).
+			b.routingSeeded = false
 		}
 	case "compact":
 		res, err := b.rpc.Compact(b.ctx, arg)
@@ -941,6 +948,14 @@ func compactArgs(args Event) string {
 	return strings.Join(pairs, " ")
 }
 
+// routingContract is pi-msg's canonical, on-start description of how the agent
+// must address its replies. It is seeded once per session (see composePrompt),
+// not on every message; the full spec lives in docs/routing.md. Ownership of
+// the routing protocol belongs to pi-msg, not to any fleet agent config.
+func (b *Bridge) routingContract() string {
+	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+}
+
 // composePrompt assembles the text sent to pi. When the account has room
 // access it leads with a "from:"/"sender:" header naming the message's origin;
 // buffered ambient commentary is prepended as a non-canonical block, and
@@ -955,6 +970,15 @@ func compactArgs(args Event) string {
 // route (#16).
 func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender, reactID, reactTo string) string {
 	var sb strings.Builder
+	// Seed the pi-msg routing contract once per session (fresh session or after
+	// /new) so the agent knows the protocol without paying a per-message cost.
+	// Resumed sessions skip this: their context already contains the contract
+	// (routingSeeded is set true at startup for a resume and reset on /new).
+	if b.acct.RoomMode() && !b.routingSeeded {
+		b.routingSeeded = true
+		sb.WriteString(b.routingContract())
+		sb.WriteString("\n\n")
+	}
 	if ambient := b.drainAmbient(); ambient != "" {
 		sb.WriteString(ambient)
 		sb.WriteString("\n\n")
