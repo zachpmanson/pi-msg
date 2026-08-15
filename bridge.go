@@ -482,13 +482,12 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.setDirectTurn(m.Direct)
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
-	// Any inbound message is activity: clear the idle-away clock and, if we
-	// had drifted to "away", come back to available (a run still in flight
-	// keeps dnd — leave its presence alone).
-	b.markActive()
-	if !b.streaming() && b.xmpp != nil {
-		b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
-	}
+	// Presence is driven by the run lifecycle, not ambient traffic: a run
+	// announces dnd at start (agent_start) and available "listening" at
+	// settle, and the idle watcher drifts to "away" after idleAwayTimeout
+	// without a run. Inbound room chatter no longer resets the away clock or
+	// flips presence back to available, so an idle agent stays visibly away
+	// until it actually works again.
 	// An inbound XEP-0444 reaction is an acknowledgment signal, not a
 	// conversation turn: surface it as ambient context for the agent's next
 	// prompt rather than triggering a run (issue #27).
