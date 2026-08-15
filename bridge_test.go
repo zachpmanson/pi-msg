@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/xml"
 	"reflect"
 	"strings"
 	"testing"
@@ -267,3 +268,60 @@ func TestPrettyDump(t *testing.T) {
 		}
 	}
 }
+
+func TestReactionEmojis(t *testing.T) {
+	// Build the token stream directly (ASCII content) to exercise the reaction
+	// extraction logic without any note-of-tool mangling of embedded emoji or
+	// XML-in-string. The emoji round-trip itself is covered by the real XML
+	// decode path (see xmpp.go handle / reactionEmojis) and TestInboundReactionAck.
+	toks := []xml.Token{
+		xml.StartElement{Name: xml.Name{Local: "message"}},
+		xml.StartElement{Name: xml.Name{Local: "reactions", Space: reactionsNS}},
+		xml.StartElement{Name: xml.Name{Local: "reaction"}},
+		xml.CharData("ACK"),
+		xml.EndElement{Name: xml.Name{Local: "reaction"}},
+		xml.StartElement{Name: xml.Name{Local: "reaction"}},
+		xml.CharData("OK"),
+		xml.EndElement{Name: xml.Name{Local: "reaction"}},
+		xml.StartElement{Name: xml.Name{Local: "reaction"}},
+		xml.CharData("  "),
+		xml.EndElement{Name: xml.Name{Local: "reaction"}},
+		xml.EndElement{Name: xml.Name{Local: "reactions"}},
+	}
+	got := reactionEmojis(toks)
+	if len(got) != 2 || got[0] != "ACK" || got[1] != "OK" {
+		t.Errorf("reactionEmojis = %v, want [ACK OK]", got)
+	}
+	if got := reactionEmojis(nil); len(got) != 0 {
+		t.Errorf("reactionEmojis(nil) = %v, want empty", got)
+	}
+}
+
+func TestInboundReactionAck(t *testing.T) {
+	b := roomBridge() // room-mode, owner zach@x.com
+	// A peer reacts to one of our messages: buffered as ambient, no turn streamed.
+	b.onInbound(InboundMessage{
+		Nick: "peppy", Room: "team@muc.x.com",
+		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "target-123",
+	})
+	amb := b.drainAmbient()
+	if !strings.Contains(amb, "peppy") || !strings.Contains(amb, "\U0001FAE1") || !strings.Contains(amb, "XEP-0444") {
+		t.Errorf("reaction ack not buffered as ambient: %q", amb)
+	}
+	// The reaction must not leave a dangling ambient ack for the next drain.
+	if got := b.drainAmbient(); got != "" {
+		t.Errorf("reaction ack re-drained: %q", got)
+	}
+
+	// Owner reacting on 1:1 renders as "owner".
+	b2 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	b2.onInbound(InboundMessage{
+		Direct: true, FromOwner: true, From: "zach@x.com/res",
+		Reactions: []string{"\u2705"}, ReactionID: "out-1",
+	})
+	amb2 := b2.drainAmbient()
+	if !strings.Contains(amb2, "owner") || !strings.Contains(amb2, "\u2705") {
+		t.Errorf("owner reaction ack wrong: %q", amb2)
+	}
+}
+

@@ -461,6 +461,13 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.setDirectTurn(m.Direct)
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
+	// An inbound XEP-0444 reaction is an acknowledgment signal, not a
+	// conversation turn: surface it as ambient context for the agent's next
+	// prompt rather than triggering a run (issue #27).
+	if len(m.Reactions) > 0 {
+		b.handleReaction(m)
+		return
+	}
 	if m.Direct {
 		// Owner 1:1: origin is the owner; no separate sender. The reaction target
 		// is this message (routed to its full from-JID).
@@ -468,6 +475,23 @@ func (b *Bridge) onInbound(m InboundMessage) {
 		return
 	}
 	b.handleRoom(m)
+}
+
+// handleReaction records an inbound XEP-0444 reaction (an ack from a peer or
+// the owner) as buffered ambient context. It deliberately does not take a
+// turn — an ack shouldn't consume a cascade slot or force a reply — but the
+// reacted-to agent sees it on its next prompt.
+func (b *Bridge) handleReaction(m InboundMessage) {
+	nick := m.Nick
+	render := nick
+	if m.FromOwner {
+		render = "owner"
+	}
+	if render == "" {
+		render = bareJid(m.From)
+	}
+	b.bufferAmbient(render, "reacted "+strings.Join(m.Reactions, " ")+" to your message (XEP-0444 ack)")
+	b.log("notice", fmt.Sprintf("inbound reaction from %s: %s (target %q)", render, strings.Join(m.Reactions, " "), m.ReactionID))
 }
 
 // roomAction is how a room message is treated under the two-axis model.

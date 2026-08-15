@@ -218,6 +218,11 @@ type InboundMessage struct {
 	Room      string // source room bare JID (room mode); "" for 1:1
 	ID        string // stanza id (used as the XEP-0444 reaction target)
 	From      string // full from-JID, so a reaction routes back to that resource
+
+	// Reactions is a non-nil emoji set when this is an inbound XEP-0444 reaction
+	// (no body). ReactionID is the stanza id of the message being reacted to.
+	Reactions   []string
+	ReactionID  string
 }
 
 // XMPPBridge owns a single account's XMPP connection: it maintains a
@@ -703,6 +708,8 @@ type incomingMsg struct {
 	delayStamp  time.Time // the <delay stamp> attr, zero if absent/unparsable
 	wantReceipt bool      // carried a XEP-0184 <request/> (delivery receipt)
 	markable    bool      // carried a XEP-0333 <markable/> (chat marker)
+	reactions   []string  // XEP-0444 reactions: the emoji set, if this is a reaction
+	reactionFor string    // XEP-0444 reactions id: stanza id of the message being reacted to
 }
 
 // handle is the mellium read-loop callback for one inbound stanza.
@@ -718,6 +725,10 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 			typ:  attr(start.Attr, "type"),
 			id:   attr(start.Attr, "id"),
 			body: childText(toks, "body"),
+		}
+		if re, ok := element(toks, reactionsNS, "reactions"); ok {
+			m.reactionFor = attr(re.Attr, "id")
+			m.reactions = reactionEmojis(toks)
 		}
 		if d, ok := element(toks, "urn:xmpp:delay", "delay"); ok {
 			m.delay = true
@@ -802,8 +813,8 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if bareJid(m.from) != b.ownerBare {
 		return
 	}
-	if strings.TrimSpace(m.body) == "" {
-		return // chat-states, receipts, empty
+	if strings.TrimSpace(m.body) == "" && len(m.reactions) == 0 {
+		return // chat-states, receipts, empty, or a reaction-only ack is forwarded below
 	}
 	// Drop server-replayed history (offline / MAM catch-up on reconnect) unless
 	// it falls inside the restart swap window — then buffer it for the resumed
@@ -826,7 +837,7 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	}
 	// The agent is about to take this in — acknowledge it as read/delivered.
 	b.sendReceipts(m)
-	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from})
+	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Reactions: m.reactions, ReactionID: m.reactionFor})
 }
 
 // dispatchRoom applies groupchat guards and forwards room messages to onMsg,
@@ -863,8 +874,8 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 		}
 		return
 	}
-	if strings.TrimSpace(m.body) == "" {
-		return // subject-only, chat-states, empty
+	if strings.TrimSpace(m.body) == "" && len(m.reactions) == 0 {
+		return // subject-only, chat-states, empty (reaction-only acks forwarded below)
 	}
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
@@ -875,13 +886,15 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	}
 	real := b.occupantRealJID(room, nick)
 	b.onMsg(InboundMessage{
-		Body:      m.body,
-		Nick:      nick,
-		RealJID:   real,
-		FromOwner: real != "" && real == b.ownerBare,
-		Room:      room,
-		ID:        m.id,
-		From:      m.from,
+		Body:       m.body,
+		Nick:       nick,
+		RealJID:    real,
+		FromOwner:  real != "" && real == b.ownerBare,
+		Room:       room,
+		ID:         m.id,
+		From:       m.from,
+		Reactions:  m.reactions,
+		ReactionID: m.reactionFor,
 	})
 }
 
@@ -1771,4 +1784,24 @@ func childText(toks []xml.Token, local string) string {
 		}
 	}
 	return ""
+}
+
+// reactionEmojis collects the text of every <reaction> child among toks
+// (XEP-0444 reaction elements), in document order.
+func reactionEmojis(toks []xml.Token) []string {
+	var out []string
+	for i, tok := range toks {
+		se, ok := tok.(xml.StartElement)
+		if !ok || se.Name.Local != "reaction" {
+			continue
+		}
+		if i+1 < len(toks) {
+			if cd, ok := toks[i+1].(xml.CharData); ok {
+				if e := strings.TrimSpace(string(cd)); e != "" {
+					out = append(out, e)
+				}
+			}
+		}
+	}
+	return out
 }
