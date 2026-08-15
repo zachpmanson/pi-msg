@@ -54,6 +54,7 @@ type Bridge struct {
 	turnDest       string        // reply destination for the current turn (owner or room jid)
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
+	idleSince      time.Time     // when the agent last became idle; zero while a run is in flight
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -118,6 +119,13 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.ctx = ctx
 
 	b.xmpp = NewXMPPBridge(b.acct, b.onInbound, b.log)
+
+	// A fresh or resumed bridge is idle until something prompts it — start the
+	// idle clock now so an unused agent drifts to "away" after the timeout.
+	b.mu.Lock()
+	b.idleSince = time.Now()
+	b.mu.Unlock()
+	go b.idleWatcher(ctx)
 
 	// Materialise the companion extension so pi can register the XMPP tools.
 	extPath, err := writeTempExtension()
@@ -302,6 +310,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setHandleWarned(false)
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
 		b.reactionAckRun = false
+		b.markActive() // a run is in flight — not idle
 		b.xmpp.SetPresence("dnd", "thinking…")
 		b.lifecycleReact("👀") // picked up (opt-in via the reactions flag)
 	case "agent_settled":
@@ -309,6 +318,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.stopTyping()
 		b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
 		b.lifecycleReact("✅") // done
+		b.markIdle()          // now idle — arm the away clock
 		// The routing reminder decision happens here (issue #16): mid-run
 		// malformed commentary drops silently, and the agent is only nudged if
 		// the run's FINAL message was malformed (pending nudge set AND nothing
@@ -465,6 +475,13 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.setDirectTurn(m.Direct)
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
+	// Any inbound message is activity: clear the idle-away clock and, if we
+	// had drifted to "away", come back to available (a run still in flight
+	// keeps dnd — leave its presence alone).
+	b.markActive()
+	if !b.streaming() && b.xmpp != nil {
+		b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
+	}
 	// An inbound XEP-0444 reaction is an acknowledgment signal, not a
 	// conversation turn: surface it as ambient context for the agent's next
 	// prompt rather than triggering a run (issue #27).
@@ -1802,6 +1819,50 @@ func (b *Bridge) settleLocally() {
 	b.stopTyping()
 	b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
 	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
+	b.markIdle()
+}
+
+// idleAwayTimeout is how long the agent may sit idle before its presence
+// drifts from available to "away". Any inbound activity resets the clock.
+const idleAwayTimeout = 20 * time.Minute
+
+// markIdle records that the agent has settled into an idle, available state;
+// the idle clock starts now and the watcher flips presence to "away" after
+// idleAwayTimeout of quiet.
+func (b *Bridge) markIdle() {
+	b.mu.Lock()
+	b.idleSince = time.Now()
+	b.mu.Unlock()
+}
+
+// markActive clears the idle clock: the agent is working or receiving activity,
+// so it should not drift to "away" until it settles again.
+func (b *Bridge) markActive() {
+	b.mu.Lock()
+	b.idleSince = time.Time{}
+	b.mu.Unlock()
+}
+
+// idleWatcher flips presence to "away" once the agent has been idle (no run in
+// flight, no inbound activity) for idleAwayTimeout. Presence returns to
+// available on the next inbound message or run (see onInbound / agent_start).
+func (b *Bridge) idleWatcher(ctx context.Context) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			b.mu.Lock()
+			idle := !b.idleSince.IsZero()
+			elapsed := time.Since(b.idleSince)
+			b.mu.Unlock()
+			if idle && !b.streaming() && elapsed >= idleAwayTimeout && b.xmpp != nil {
+				b.xmpp.SetPresence("away", "idle — will respond to your next message")
+			}
+		}
+	}
 }
 
 // --- small state accessors ---

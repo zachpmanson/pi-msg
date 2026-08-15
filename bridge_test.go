@@ -344,3 +344,20 @@ func TestInboundReactionAck(t *testing.T) {
 		t.Errorf("owner 1:1 reaction turnDest = %q, want owner", b3.currentTurnDest())
 	}
 }
+
+func TestIdleAwayClock(t *testing.T) {
+	b := roomBridge()
+	b.markActive()
+	if !b.idleSince.IsZero() {
+		t.Error("markActive should clear idleSince")
+	}
+	b.markIdle()
+	if b.idleSince.IsZero() {
+		t.Error("markIdle should set idleSince")
+	}
+	// An inbound message marks active again, even a non-canonical one.
+	b.markActive()
+	if !b.idleSince.IsZero() {
+		t.Error("markActive after activity should clear idleSince")
+	}
+}
