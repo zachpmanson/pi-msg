@@ -298,30 +298,49 @@ func TestReactionEmojis(t *testing.T) {
 }
 
 func TestInboundReactionAck(t *testing.T) {
+	// Path 1: a run is in flight → the ack is buffered to ambient, not a wake.
 	b := roomBridge() // room-mode, owner zach@x.com
-	// A peer reacts to one of our messages: buffered as ambient, no turn streamed.
+	b.setStreaming(true)
 	b.onInbound(InboundMessage{
 		Nick: "peppy", Room: "team@muc.x.com",
 		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "target-123",
 	})
 	amb := b.drainAmbient()
 	if !strings.Contains(amb, "peppy") || !strings.Contains(amb, "\U0001FAE1") || !strings.Contains(amb, "XEP-0444") {
-		t.Errorf("reaction ack not buffered as ambient: %q", amb)
+		t.Errorf("streaming ack not buffered as ambient: %q", amb)
 	}
-	// The reaction must not leave a dangling ambient ack for the next drain.
-	if got := b.drainAmbient(); got != "" {
-		t.Errorf("reaction ack re-drained: %q", got)
+	if b.reactionAckRun {
+		t.Error("streaming path should not set reactionAckRun")
 	}
 
-	// Owner reacting on 1:1 renders as "owner".
-	b2 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	// Path 2: idle → the ack wakes the agent (reactionAckRun set, turnDest = room).
+	b2 := roomBridge()
+	b2.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
 	b2.onInbound(InboundMessage{
+		Nick: "peppy", Room: "team@muc.x.com",
+		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "target-123",
+	})
+	if !b2.reactionAckRun {
+		t.Error("idle reaction should set reactionAckRun")
+	}
+	if b2.currentTurnDest() != "team@muc.x.com" {
+		t.Errorf("idle room reaction turnDest = %q, want room", b2.currentTurnDest())
+	}
+	if got := b2.drainAmbient(); got != "" {
+		t.Errorf("idle reaction should not buffer ambient: %q", got)
+	}
+
+	// Owner reacting on 1:1 renders as "owner" and turns to the owner.
+	b3 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	b3.rpc = &RPCClient{}
+	b3.onInbound(InboundMessage{
 		Direct: true, FromOwner: true, From: "zach@x.com/res",
 		Reactions: []string{"\u2705"}, ReactionID: "out-1",
 	})
-	amb2 := b2.drainAmbient()
-	if !strings.Contains(amb2, "owner") || !strings.Contains(amb2, "\u2705") {
-		t.Errorf("owner reaction ack wrong: %q", amb2)
+	if !b3.reactionAckRun {
+		t.Error("owner 1:1 reaction should wake (set reactionAckRun)")
+	}
+	if b3.currentTurnDest() != "zach@x.com" {
+		t.Errorf("owner 1:1 reaction turnDest = %q, want owner", b3.currentTurnDest())
 	}
 }
-

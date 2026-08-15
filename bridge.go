@@ -53,6 +53,7 @@ type Bridge struct {
 	reactID        string        // stanza id of that message (XEP-0444 target); "" disables
 	turnDest       string        // reply destination for the current turn (owner or room jid)
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
+	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -300,6 +301,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setReplied(false)
 		b.setHandleWarned(false)
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
+		b.reactionAckRun = false
 		b.xmpp.SetPresence("dnd", "thinking…")
 		b.lifecycleReact("👀") // picked up (opt-in via the reactions flag)
 	case "agent_settled":
@@ -314,7 +316,9 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.firePendingNudge()
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
-		if !b.replied() && !b.volunteered {
+		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
+		// stay silent after a to:noop without spamming the owner.
+		if !b.replied() && !b.volunteered && !b.reactionAckRun {
 			b.reply("✅ done (no reply) — your turn")
 		}
 		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
@@ -478,20 +482,38 @@ func (b *Bridge) onInbound(m InboundMessage) {
 }
 
 // handleReaction records an inbound XEP-0444 reaction (an ack from a peer or
-// the owner) as buffered ambient context. It deliberately does not take a
-// turn — an ack shouldn't consume a cascade slot or force a reply — but the
-// reacted-to agent sees it on its next prompt.
+// the owner). Idle, it surfaces immediately so the reacted-to agent can read
+// the ack without the owner sending anything; if a run is in flight it is
+// buffered to ambient so the active turn isn't interrupted (issue #27).
 func (b *Bridge) handleReaction(m InboundMessage) {
-	nick := m.Nick
-	render := nick
+	render := m.Nick
 	if m.FromOwner {
 		render = "owner"
 	}
 	if render == "" {
 		render = bareJid(m.From)
 	}
-	b.bufferAmbient(render, "reacted "+strings.Join(m.Reactions, " ")+" to your message (XEP-0444 ack)")
-	b.log("notice", fmt.Sprintf("inbound reaction from %s: %s (target %q)", render, strings.Join(m.Reactions, " "), m.ReactionID))
+	joint := strings.Join(m.Reactions, " ")
+	b.log("notice", fmt.Sprintf("inbound reaction from %s: %s (target %q)", render, joint, m.ReactionID))
+	// A run already in flight must not be interrupted by a steering prompt.
+	if b.streaming() {
+		b.bufferAmbient(render, "reacted "+joint+" to your message (XEP-0444 ack)")
+		return
+	}
+	// Idle: wake the agent so the ack is readable now. It may acknowledge, act,
+	// or reply "to: noop" — no owner message required (issue #27).
+	if m.Direct {
+		b.setTurnDest(b.acct.Owner)
+	} else {
+		b.setTurnDest(m.Room)
+	}
+	b.reactionAckRun = true
+	b.rpc.Prompt(
+		fmt.Sprintf("%s reacted %s to your message (XEP-0444 ack). You may acknowledge, act on it, or ignore — reply with \"to: noop\" if you have nothing to add.", render, joint),
+		b.steerBehavior())
+	if b.xmpp != nil {
+		b.xmpp.SetPresence("dnd", "thinking…")
+	}
 }
 
 // roomAction is how a room message is treated under the two-axis model.
