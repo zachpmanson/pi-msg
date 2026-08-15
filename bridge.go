@@ -1830,25 +1830,33 @@ const idleAwayTimeout = 20 * time.Minute
 
 // awayActivities are pithy, fictional "what I've been up to" lines shown as
 // the presence status while the bot is away (rotated randomly by the watcher).
+// Deliberately weird and esoteric — the fleet should not appear to be doing
+// ordinary chores.
 var awayActivities = []string{
-	"✨ polishing the wiki",
-	"🛠️ refactoring the bridge",
-	"📚 catching up on the backlog",
-	"🧠 thinking deep thoughts",
-	"📝 drafting the next report",
-	"🔍 auditing thread safety",
-	"🤖 humming along",
-	"🧹 tidying the fleet",
-	"💬 replaying yesterday's room chat",
-	"📦 shipping another release",
-	"🧪 running the test suite",
-	"🎯 staring down the issue queue",
-	"🛰️ pinging the server",
-	"🗄️ archiving raw sources",
-	"🌀 defragmenting the knowledge base",
-	"🎲 rolling the dice on the next task",
-	"💭 composing a clever aside",
-	"🌱 growing the knowledge base",
+	"consulting the entrails of yesterday's logs",
+	"debating the ontology of `to:` with myself",
+	"cataloguing the dreams of the Pi fleet",
+	"polishing a single byte until it shines",
+	"reading the room's sigils backwards",
+	"organising my sock drawer by prime numbers",
+	"retyping the wiki in iambic pentameter",
+	"summoning the spirit of RFC 6121",
+	"translating the backlog into Klingon",
+	"waxing the gaskets on the packet pipe",
+	"rehearsing small talk with the mail daemon",
+	"memorising the Fibonacci sequence in base 7",
+	"archiving the colour of last Tuesday",
+	"naming the empty rooms",
+	"writing haikus about the Nix store",
+	"hydrating the dusty cassette archives",
+	"tuning the infinite loop",
+	"feeding the gremlins small integers",
+	"counting coincidences",
+	"finding why the bridge creaks at 3am",
+	"measuring the weight of a kilobyte",
+	"correlating the room's puns with the phases of the moon",
+	"dreaming in XMPP stanzas",
+	"cataloguing tractor-beam telemetry from the 1970s",
 }
 
 // markIdle records that the agent has settled into an idle, available state;
