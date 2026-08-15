@@ -120,25 +120,21 @@ func TestAmbientCap(t *testing.T) {
 
 func TestComposePrompt(t *testing.T) {
 	b := roomBridge() // owner zach@x.com, room team@muc.x.com
-	hint := b.routingHint()
 
 	// Owner DM turn: "from:" is the owner, body follows directly (no sender
-	// line), hint appended.
+	// line). No routing hint is appended (removed per issue #33).
 	got := b.composePrompt("hello", true, "", "zach@x.com", "", "", "")
 	if !strings.HasPrefix(got, "from: zach@x.com\nhello") {
 		t.Errorf("dm header wrong: %q", got)
 	}
-	if !strings.HasSuffix(got, hint) {
-		t.Errorf("dm turn missing hint: %q", got)
+	if strings.Contains(got, "to: ") {
+		t.Errorf("dm turn should not contain a routing hint: %q", got)
 	}
 
 	// Room turn from the owner: from: is the room, sender: is the owner's jid.
 	got = b.composePrompt("hi", true, "", "team@muc.x.com", "zach@x.com", "", "")
 	if !strings.Contains(got, "from: team@muc.x.com\n") || !strings.Contains(got, "sender: zach@x.com\n") {
 		t.Errorf("room header wrong: %q", got)
-	}
-	if !strings.HasSuffix(got, hint) {
-		t.Errorf("room turn missing hint: %q", got)
 	}
 
 	// Commentary: wrapped as untrusted, includes nick + sender header.
@@ -148,17 +144,11 @@ func TestComposePrompt(t *testing.T) {
 		t.Errorf("commentary framing wrong: %q", got)
 	}
 
-	// Ambient is prepended; the hint is still last.
+	// Ambient is prepended.
 	b.bufferAmbient("bob", "fyi")
 	got = b.composePrompt("do it", true, "", "team@muc.x.com", "zach@x.com", "", "")
-	if !strings.Contains(got, "room commentary") || !strings.Contains(got, "do it") || !strings.HasSuffix(got, hint) {
+	if !strings.Contains(got, "room commentary") || !strings.Contains(got, "do it") {
 		t.Errorf("canonical+ambient wrong: %q", got)
-	}
-}
-
-func TestRoutingHintNamesOwner(t *testing.T) {
-	if h := roomBridge().routingHint(); !strings.Contains(h, "to:") || !strings.Contains(h, "zach@x.com") {
-		t.Errorf("routingHint = %q, want it to mention to: and the owner jid", h)
 	}
 }
 
