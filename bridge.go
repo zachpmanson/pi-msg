@@ -57,7 +57,8 @@ type Bridge struct {
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
 	idleSince      time.Time     // when the agent last became idle; zero while a run is in flight
-	lastAwayStatus string        // the last pithy activity shown while away (skip redundant stanzas)
+	awayAnnounced  bool          // the away transition has been announced this idle period
+	lastAwayStatus string        // the last pithy activity shown while away (skip repeats across periods)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -1898,9 +1899,12 @@ func (b *Bridge) markIdle() {
 // markActive clears the idle clock: the agent is working or receiving activity,
 // so it should not drift to "away" until it settles again. The XMPP bridge
 // drops its XEP-0319 idle stamp, re-announcing active on the next presence.
+// awayAnnounced is cleared so the next idle period announces its away status
+// afresh.
 func (b *Bridge) markActive() {
 	b.mu.Lock()
 	b.idleSince = time.Time{}
+	b.awayAnnounced = false
 	b.lastAwayStatus = "" // next away entry picks a fresh activity
 	b.mu.Unlock()
 	if b.xmpp != nil {
@@ -1933,9 +1937,11 @@ func (b *Bridge) loadAwayActivities() {
 
 // idleWatcher flips presence to "away" once the agent has been idle (no run in
 // flight, no inbound activity) for idleAwayTimeout, showing a randomized pithy
-// activity as the status (rotated on later ticks so the roster stays alive).
-// Presence returns to available on the next inbound message or run (see
-// onInbound / agent_start).
+// activity as the status. The away status is announced exactly once per idle
+// period — the transition, not a 30s rotation — and stays put until the next
+// inbound message or run brings the agent back to available (see onInbound /
+// agent_start). markActive clears the announced flag, so each new away period
+// picks a fresh activity.
 func (b *Bridge) idleWatcher(ctx context.Context) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -1947,20 +1953,20 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 			b.mu.Lock()
 			idle := !b.idleSince.IsZero()
 			elapsed := time.Since(b.idleSince)
-			b.mu.Unlock()
-			if !idle || b.streaming() || elapsed < idleAwayTimeout || b.xmpp == nil {
+			if !idle || b.streaming() || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
+				b.mu.Unlock()
 				continue
 			}
+			// First tick past the threshold: announce away once, picking an
+			// activity different from the previous away period's.
 			act := awayActivities[rand.Intn(len(awayActivities))]
-			b.mu.Lock()
-			same := act == b.lastAwayStatus
-			if !same {
-				b.lastAwayStatus = act
+			for act == b.lastAwayStatus {
+				act = awayActivities[rand.Intn(len(awayActivities))]
 			}
+			b.awayAnnounced = true
+			b.lastAwayStatus = act
 			b.mu.Unlock()
-			if !same {
-				b.xmpp.SetPresence("away", act)
-			}
+			b.xmpp.SetPresence("away", act)
 		}
 	}
 }
