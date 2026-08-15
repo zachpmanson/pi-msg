@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,6 +56,7 @@ type Bridge struct {
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
 	idleSince      time.Time     // when the agent last became idle; zero while a run is in flight
+	lastAwayStatus string        // the last pithy activity shown while away (skip redundant stanzas)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -1826,6 +1828,29 @@ func (b *Bridge) settleLocally() {
 // drifts from available to "away". Any inbound activity resets the clock.
 const idleAwayTimeout = 20 * time.Minute
 
+// awayActivities are pithy, fictional "what I've been up to" lines shown as
+// the presence status while the bot is away (rotated randomly by the watcher).
+var awayActivities = []string{
+	"✨ polishing the wiki",
+	"🛠️ refactoring the bridge",
+	"📚 catching up on the backlog",
+	"🧠 thinking deep thoughts",
+	"📝 drafting the next report",
+	"🔍 auditing thread safety",
+	"🤖 humming along",
+	"🧹 tidying the fleet",
+	"💬 replaying yesterday's room chat",
+	"📦 shipping another release",
+	"🧪 running the test suite",
+	"🎯 staring down the issue queue",
+	"🛰️ pinging the server",
+	"🗄️ archiving raw sources",
+	"🌀 defragmenting the knowledge base",
+	"🎲 rolling the dice on the next task",
+	"💭 composing a clever aside",
+	"🌱 growing the knowledge base",
+}
+
 // markIdle records that the agent has settled into an idle, available state;
 // the idle clock starts now and the watcher flips presence to "away" after
 // idleAwayTimeout of quiet.
@@ -1840,12 +1865,15 @@ func (b *Bridge) markIdle() {
 func (b *Bridge) markActive() {
 	b.mu.Lock()
 	b.idleSince = time.Time{}
+	b.lastAwayStatus = "" // next away entry picks a fresh activity
 	b.mu.Unlock()
 }
 
 // idleWatcher flips presence to "away" once the agent has been idle (no run in
-// flight, no inbound activity) for idleAwayTimeout. Presence returns to
-// available on the next inbound message or run (see onInbound / agent_start).
+// flight, no inbound activity) for idleAwayTimeout, showing a randomized pithy
+// activity as the status (rotated on later ticks so the roster stays alive).
+// Presence returns to available on the next inbound message or run (see
+// onInbound / agent_start).
 func (b *Bridge) idleWatcher(ctx context.Context) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -1858,8 +1886,18 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 			idle := !b.idleSince.IsZero()
 			elapsed := time.Since(b.idleSince)
 			b.mu.Unlock()
-			if idle && !b.streaming() && elapsed >= idleAwayTimeout && b.xmpp != nil {
-				b.xmpp.SetPresence("away", "idle — will respond to your next message")
+			if !idle || b.streaming() || elapsed < idleAwayTimeout || b.xmpp == nil {
+				continue
+			}
+			act := awayActivities[rand.Intn(len(awayActivities))]
+			b.mu.Lock()
+			same := act == b.lastAwayStatus
+			if !same {
+				b.lastAwayStatus = act
+			}
+			b.mu.Unlock()
+			if !same {
+				b.xmpp.SetPresence("away", act)
 			}
 		}
 	}
