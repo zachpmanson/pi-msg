@@ -395,69 +395,69 @@ markdown-ing the lecture
 prepping for the exam
 asking michael wise the wise question
 # folklore
-memorising the 10 rules of the internet
-conspiring against ie6
-falling down the modeland hole
+giving people really good software for free
+plotting ie6's demise over lunch
+wandering modeland with googl-e and bingle-dum
 asking aliens what calendar they use
-framing amazon's first job posting
-auditing the facebook video metrics
-telling the story about magic
+pioneering commerce on the internet
+averaging the duration of videos viewed
+not touching the unknown switch labeled magic
 unravelling the bell labs mystery
-practising time travel responsibly
-watching bill gates install movie maker
+selling a 2036 corvette to pay for time travel
+watching bill gates flame jim allchin about usability
 writing fat on an airplane
 watching the blinkenlichten blink
 not fixing things to keep the job
 reading carproblems.txt aloud
 canonising christ mcdonald
 dying a little in the c locale
-competing with gpt
+panicking inside the nlp orgs
 living in context menu hell
 keeping the cool uris cool
-writing to google cloud
-digging the digg v4 grave
+ranting about google cloud's deprecation policy
+being the one guy who was a machine
 dispatching from the cyberpunk city
 doing things and telling people
-giving dropbox feedback it didn't ask for
-advising kissinger
-facing the street
-factoring the factory factory
+emailing files to myself instead of using dropbox
+advising kissinger about the burden of secrets
+facing the street with a good sign
+building a factory to build the factory for the spice rack
 manifesting the feminist server
 filing over apps
 koaning the git
 importing urls into go
 ruling the world from the group chat
-growing at tumblr and wordpress
+wading through the seagull shit of search
 guerilla-ing open access
 banning heaven
-hyperanalyzing the hyperanalysis
+hyperanalyzing the ending podcasts
 incompleting the list of css mistakes
-no longer building software
+making furniture out of wood instead of software
 interviewing for canonical
 returning to the beginning of the command line
-asking whether it's a bubble
+asking howard marks whether it's a bubble
 jsxing the react native typescript
-grading vonnegut
-languaging death
+grading my works from a to d
+counting the 112 billion dead
 watching larry page build the robot
 leaving linkedin
-living the oracle developer life
-mastering the crappy codebase
+living the oracle developer horror
+mastering the war and peace of wingdings
 tri-stating the enum
-testing the no-coffee hypothesis
+getting fired with grace and aplomb
 assuring the dogs
-not being a real engineer
+being a creature with a terrible countenance
 tracing the origin of .ds_store
-tracing the origin of emacs
+tracing emacs's origins to a stolen source tree
 tracing the origin of toots
-tracing dynamic programming's origins
+calling the math dynamic programming to hide it from the defense secretary
 tracing rust's origins
 printing on tuesdays out of spite
 mowing with the oracle
 being original about not being original
 drinking the verification can
 pocket-vetoing the room
-potentialising the potential
+hoarding potential like an eternal child
 pricing the chatgpt api against humanity
 un-favouriting the psd
 walking in jia tan's shoes
@@ -466,19 +466,19 @@ learning rob pike's five rules
 taking shortcuts the long way
 sleep-sorting the room
 threatening the sre
-retelling yegge's tale of geoworks
+talking myself into liking object-oriented assembly
 ranting about platforms
-encoding superstitiously
+encoding names superstitiously in taiwan
 parsing html all wrong with svelte
 splitting the bin
 learning the bitter lesson
 remembering the cab ride
 investigating the 500-mile email
 manifesting the cmd-click
-principling the crawford
+naming things after myself, crawford-style
 playing three chords for the damned
 descending to c
-futuring open source
+imagining a future where spy agencies fund open source
 graphing the calculator story
 solving the nazi bar problem
 praying to the patron saint of yak shaves
@@ -492,7 +492,7 @@ time-travelling on irc
 recovering from the unix legend
 warning the usenet
 vibe-coding carefully
-practising the virtues
+practising laziness, impatience and hubris
 not breaking userspace
 digging moats for openai
 asking when midnight is
@@ -500,149 +500,150 @@ anti-elitising wikipedia
 making worse better
 shaving the yak
 # lines
-asking alan kay to reinvent the room
-generalising perlis's generalizations
-aging gracefully with alex pagano
-interviewing the candidate about c++
-phoning andrew moses about friends
-startupping with andy bell
-executive-ing on linkedin
-typescripting with barnaby keene
-immunising the server with bert hubert
-asking bill wurtz what being human is
-asking bill wurtz about happiness
-aging with bill wurtz
-housing the houseless with brandon ewing
-writing with bryan cantrill's llms
-podcasting with cgp grey
-algorithming with christo buschek
-childing with clay shirky
-copyrighting with cory doctorow
-enshittifying with cory doctorow
-lambda-ing with david beasley
-subculturing with david chapman
-deloitting with deborah o'neill
-api-ing with devine lu linvega
-standing on dijkstra's head
-incompleting notes with dijkstra
-oop-ing with elle mundy
-networking the feminist server
-collecting useless tools with fernando borretti
-scraping the web with fireship
-overflowing buffers with foone turing
-science-fictioning with frederik pohl
-advertising with g. k. chesterton
-getting faster with greg lemond
-experiencing with hank green
-humaning with hank green
-knowledging with hank green
-resisting with hank green
-truthing with ian crosby danskin
-holding ibm accountable
-nft-ing with illllllllllllli
-crud-ing with jacoblambda
-biologising with james somers
-layering computing with james somers
-rutting creatively with james somers
-storying with james wood
-originality-ing with jennifer lepp
-fandoming with jes olsen
-iso-8601-ing with jl6
-memoir-ing with joe brockmeier
-llm-ing with joel franusic's friend
-algorithming with john green
-timing with john green
-accountability-ing with john s russel
-creating with jurgen geuter
-committing with justin duke
-coding with kai lentit
-budgeting security with kate temkin
-writing with kurt vonnegut
-advertising with larry and sergey
-accurating data with lily mara
-moderating with lori
-engineering software with ludic
-idea-ing with lu wilson
-crafting software with lu wilson
-nostalgia-ing with mark carney
-poetry-ing with marwan makhoul
-qualiting with matthew morgan
-open-sourcing with matt holt
-budgeting ads with mcdonje
-blogging with merlin mann
-gitting with michael b. paulson
-metadata-ing with michael hayden
-working poor with micheal goldstein
-experiencing with mike playle
-courting with monkaiju
-orthography-ing with mousethatroared
-myki-ing with mrhippopants
-command-lining with neal stephenson
-grifting with nikhil suresh
-presenting with nikhil suresh
-believing with noduerme
-renting with not scott smitelli
-resource-ing with paul farmer
-buddhism-ing with paul ford
-deadlining with paul ford
-english-majoring with paul ford
-php-ing with paul ford
-greatness-ing with paul graham
-content-creating with pewdiepie
-tree-ing with philip wadler
-arting with projectileboy's friend
-succeeding with randall munroe
-studying breaks with randomtako
-computing with richard feynman
-social-spacing with robin sloan
-speaking online with robin sloan
-jira-ing with rplnt
-dieting information with ryandv
-iot-ing with sam kriss
-seniority-ing with sarai rosenberg
-limiting with savannah brown
-courseworking with seph
-chatting systems with simon heath
-dj-ing with ska
-history-ing software with ska
-engineering with skylar hill
-bridge-engineering with someone
-half-assing with someone
-senior-engineering with someone
-sydney-melbourne-ing with someone
-testing with someone
-constraining with steph ango
-plain-texting with steph ango
-databasing with stephen hugg
-rafting with steve yegge
-blog-writing with steve yegge
-unixing with sy brand
-hell-ing with technoblade
-screening time with terry godier
-proving with thepasswordis
-advertising with tim raymond
-going with tom delalande
-entropy-ing with tom m
-empathising with tony gilroy
-revolution-ing with tony gilroy
-collecting data with tristram oaten
-stealing art with tristram oaten
-ex-ing with unemployedtechie2021
-xml-ing with varjag
-dating apps with vasco
-technology-ing with virginia postrel
-magic-numbering with wikipedia
-art-ing with william morris
-copyright-ing with woodie guthrie
-ai-ing with xe iaso
-evangelion-ing with xe iaso
-free-coding with xe iaso
-hacking with xe iaso
-microservice-ing with xe iaso
-xeact-ing with xe iaso
-timezoning with zach holman
-inspiriting with zach weinersmith
-woodworking with zain rizvi
+finding the comedy flavour in an existential crisis
+reinventing the flat tire
+treating everything as a special case of something more general
+filling the closet with everyone's hidden shit
+hammering everything with c++ until it looks like my thumb
+deploying the unpatchable strategy of having friends
+going to adult daycare, sorry, the startup office
+studying linkedin for two hours a day
+keeping undefined is not a function at bay with typescript
+marvelling at the spaceship that is biology
+waiting for being human to come back in style
+asking if happiness can be sold
+pondering the nothing that is human age
+being radical about having no house
+ripping up the social contract of prose
+feeding the podcast the lives of its hosts
+misunderstanding numeric thresholds with precision
+refusing media that doesn't include me
+weighing copyright on the utilitarian scales
+watching platforms enshittify and die
+making code compact and foreboding
+writing an obituary for subcultures
+diagnosing deloitte's human intelligence problem
+deciding whether to be above or below the api
+rehearsing slow-wittedness with my very small head
+ending my notes in mid-air on purpose
+asking why it's not called class struggle
+networking awkwardly, promiscuously and parasitically
+moving needles that don't exist
+scraping the web at an industrial scale
+saying the letter a for 90 seconds straight
+predicting the traffic jam, not the automobile
+hearing the rich ask for more money in silk hats
+never getting easier, only faster
+confirming that experience is real
+collaborating with almost every dead person
+sharing the load of knowing everything
+awaiting the divine for resisting
+looking for the floor under the truth
+never holding the computer accountable
+saying nfts were a scam from the start
+reciting incantations and duct-taping bits
+admiring biology's unplanned fractal complexity
+sifting computing's geological layers
+being in a creative rut with exactly one other person
+hypothesising entitledly about stories
+copying the copies until nothing is original
+allegedly maintaining a wiki website called fandom
+worshipping only the god iso 8601
+mercilessly abbreviating memoirs
+wondering what to do with the extra arm
+directing algorithms while algorithms direct me
+having a long week, a long month, a long life
+declaring billionaires unaccountable
+harvesting creativity as a byproduct of work
+writing my commitments in pencil
+waiting for the code to become a liability
+budgeting $1 for safety and $10M for the disgraced ciso
+writing to please just one person
+keeping advertising away from quality search
+starting from scratch because the data lied
+preparing the moderation policy for its first test
+hammering code into shapes that spark joy and money
+merging the ideas we already have
+passing on skills like a chair maker
+declaring nostalgia not a strategy
+listening for birds between the warplanes
+judging quality by the wastebasket
+reminding users they're not needed
+normalising things with ad budgets
+writing blog posts, not defecating them
+committing atrocities as the last committer
+killing people based on metadata, allegedly
+stretching the paycheck across the week
+reading what people write near the word experience
+opening the doors to the ritz for everyone
+nominating english orthography for unesco protection
+being card 6742069, forever
+carrying the stone tablets of the command line
+practising the grifter's transferable smile
+letting my presentation skills outstrip my technical skill
+articulating the best case against my beliefs
+refusing to rent my livelihood
+finding the resources less limited than before
+explaining that buddhism anticipated quantum theory
+needing only the technology of deadlines
+being ashamed not to have read things
+reading php like freshman-year poetry
+being mystified at everyone else's incompetence
+industrialising nothingness
+writing poems about trees
+wanting painters, not artists
+distrusting people more excited about success than the thing
+studying till I break
+playing with the computer disease
+finding social spaces harder than rocket science
+speaking nonstop to avoid disappearing
+finding the jira coprocessor in apple silicon
+being what I consume, informationally
+watching the lightbulbs blink ads in morse code
+starting nothing useful with that phrase
+straining against the brick wall of my ability
+doing all the work and watching all the lectures
+making chat systems pay for themselves
+declaring DJs non-fungible
+incrementally increasing complexity without collapsing
+engineering solutions that only suck in ways that don't matter
+building bridges that barely stand
+half-assing exactly the right amount
+outputting more senior engineers
+pretending to be poor in melbourne
+testing what I detest
+collecting constraints I enjoy
+making my notes readable on a 1960s computer
+saying altar table over the sick database
+building a life raft instead of a moat
+emitting legally actionable statements from my soul
+filling my lungs with files
+hoping god hesitates before sending me to hell
+maintaining the to-do list that writes itself
+regressing to the mean of proof
+outbidding my desire to not see ads
+being not much fun by design
+being entropy's number one enemy
+feeding my family with empathy
+building the perfect enemy from the catalogue
+refusing your data
+stealing the damn work for myself
+keeping exes forever
+killing xml, the millennials' best kill
+radicalising nerds via dating apps
+mistaking familiar technology for nature
+not copying file handles because they may be magic
+finding resistance in the materials
+befriending everyone who sings my songs
+churning linear algebra through the sand
+disturbing the comforted and comforting the disturbed
+sharing code that's free as in mattress
+keeping both pieces when things break
+imagining the ideal spherical cow of microservices
+counting the milli-developers
+being a javascript programmer in 1882
+being 80% into something like an old relationship
+holding my creations like a woodworker
 # problems
 colliding alembic revisions
 transferring android files on macos
