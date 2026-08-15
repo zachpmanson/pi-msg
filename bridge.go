@@ -943,9 +943,11 @@ func compactArgs(args Event) string {
 
 // routingHint tells the agent, when the account has room access, that every
 // reply must begin with an explicit "to: <jid>" line, how to choose it, how to
-// stay silent (#20), and how to address another agent (#21).
+// stay silent (#20), and how to address another agent (#21). Terse form: the
+// full rules live in the fleet AGENTS.md, so the per-message hint only needs to
+// name the mechanics.
 func (b *Bridge) routingHint() string {
-	return fmt.Sprintf("[routing: you have group-chat access, so EVERY reply MUST begin with a line \"to: <jid>\" naming the destination. To reply where this message came from, use the \"from:\" jid above; to DM the person who sent it, use their \"sender:\" jid (if shown); to reach your owner, use to: %s. You may include several \"to: <jid>\" blocks in one reply to send different parts to different destinations — each \"to:\" line starts a new message. If this message needs no response from you, reply with exactly \"to: %s\" and nothing else — that sends nothing at all, and is preferred over saying you have nothing to add. To address another agent in a room, write \"@their-name\" inline, or \"@everyone\" to address the whole room; a name mentioned without the @ does not reach them.]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[routing: every reply starts with to: <jid> (from: → origin; sender: → DM; %s → owner; multiple to: fan out). to: %s = silence. @name/@everyone = address.]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
