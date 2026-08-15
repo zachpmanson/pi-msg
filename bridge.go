@@ -1682,7 +1682,7 @@ func toolLabel(ev Event) string {
 	if name == "bash" {
 		if args := ev.Obj("args"); args != nil {
 			if cmd := strings.TrimSpace(args.Str("command")); cmd != "" {
-				return "! " + truncateLabel(cmd, 80)
+				return "! " + truncateLabel(cmd, 512)
 			}
 		}
 	}
