@@ -36,7 +36,7 @@ set -euo pipefail
 
 # ---- config (env overridable) ----
 HOST="${HOST:-chat.zachmanson.com}"
-BRIDGE="${BRIDGE:-replaytest}"
+BRIDGE="${BRIDGE:?set BRIDGE to the throwaway bridge persona JID localpart}"
 DRIVER="${DRIVER:-e2e-test}"
 ROOM="${ROOM:-testing@muc.chat.zachmanson.com}"
 BRIDGE_JID="${BRIDGE_JID:-${BRIDGE}@${HOST}}"
@@ -96,8 +96,8 @@ newlines() { # print lines added to inbox since the given marker (line count)
 }
 contains() { grep -q "$1" <<<"$2"; }
 # bridge_lines filters inbox JSONL down to bridge-authored lines (the bot JID in
-# the from field: bare 1:1 replaytest@… or its MUC nick …/replaytest).
-bridge_lines() { grep -E '"from":"[^"]*replaytest@' <<<"$1"; }
+# the from field: bare 1:1 ${BRIDGE}@… or its MUC nick …/${BRIDGE}).
+bridge_lines() { grep -E '"from":"[^"]*${BRIDGE}@' <<< "$1"; }
 # has_bridge_line asserts a pattern exists on a bridge-authored line.
 has_bridge_line() { bridge_lines "$1" | grep -q "$2"; }
 

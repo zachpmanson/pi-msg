@@ -1015,7 +1015,7 @@ func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender
 // Agents address each other mid-message far more often than at position 0, so
 // restricting to the leading form drops most handoffs on the floor (#21). Only
 // the colon form is honoured away from the start: "name," occurs constantly in
-// ordinary prose ("roster shows peppy, replaytest and slippy") and matching it
+// ordinary prose ("roster shows peppy and slippy") and matching it
 // anywhere produces false triggers, whereas "name:" does not.
 //
 // Fenced code blocks and quoted lines are excluded before scanning, so a pasted

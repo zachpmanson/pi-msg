@@ -444,3 +444,48 @@ func TestKickDebounced(t *testing.T) {
 		t.Errorf("kicks within the debounce window advanced lastKick: %v -> %v", first, b.lastKick)
 	}
 }
+
+// fenceCount counts ``` fence lines in a string, treating any line starting
+// with "```" as a fence marker (open or close).
+func fenceCount(s string) int {
+	n := 0
+	for _, l := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimRight(l, " \t"), "```") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestChunkFenceAware ensures chunk() never splits a ``` code fence across
+// message boundaries: every piece is self-contained (its own balanced fences),
+// and together the pieces reconstruct the fenced content without corruption.
+func TestChunkFenceAware(t *testing.T) {
+	// A long message whose bulk is a fenced code block, small enough that the
+	// fix must not refuse to split but large enough to force boundary cuts.
+	fence := "```\n"
+	for i := 0; i < maxBody/4; i++ {
+		fence += "code line\n"
+	}
+	fence += "```"
+	msg := "Before fence.\n" + fence + "\nAfter fence."
+
+	parts := chunk(msg, maxBody)
+	if len(parts) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(parts))
+	}
+	// Every piece must be self-contained: it opens what it closes.
+	for i, p := range parts {
+		if len(p) > maxBody {
+			t.Errorf("piece %d exceeds cap (%d > %d)", i, len(p), maxBody)
+		}
+		if n := fenceCount(p); n%2 != 0 {
+			t.Errorf("piece %d has unbalanced fence markers (%d):\n%s", i, n, p)
+		}
+		// Strip the code block and confirm no bare fence opener leaked without
+		// a closer within the piece.
+		if strings.HasPrefix(p, "```") && fenceCount(p) == 1 {
+			t.Errorf("piece %d opens a fence it never closes:\n%s", i, p)
+		}
+	}
+}

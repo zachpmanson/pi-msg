@@ -87,29 +87,122 @@ func resourcepart(full string) string {
 	return ""
 }
 
-// chunk splits text into pieces no longer than max, preferring newline then
-// word boundaries.
+// isFenceLine reports whether a line opens or closes a markdown ``` code
+// fence (e.g. "```" or "```go"). Used so chunking never splices a fence.
+func isFenceLine(s string) bool {
+	t := strings.TrimRight(s, " \t")
+	return strings.HasPrefix(t, "```")
+}
+
+// chunk splits text into pieces no longer than max, preferring line then
+// word boundaries. It is code-fence-aware: a chunk boundary never falls
+// *inside* a ``` fenced block. If the cap is hit while inside a fence, the
+// fence is closed at the end of one piece and reopened at the start of the
+// next, so every piece is self-contained valid markdown (no mangled fences
+// when a client renders one message at a time).
 func chunk(text string, max int) []string {
 	if len(text) <= max {
 		return []string{text}
 	}
+	lines := strings.Split(text, "\n")
 	var chunks []string
+	var buf []string
+	bytes := 0
+	inFence := false
+	// Reserve room for the fence close/reopen lines a cut may inject, so no
+	// emitted piece exceeds max.
+	const fenceReserve = 64
+	// nextOpens: the previous piece had to close an open fence; the next piece
+	// must begin by reopening it.
+	nextOpens := false
+
+	emit := func() {
+		if len(buf) == 0 {
+			if nextOpens {
+				nextOpens = false
+			}
+			return
+		}
+		if inFence {
+			buf = append(buf, "```") // terminate so this piece is well-formed
+		}
+		chunks = append(chunks, strings.Join(buf, "\n"))
+		buf = nil
+		bytes = 0
+		nextOpens = inFence
+		inFence = false
+	}
+
+	for _, line := range lines {
+		isFence := isFenceLine(line)
+		need := len(line) + 1
+
+		// Reopen a fence that a prior cut closed mid-block, unless this next
+		// line is itself a source fence (which then serves as the opener).
+		if nextOpens && !isFence {
+			buf = append(buf, "```")
+			bytes += 4
+			nextOpens = false
+			inFence = true
+		}
+
+		// A single prose line larger than the cap has no newline to cut on, so
+		// fall back to word-boundary splitting. Not inside a fence here (a
+		// fence line or fenced content is handled below and can only be split
+		// at fence boundaries).
+		if len(line) > max && !inFence && !isFence && !nextOpens {
+			emit()
+			for _, w := range chunkWords(line, max) {
+				chunks = append(chunks, w)
+			}
+			continue
+		}
+
+		// Otherwise, if the next line would overflow and we're outside a fence,
+		// cut cleanly between logical blocks before taking it.
+		if bytes+need > max-fenceReserve && len(buf) > 0 && !inFence && !nextOpens {
+			emit()
+		}
+
+		// Track fence state from this line.
+		if isFence {
+			inFence = !inFence
+		}
+
+		buf = append(buf, line)
+		bytes += need
+
+		// A single line can still push us over the cap while inside a fence
+		// (e.g. one giant code line). Close the fence here to keep the piece
+		// well-formed; the next piece reopens it.
+		if bytes > max-fenceReserve && inFence {
+			emit()
+		}
+	}
+	emit()
+	return chunks
+}
+
+// chunkWords splits a string with no usable newlines into pieces no longer
+// than max, preferring spaces then hard cuts (the historical prose fallback).
+func chunkWords(text string, max int) []string {
+	if len(text) <= max {
+		return []string{text}
+	}
+	var out []string
 	rest := text
 	for len(rest) > max {
-		cut := strings.LastIndexByte(rest[:max], '\n')
-		if cut < max/2 {
-			cut = strings.LastIndexByte(rest[:max], ' ')
-		}
+		cut := strings.LastIndexByte(rest[:max], ' ')
 		if cut < max/2 {
 			cut = max
 		}
-		chunks = append(chunks, rest[:cut])
+		out = append(out, rest[:cut])
 		rest = strings.TrimLeft(rest[cut:], " \t\r\n")
 	}
 	if rest != "" {
-		chunks = append(chunks, rest)
+		out = append(out, rest)
 	}
-	return chunks
+	return out
 }
 
 // InboundMessage is a received message the bridge should act on, after
