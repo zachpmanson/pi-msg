@@ -609,6 +609,8 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.shutdown("requested over chat")
 	case "dump":
 		b.dumpSession(arg)
+	case "dump-all", "dumpall":
+		b.dumpAllSessions(arg)
 	default:
 		return false
 	}
@@ -693,6 +695,70 @@ func (b *Bridge) sendDumpFile(name string, content []byte) {
 		}
 		_ = os.Remove(p)
 	}()
+}
+
+// dumpAllSessions sends the full accumulated history for this account: every
+// session file in the same session directory as the active one, concatenated in
+// chronological order (the filename embeds each session's start timestamp).
+// Raw JSONL by default, or a TSV table when arg is "table"/"pretty". Unlike
+// /dump (which reads just the live get_state session file), this spans all
+// past sessions so you can see the complete transcript, not just the current
+// working file.
+func (b *Bridge) dumpAllSessions(arg string) {
+	res, err := b.rpc.GetState(b.ctx)
+	if err != nil {
+		b.reply("⚠️ /dump-all failed: " + err.Error())
+		return
+	}
+	if !res.success() {
+		b.reply("⚠️ /dump-all failed: " + res.errText())
+		return
+	}
+	path := res.Obj("data").Str("sessionFile")
+	if path == "" {
+		b.reply("⚠️ /dump-all: no session (session persistence disabled)")
+		return
+	}
+	dir := filepath.Dir(path)
+	matches, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if err != nil {
+		b.reply("⚠️ /dump-all: cannot list sessions: " + err.Error())
+		return
+	}
+	if len(matches) == 0 {
+		b.reply("⚠️ /dump-all: no session files found in " + dir)
+		return
+	}
+	sort.Strings(matches) // filename embeds ISO start timestamp → chronological
+	var sb strings.Builder
+	records := 0
+	for _, f := range matches {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			b.log("warning", "dump-all: skipping "+f+": "+err.Error())
+			continue
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.TrimSpace(line) != "" {
+				sb.WriteString(line)
+				sb.WriteByte('\n')
+				records++
+			}
+		}
+	}
+	if records == 0 {
+		b.reply("⚠️ /dump-all: no session records found")
+		return
+	}
+	table := strings.EqualFold(strings.TrimSpace(arg), "table") || strings.EqualFold(strings.TrimSpace(arg), "pretty")
+	content := []byte(sb.String())
+	name := "session-" + b.acct.Name + "-all-raw.jsonl"
+	if table {
+		content = []byte(prettyDump(content))
+		name = "session-" + b.acct.Name + "-all-table.tsv"
+	}
+	b.reply(fmt.Sprintf("📄 full session dump (%d files, %d records) — uploading…", len(matches), records))
+	b.sendDumpFile(name, content)
 }
 
 // prettyDump reformats a session's JSONL into a real TSV — one record per row
