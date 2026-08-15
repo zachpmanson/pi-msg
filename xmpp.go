@@ -633,8 +633,12 @@ func (b *XMPPBridge) keepalive(ctx context.Context, session *xmpp.Session) {
 			b.log("warning", "keepalive ping failed; forcing reconnect: "+err.Error())
 			// Closing unblocks session.Serve, so serve() returns and Run
 			// reconnects. serve()'s deferred Close makes the double-close a
-			// harmless no-op.
-			session.Close()
+			// harmless no-op. A dead connection (the same condition that
+			// just timed out the ping) can make the graceful stream-close
+			// write block on the kernel's own TCP retransmission timeout
+			// (minutes), so bound it and fall back to yanking the raw
+			// connection's deadline to force it closed.
+			closeSession(b, session)
 			return
 		}
 		for _, room := range b.acct.Rooms {
@@ -643,6 +647,30 @@ func (b *XMPPBridge) keepalive(ctx context.Context, session *xmpp.Session) {
 		if errRoom := b.acct.ErrorRoom; errRoom != "" {
 			b.selfPing(ctx, session, errRoom)
 		}
+	}
+}
+
+// sessionCloseTimeout bounds how long closeSession waits for a graceful
+// session.Close() before forcing the underlying connection closed.
+const sessionCloseTimeout = 5 * time.Second
+
+// closeSession closes session, forcibly severing the underlying connection if
+// the graceful close doesn't complete within sessionCloseTimeout. A dead
+// connection can make the graceful stream-close write block on the kernel's
+// own TCP retransmission timeout (minutes), leaving the bridge silently stuck
+// instead of reconnecting.
+func closeSession(b *XMPPBridge, session *xmpp.Session) {
+	done := make(chan struct{})
+	go func() {
+		session.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(sessionCloseTimeout):
+		b.log("warning", "session.Close() did not return in time; forcing connection closed")
+		session.Conn().SetDeadline(time.Now())
+		<-done
 	}
 }
 
