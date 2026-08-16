@@ -377,16 +377,16 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 
 // handleUIRequest routes companion-extension tool-action relays and otherwise
 // cancels interactive dialogs (nobody is at the TUI to answer them) so pi
-// doesn't block. A `confirm` whose title carries the sentinel is a relayed tool
-// action, not a real user dialog — see handleToolRelay.
+// doesn't block. A dialog whose title carries the sentinel is a relayed tool
+// action, not a real user dialog — see handleToolRelay. The relay rides
+// ui.select (issue #34) but accept any method with the sentinel for
+// forward compatibility.
 func (b *Bridge) handleUIRequest(ev Event) {
 	id := ev.Str("id")
 	method := ev.Str("method")
-	if method == "confirm" {
-		if payload, ok := strings.CutPrefix(ev.Str("title"), relayPrefix); ok {
-			b.handleToolRelay(id, payload)
-			return
-		}
+	if payload, ok := strings.CutPrefix(ev.Str("title"), relayPrefix); ok {
+		b.handleToolRelay(id, payload)
+		return
 	}
 	switch method {
 	case "select", "confirm", "input", "editor":
@@ -404,10 +404,13 @@ func (b *Bridge) handleUIRequest(ev Event) {
 }
 
 // handleToolRelay performs an XMPP-side action requested by an agent tool call
-// in the companion extension, then answers the blocking confirm so the tool
-// (and thus the LLM) learns whether it succeeded. The JSON payload names the
-// action and its arguments. This is the structured alternative to the in-band
-// `react:` / `file:` text conventions (issue #8 spike).
+// in the companion extension, then answers the blocking relay with a string
+// result — "ok", or a failure reason the extension surfaces to the model as
+// the tool's error. The reason matters: an upload rejected by the server (e.g.
+// "too large: 207387434 bytes") must reach the agent so it can rebuild or ask,
+// not just a boolean (issue #34). The JSON payload names the action and its
+// arguments. This is the structured alternative to the in-band `react:` /
+// `file:` text conventions (issue #8 spike).
 func (b *Bridge) handleToolRelay(id, payload string) {
 	var cmd struct {
 		Action    string `json:"action"`
@@ -419,7 +422,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 	}
 	if err := json.Unmarshal([]byte(payload), &cmd); err != nil {
 		b.log("warning", "bad tool-relay payload: "+err.Error())
-		b.rpc.RespondUI(id, false)
+		b.rpc.RespondUIRelay(id, "bad tool-relay payload: "+err.Error())
 		return
 	}
 	switch cmd.Action {
@@ -439,10 +442,16 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		b.xmpp.SendReaction(to, rid, cmd.Emoji)
 		// Success iff we had a target; reactions are instant.
 		ok := to != "" && rid != ""
-		if !ok && cmd.MessageID != "" {
-			b.log("warning", fmt.Sprintf("reaction target %q not found in message history and no from-JID supplied", cmd.MessageID))
+		if !ok {
+			reason := "no reaction target (no messageId and no from-JID supplied)"
+			if cmd.MessageID != "" {
+				reason = fmt.Sprintf("reaction target %q not found in message history (no from-JID supplied; pass from explicitly)", cmd.MessageID)
+			}
+			b.log("warning", reason)
+			b.rpc.RespondUIRelay(id, reason)
+			return
 		}
-		b.rpc.RespondUI(id, ok)
+		b.rpc.RespondUIRelay(id, "ok")
 	case "file":
 		dest := cmd.To
 		if dest == "" {
@@ -456,8 +465,9 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		// Same allowlist as the in-band file: path — the agent can't ship files
 		// to arbitrary JIDs.
 		if b.xmpp.classifyDest(dest) == destBlocked {
-			b.reply(fmt.Sprintf("⚠️ send_file: %q is not an allowed destination", dest))
-			b.rpc.RespondUI(id, false)
+			reason := fmt.Sprintf("send_file: %q is not an allowed destination", dest)
+			b.reply("⚠️ " + reason)
+			b.rpc.RespondUIRelay(id, reason)
 			return
 		}
 		// The XEP-0363 upload is a network round-trip (up to ~2min); run it off
@@ -465,13 +475,16 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		go func() {
 			err := b.xmpp.SendFile(dest, cmd.Path)
 			if err != nil {
-				b.reply(fmt.Sprintf("⚠️ send_file %q → %s failed: %v", cmd.Path, dest, err))
+				reason := fmt.Sprintf("send_file %q → %s failed: %v", cmd.Path, dest, err)
+				b.reply("⚠️ " + reason)
+				b.rpc.RespondUIRelay(id, reason)
+				return
 			}
-			b.rpc.RespondUI(id, err == nil)
+			b.rpc.RespondUIRelay(id, "ok")
 		}()
 	default:
 		b.log("warning", "unknown tool-relay action: "+cmd.Action)
-		b.rpc.RespondUI(id, false)
+		b.rpc.RespondUIRelay(id, "unknown tool-relay action: "+cmd.Action)
 	}
 }
 

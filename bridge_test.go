@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -403,3 +406,95 @@ func TestLoadAwayActivities(t *testing.T) {
 		}
 	}
 }
+
+// TestToolRelayCarriesReason: a relayed tool action must come back as a string
+// — "ok" on success, or the failure reason — not a bare boolean, so the model
+// learns *why* something failed (issue #34: e.g. an upload rejected by the
+// server as too large never reached the agent).
+func TestToolRelayCarriesReason(t *testing.T) {
+	var buf bytes.Buffer
+	b := roomBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com"} // owner allowlisted; SendFile fails fast ("not online")
+
+	readLine := func(t *testing.T) map[string]any {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if line, err := buf.ReadString('\n'); err == nil {
+				var resp map[string]any
+				if err := json.Unmarshal([]byte(line), &resp); err != nil {
+					t.Fatalf("bad relay response line %q: %v", line, err)
+				}
+				return resp
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// Bad payload: the parse error is the reason.
+	b.handleToolRelay("r-bad", `{not json`)
+	resp := readLine(t)
+	if resp["id"] != "r-bad" {
+		t.Errorf("bad-payload response id = %v, want r-bad", resp["id"])
+	}
+	if v, _ := resp["value"].(string); !strings.Contains(v, "bad tool-relay payload") {
+		t.Errorf("bad-payload response value = %q, want a reason", v)
+	}
+
+	// Blocked destination: the allowlist refusal is the reason.
+	b.handleToolRelay("r-block", `{"action":"file","path":"/tmp/a.apk","to":"stranger@x.com"}`)
+	resp = readLine(t)
+	if v, _ := resp["value"].(string); !strings.Contains(v, "not an allowed destination") {
+		t.Errorf("blocked-dest response value = %q, want allowlist reason", v)
+	}
+
+	// Failed upload: SendFile's error text, not a plain false (issue #34).
+	b.handleToolRelay("r-file", `{"action":"file","path":"/tmp/a.apk","to":"zach@x.com"}`)
+	resp = readLine(t)
+	if v, _ := resp["value"].(string); !strings.Contains(v, "not online") {
+		t.Errorf("file-failure response value = %q, want SendFile's reason (not online)", v)
+	}
+	if _, hasConfirmed := resp["confirmed"]; hasConfirmed {
+		t.Errorf("file-failure response = %v, unexpected confirm-style boolean field", resp)
+	}
+}
+
+// TestToolRelaySuccessOk: a successful relay answers "ok", which the extension
+// maps to a clean tool result (as opposed to a generic failure).
+func TestToolRelaySuccessOk(t *testing.T) {
+	var buf bytes.Buffer
+	b := roomBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com"}
+
+	// The react path is synchronous and doesn't need a live session: a missing
+	// target is the only failure mode reachable here, so feed one and assert
+	// the reason names the missing stanza.
+	b.handleToolRelay("r-react", `{"action":"react","emoji":"✅","messageId":"nonexistent-1"}`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var line string
+	for {
+		if l, err := buf.ReadString('\n'); err == nil {
+			line = l
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.Contains(line, "\"value\"") || !strings.Contains(line, "not found in message history") {
+		t.Errorf("react-miss response = %q, want a reason naming the missing target", line)
+	}
+}
+
+// nopClose adapts a bytes.Buffer to io.WriteCloser for RPCClient.stdin.
+type nopClose struct{ buf *bytes.Buffer }
+
+func (n *nopClose) Write(p []byte) (int, error) { return n.buf.Write(p) }
+func (n *nopClose) Close() error                { return nil }

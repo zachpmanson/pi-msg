@@ -5,14 +5,15 @@
 // therefore can't touch the socket directly — so it relays the action to pi-msg
 // over the RPC extension-UI channel and blocks for the result.
 //
-// Relay transport: `ctx.ui.confirm(title, message)`. In RPC mode this emits an
-// `extension_ui_request` (method "confirm") on stdout and blocks until the
-// client sends back `extension_ui_response {confirmed}`. We smuggle a JSON
-// action through the sentinel-prefixed `title`; pi-msg recognises the sentinel,
-// performs the real XMPP action, and answers `confirmed: true/false`. That
-// gives each tool a genuine success/failure to report to the LLM (unlike a
-// fire-and-forget notify) — which matters for file uploads that are slow and
-// can fail.
+// Relay transport: `ctx.ui.select(title, ["ok"])`. In RPC mode this emits an
+// `extension_ui_request` (method "select") on stdout and blocks until the
+// client sends back `extension_ui_response {value}`. We smuggle a JSON action
+// through the sentinel-prefixed `title`; pi-msg recognises the sentinel,
+// performs the real XMPP action, and answers `value: "ok"` on success or a
+// failure reason on error. select is used (not confirm) because its response
+// carries a *string* back to the extension, so the failure reason (e.g. a
+// server refusing an upload as too large) reaches the LLM as the tool error
+// instead of a bare boolean (pi-msg issue #34).
 //
 // Which tools are registered is chosen by pi-msg via the PI_MSG_TOOLS env var
 // (comma-separated); this mirrors the account's config (e.g. send_reaction is
@@ -33,14 +34,17 @@ const RELAY_PREFIX = "pi-msg-relay:";
 
 // Minimal structural type for the one UI method we use, so we don't depend on
 // the exact exported type name.
-type ConfirmUI = { confirm(title: string, message?: string): Promise<boolean> };
+type RelayUI = {
+	confirm(title: string, message?: string): Promise<boolean>;
+	select(title: string, options: string[]): Promise<string | undefined>;
+};
 
 export default function xmppTools(pi: ExtensionAPI) {
 	// Captured on session_start; used by tool handlers to reach pi-msg.
-	let ui: ConfirmUI | undefined;
+	let ui: RelayUI | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
-		ui = ctx.ui as unknown as ConfirmUI;
+		ui = ctx.ui as unknown as RelayUI;
 	});
 
 	// Inject the agent's identity ($PI_MSG_ACCOUNT) at the top of every system
@@ -62,12 +66,13 @@ ${event.systemPrompt}`,
 	const enabled =
 		raw === undefined ? new Set(["file", "reaction"]) : new Set(raw.split(",").map((s) => s.trim()));
 
-	// relay hands an action to pi-msg and blocks for its boolean result.
-	async function relay(action: string, args: Record<string, unknown>): Promise<boolean> {
+	// relay hands an action to pi-msg and blocks for its string result: "ok" on
+	// success, or a failure reason that becomes the tool error the model sees.
+	async function relay(action: string, args: Record<string, unknown>): Promise<string> {
 		if (!ui) {
 			throw new Error("no relay channel to pi-msg (session not started)");
 		}
-		return ui.confirm(RELAY_PREFIX + JSON.stringify({ action, ...args }), "pi-msg action");
+		return (await ui.select(RELAY_PREFIX + JSON.stringify({ action, ...args }), ["ok"])) ?? "relay cancelled (no response from pi-msg)";
 	}
 
 	if (enabled.has("reaction")) {
@@ -99,8 +104,9 @@ ${event.systemPrompt}`,
 				if (p.from) {
 					args.from = p.from;
 				}
-				if (!(await relay("react", args))) {
-					throw new Error("pi-msg could not send the reaction" + (p.messageId ? " (target message not found in history; try supplying from-JID explicitly)" : " (no message to react to?)"));
+				const result = await relay("react", args);
+				if (result !== "ok") {
+					throw new Error("pi-msg could not send the reaction: " + result);
 				}
 				return {
 					content: [{ type: "text", text: `Reacted with ${emoji}.` }],
@@ -130,8 +136,9 @@ ${event.systemPrompt}`,
 				if (!path) {
 					throw new Error("path is required");
 				}
-				if (!(await relay("file", { path, to: p.to ?? "" }))) {
-					throw new Error(`pi-msg could not send the file ${path}`);
+				const result = await relay("file", { path, to: p.to ?? "" });
+				if (result !== "ok") {
+					throw new Error(`pi-msg could not send the file ${path}: ${result}`);
 				}
 				return {
 					content: [{ type: "text", text: `Sent file ${path}.` }],

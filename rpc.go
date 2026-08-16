@@ -57,11 +57,11 @@ type RPCClient struct {
 	bin     string
 	model   string
 	cwd     string
-	extPath string       // optional companion extension to load via `-e`
+	extPath string // optional companion extension to load via `-e`
 	// sessionPath, when set, resumes that session file on launch via
 	// `--session`. Set before Start().
 	sessionPath string
-	env         []string // extra environment ("KEY=value") for the pi process
+	env         []string     // extra environment ("KEY=value") for the pi process
 	stderr      func(string) // optional per-line stderr sink
 
 	events chan Event
@@ -340,10 +340,14 @@ func (c *RPCClient) CancelUI(id string) {
 	c.Send(map[string]any{"type": "extension_ui_response", "id": id, "cancelled": true})
 }
 
-// RespondUI answers a confirm-style extension_ui_request with a boolean result.
-// Used to complete the companion extension's tool-action relay.
-func (c *RPCClient) RespondUI(id string, confirmed bool) {
-	c.Send(map[string]any{"type": "extension_ui_response", "id": id, "confirmed": confirmed})
+// RespondUIRelay completes a companion-extension tool-action relay with a
+// string result: "ok" on success, or a failure reason the extension surfaces
+// to the model as the tool's error. The relay rides ui.select (not confirm)
+// because confirm's response is boolean-only — the boolean said *that* the
+// action failed but never *why*, so a server rejection (e.g. an upload slot
+// refused as "too large: 207387434 bytes") never reached the model (issue #34).
+func (c *RPCClient) RespondUIRelay(id, result string) {
+	c.Send(map[string]any{"type": "extension_ui_response", "id": id, "value": result})
 }
 
 // Stop signals intentional shutdown and terminates the pi process.
