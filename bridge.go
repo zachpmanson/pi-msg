@@ -1950,25 +1950,34 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			b.mu.Lock()
-			idle := !b.idleSince.IsZero()
-			elapsed := time.Since(b.idleSince)
-			if !idle || b.streaming() || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
-				b.mu.Unlock()
-				continue
-			}
-			// First tick past the threshold: announce away once, picking an
-			// activity different from the previous away period's.
-			act := awayActivities[rand.Intn(len(awayActivities))]
-			for act == b.lastAwayStatus {
-				act = awayActivities[rand.Intn(len(awayActivities))]
-			}
-			b.awayAnnounced = true
-			b.lastAwayStatus = act
-			b.mu.Unlock()
-			b.xmpp.SetPresence("away", act)
+			b.idleTick()
 		}
 	}
+}
+
+// idleTick runs the body of one idleWatcher tick: it announces "away" at most
+// once per idle period, once the agent has been idle past idleAwayTimeout.
+// Split out from idleWatcher so it's callable directly from tests.
+func (b *Bridge) idleTick() {
+	b.mu.Lock()
+	idle := !b.idleSince.IsZero()
+	elapsed := time.Since(b.idleSince)
+	// Read streamingRun directly rather than via streaming(), which re-locks
+	// b.mu and would deadlock this goroutine against itself.
+	if !idle || b.streamingRun || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
+		b.mu.Unlock()
+		return
+	}
+	// First tick past the threshold: announce away once, picking an
+	// activity different from the previous away period's.
+	act := awayActivities[rand.Intn(len(awayActivities))]
+	for act == b.lastAwayStatus {
+		act = awayActivities[rand.Intn(len(awayActivities))]
+	}
+	b.awayAnnounced = true
+	b.lastAwayStatus = act
+	b.mu.Unlock()
+	b.xmpp.SetPresence("away", act)
 }
 
 // --- small state accessors ---

@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractText(t *testing.T) {
@@ -359,6 +360,29 @@ func TestIdleAwayClock(t *testing.T) {
 	b.markActive()
 	if !b.idleSince.IsZero() {
 		t.Error("markActive after activity should clear idleSince")
+	}
+}
+
+// TestIdleTickNoSelfDeadlockWhileStreaming guards against a regression where
+// idleTick held b.mu and then called streaming() (which itself locks b.mu),
+// self-deadlocking the idle-watcher goroutine — and, since idleTick's handler
+// runs in the same goroutine as the XMPP read loop for other callers of b.mu,
+// wedging the whole bridge until a manual restart. A buggy idleTick would hang
+// forever here instead of returning.
+func TestIdleTickNoSelfDeadlockWhileStreaming(t *testing.T) {
+	b := roomBridge()
+	b.idleSince = time.Now().Add(-idleAwayTimeout - time.Minute)
+	b.streamingRun = true
+
+	done := make(chan struct{})
+	go func() {
+		b.idleTick()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idleTick deadlocked while a run was streaming")
 	}
 }
 
