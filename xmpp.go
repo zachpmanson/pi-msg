@@ -359,7 +359,7 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		roomBares:   roomBares,
 		onMsg:       onMsg,
 		logf:        logf,
-		presence:    "awake (" + nowStamp() + ")",
+		presence:    "awake",
 		startStatus: "awake",
 		seen:        make(map[string]struct{}),
 		occupants:   make(map[string]map[string]string),
@@ -444,7 +444,7 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	// correct label (fresh start "awake" vs resumed "resumed") rather than a
 	// stale idle label from a previous session.
 	b.show = ""
-	b.presence = b.startStatus + " (" + nowStamp() + ")"
+	b.presence = b.startStatus
 	show, status := b.show, b.presence
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
 	b.occupants = make(map[string]map[string]string)
