@@ -325,7 +325,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setStreaming(false)
 		b.stopTyping()
 		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
-		b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
+		b.xmpp.SetPresence("", "listening")
 		b.lifecycleReact("✅") // done
 		// The routing reminder decision happens here (issue #16): mid-run
 		// malformed commentary drops silently, and the agent is only nudged if
@@ -488,7 +488,7 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	// keeps dnd — leave its presence alone).
 	b.markActive()
 	if !b.streaming() && b.xmpp != nil {
-		b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
+		b.xmpp.SetPresence("", "listening")
 	}
 	// An inbound XEP-0444 reaction is an acknowledgment signal, not a
 	// conversation turn: surface it as ambient context for the agent's next
@@ -1826,7 +1826,7 @@ func (b *Bridge) settleLocally() {
 	b.setStreaming(false)
 	b.stopTyping()
 	b.markIdle()
-	b.xmpp.SetPresence("", "listening ("+nowStamp()+")")
+	b.xmpp.SetPresence("", "listening")
 	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
 }
 
