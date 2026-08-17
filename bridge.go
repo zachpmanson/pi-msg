@@ -496,10 +496,21 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.setDirectTurn(m.Direct)
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
-	// Any inbound message is activity: clear the idle-away clock and, if we
-	// had drifted to "away", come back to available (a run still in flight
-	// keeps dnd — leave its presence alone).
+	// Any inbound message is activity: come back to available and restart the
+	// idle-away timer from now (a run still in flight keeps dnd — leave its
+	// presence alone).
+	//
+	// We re-arm the clock (markIdle) rather than leaving markActive's cleared
+	// state, because many inbound messages are ambient room chatter that never
+	// becomes a run — there's no agent_settled to re-arm it later. With only
+	// markActive, idleSince stays zero forever and the watcher can never drift
+	// the agent back to "away": a bot in a busy room is pinned to "listening"
+	// with no path back. markActive first resets awayAnnounced/lastAwayStatus so
+	// the next idle period announces a fresh away, then markIdle restarts the
+	// timer; if the message does start a run, that run's own agent_start/
+	// agent_settled lifecycle takes over the clock as usual.
 	b.markActive()
+	b.markIdle()
 	if !b.streaming() && b.xmpp != nil {
 		b.xmpp.SetPresence("", "listening")
 	}

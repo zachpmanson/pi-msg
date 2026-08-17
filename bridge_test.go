@@ -366,6 +366,36 @@ func TestIdleAwayClock(t *testing.T) {
 	}
 }
 
+// TestInboundRearmsIdleClock guards against the "busy-room bot never goes
+// away" regression: an inbound message that never becomes a run (ambient room
+// chatter, buffered with no prompt) previously left idleSince cleared by
+// markActive, and since agent_settled never fires for it, the idle watcher had
+// no way to ever drift the agent back to "away". onInbound must re-arm the
+// clock so a quiet stretch still produces an away transition.
+func TestInboundRearmsIdleClock(t *testing.T) {
+	b := roomBridge()
+	b.idleSince = time.Time{}          // e.g. just cleared by a prior markActive
+	b.awayAnnounced = false
+
+	// Ambient room message: not from the owner, not addressed to the bot →
+	// buffered, no run, no agent_settled.
+	b.onInbound(InboundMessage{
+		Nick: "falco", Room: "team@muc.x.com",
+		From: "falco@x.com/falco", Body: "some ambient chatter",
+	})
+
+	if b.idleSince.IsZero() {
+		t.Fatal("ambient inbound should re-arm the idle clock; zero idleSince = can never go away")
+	}
+	if elapsed := time.Since(b.idleSince); elapsed > time.Second {
+		t.Errorf("idleSince should be restarted to ~now, got %v old", elapsed)
+	}
+	if b.awayAnnounced {
+		t.Error("onInbound should leave awayAnnounced false so a fresh away can be announced")
+	}
+}
+
+
 // TestIdleTickNoSelfDeadlockWhileStreaming guards against a regression where
 // idleTick held b.mu and then called streaming() (which itself locks b.mu),
 // self-deadlocking the idle-watcher goroutine — and, since idleTick's handler
