@@ -18,7 +18,8 @@ Conversations are persisted across restarts: pi-msg records the pi session file
 (`<config-dir>/<account>.session`) on startup, whenever the session changes
 (`/new`, `/resume`, `/fork`), and on shutdown — then resumes it on the next
 launch via `pi --session <file>`. A bridge restart therefore **continues the
-previous conversation**; only `/new` resets context. If the saved session file
+previous conversation**; only `/new` resets context (or an explicit
+`--prompt` on-demand spawn — see below). If the saved session file
 is missing or empty, pi-msg starts a fresh session instead.
 
 ```mermaid
@@ -213,6 +214,27 @@ Set `PI_MSG_DEBUG=1` to print connection/status/stderr diagnostics. On startup t
 simply comes **online** in your roster (presence `listening`); on shutdown or a pi crash it
 goes **offline** with a `<status>` describing why and when — pi-msg no longer posts chat
 banners for these lifecycle events.
+
+### On-demand spawns: `--prompt`
+
+`pi-msg --prompt "<task>"` (alias `--command`) spawns a **fresh, on-demand
+persona** with the task as its very first prompt — no separate XMPP-send hop
+needed to wake it. It intentionally does **not** resume the saved session
+(stateless by construction) and skips restart-gap replay; the reply routes to
+the owner per the normal routing contract. This backs the sentinel doer flow
+(zachpmanson/beltino#18).
+
+The same payload can ride the existing one-shot start-directive file
+(`<config-dir>/<account>.start`, written via `writePromptDirective`):
+
+```
+prompt
+resolve zachpmanson/pi-msg#35 and open a PR
+```
+
+Either way the directive file is consumed (one-shot); an explicit `--prompt`
+flag overrides a file-delivered payload. Routine restarts that carry no prompt
+keep the existing resume + proactive/idle behavior unchanged.
 
 Requirements: Go ≥ 1.26 (to build), and a `pi` on `PATH` that's logged into a provider
 (`pi` → `/login`).

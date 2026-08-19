@@ -37,12 +37,20 @@ type Bridge struct {
 
 	// Start-directive / volunteer-turn state. On a restart the operator CLIs
 	// write a one-shot directive ("proactive" → fire a volunteer turn on resume,
-	// "idle" → stay silent); the bridge reads and consumes it at startup.
+	// "idle" → stay silent, "prompt" → deliver an initial task prompt to a
+	// fresh on-demand spawn); the bridge reads and consumes it at startup.
 	resumed           bool   // a saved, usable session was resumed this launch
-	startDir          string // directive consumed at startup: "proactive", "idle", or ""
+	startDir          string // directive consumed at startup: "proactive", "idle", "prompt", or ""
 	volunteered       bool   // whether the proactive volunteer turn has been fired
 	volunteerPending  bool   // proactive volunteer turn deferred until replay completes
 	replayWindowArmed bool   // a restart replay window was armed at startup
+
+	// initialPrompt is the invocation-time initial prompt (--prompt/--command
+	// CLI flag, or a "prompt" start-directive payload): the task an on-demand
+	// persona is spawned with. Non-empty means a fresh, stateless launch — the
+	// saved session is NOT resumed, and the task becomes the very first prompt
+	// (see fireInitialPrompt). Used by the sentinel doer flow (beltino#18).
+	initialPrompt string
 
 	mu             sync.Mutex
 	streamingRun   bool
@@ -161,8 +169,25 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// fall back to a fresh session.
 	// The presence label reflects the outcome: "resumed" for a continuation,
 	// "awake" for a fresh start.
-	b.startDir = loadStartDirective(b.acct.Name)
-	if prev := loadSessionState(b.acct.Name); prev != "" && sessionFileUsable(prev) {
+	kind, dirPayload := loadStartDirective(b.acct.Name)
+	b.startDir = kind
+	if b.initialPrompt == "" {
+		b.initialPrompt = dirPayload // "prompt" directive payload; "" unless kind was StartPrompt
+	}
+
+	// Session persistence: we always continue from the last session when one is
+	// usable — UNLESS an invocation-time initial prompt is set. A prompt means
+	// an on-demand persona spawn (beltino#18): stateless by construction, so the
+	// saved session is never resumed and the task is delivered as the very
+	// first prompt. Routine restarts (no prompt) resume as before; a "fresh"
+	// restart is never requested via the CLI (the choice is proactive vs idle).
+	// Missing/deleted files fall back to a fresh session.
+	// The presence label reflects the outcome: "resumed" for a continuation,
+	// "awake" for a fresh start.
+	if b.initialPrompt != "" {
+		b.log("info", "on-demand spawn: initial prompt set, starting fresh session")
+		b.xmpp.SetStartupStatus("awake")
+	} else if prev := loadSessionState(b.acct.Name); prev != "" && sessionFileUsable(prev) {
 		b.rpc.sessionPath = prev
 		b.log("info", fmt.Sprintf("resuming session %s (start=%s)", prev, startLabel(b.startDir)))
 		b.resumed = true
@@ -182,11 +207,15 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// account was offline during a restart. Window start = graceful swapstart
 	// marker when present (consumed), else last-outbound fallback (kept). The
 	// XMPP layer buffers replay-window messages and hands them to the resumed
-	// session after the grace period (see onXMPPConnected).
-	if start, ok := replayWindowStart(b.acct.Name); ok {
-		if b.xmpp.SetReplayWindow(start) {
-			b.replayWindowArmed = true
-			b.log("info", "replay window armed from "+start.UTC().Format(time.RFC3339))
+	// session after the grace period (see onXMPPConnected). Skipped for
+	// on-demand spawns: a fresh doer starts with only its task, not a replay of
+	// stale chat from a previous incarnation.
+	if b.initialPrompt == "" {
+		if start, ok := replayWindowStart(b.acct.Name); ok {
+			if b.xmpp.SetReplayWindow(start) {
+				b.replayWindowArmed = true
+				b.log("info", "replay window armed from "+start.UTC().Format(time.RFC3339))
+			}
 		}
 	}
 
@@ -204,14 +233,15 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// proactive volunteer turn.
 	b.refreshSessionFile()
 
-	// Fire the proactive volunteer turn once, on a resumed session that requested
-	// it (an --proactive start directive). This must happen here, not on an RPC
+	// Fire the invocation-time initial prompt once, on an on-demand spawn: the
+	// task IS the launch reason, so it must be the session's first prompt. Like
+	// the proactive volunteer turn below, this must happen here, not on an RPC
 	// session_start event: pi does NOT emit session_start over the RPC event
 	// stream (it's an extension lifecycle hook, not an RPC event), so a hook in
-	// handleRPCEvent would never run. When a replay window is armed, defer the
-	// volunteer turn until the buffered messages have been handed over (see
-	// replayInbound) so the real content lands first.
-	if b.resumed && b.startDir == StartProactive && !b.volunteered {
+	// handleRPCEvent would never run.
+	if b.initialPrompt != "" {
+		b.fireInitialPrompt()
+	} else if b.resumed && b.startDir == StartProactive && !b.volunteered {
 		if b.replayWindowArmed {
 			b.volunteerPending = true
 		} else {
@@ -2092,6 +2122,8 @@ func startLabel(v string) string {
 		return "proactive"
 	case StartIdle:
 		return "idle"
+	case StartPrompt:
+		return "prompt"
 	}
 	return "auto (idle default)"
 }
@@ -2108,6 +2140,19 @@ func (b *Bridge) fireResumeTurn() {
 			"You may volunteer to continue the conversation or task from the previous session. "+
 			"If you have nothing worth volunteering, reply with nothing at all.",
 		b.steerBehavior())
+	b.xmpp.SetPresence("dnd", "thinking…")
+}
+
+// fireInitialPrompt delivers the invocation-time initial prompt (--prompt flag
+// or a "prompt" start-directive payload) as the persona's very first prompt,
+// so an on-demand spawn arrives with its task baked in (beltino#18). It is
+// composed through the normal prompt path: a fresh room-mode session gets the
+// routing contract seed (routingSeeded is false for a forced-fresh launch), and
+// the reply routes to the owner, mirroring fireResumeTurn.
+func (b *Bridge) fireInitialPrompt() {
+	b.setLifecycleReactTarget("", "")
+	b.setTurnDest(b.acct.Owner)
+	b.rpc.Prompt(b.composePrompt(b.initialPrompt, true, "", b.acct.Owner, "", "", ""), b.steerBehavior())
 	b.xmpp.SetPresence("dnd", "thinking…")
 }
 

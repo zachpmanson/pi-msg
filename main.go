@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -19,6 +20,14 @@ func main() {
 }
 
 func run() error {
+	// Invocation-time initial prompt: spawn a fresh, on-demand persona with this
+	// task as its very first prompt (beltino#18 doer flow). --command is an
+	// alias; both are explicit "stateless spawn" requests, so the saved session
+	// is never resumed and the text fires once at startup.
+	promptFlag := flag.String("prompt", "", "initial task prompt for a fresh on-demand spawn (delivered as the persona's first prompt; forces a fresh session)")
+	commandFlag := flag.String("command", "", "alias for --prompt")
+	flag.Parse()
+
 	cfg, err := loadConfig(configPath())
 	if err != nil {
 		if errors.Is(err, errNoConfig) {
@@ -35,5 +44,13 @@ func run() error {
 	defer stop()
 
 	debug := os.Getenv("PI_MSG_DEBUG") != ""
-	return NewBridge(acct, debug).Run(ctx)
+	b := NewBridge(acct, debug)
+	b.initialPrompt = *promptFlag
+	if b.initialPrompt == "" {
+		b.initialPrompt = *commandFlag
+	}
+	if b.initialPrompt != "" {
+		b.log("info", "initial prompt set via CLI (--prompt/--command)")
+	}
+	return b.Run(ctx)
 }
