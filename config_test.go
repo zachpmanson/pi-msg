@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -294,35 +295,89 @@ func TestStartDirectiveRoundTrip(t *testing.T) {
 	t.Setenv("PI_MSG_CONFIG", cfg)
 
 	// Nothing written → no directive, and the call is a no-op.
-	if got := loadStartDirective("slippy"); got != "" {
-		t.Fatalf("no directive written, got %q", got)
+	if kind, payload := loadStartDirective("slippy"); kind != "" || payload != "" {
+		t.Fatalf("no directive written, got kind=%q payload=%q", kind, payload)
 	}
 	var logged []string
 	logf := func(level, msg string) { logged = append(logged, level+": "+msg) }
 
 	writeStartDirective(logf, "slippy", StartProactive)
-	if got := loadStartDirective("slippy"); got != StartProactive {
-		t.Errorf("after write, load = %q, want %q", got, StartProactive)
+	if kind, payload := loadStartDirective("slippy"); kind != StartProactive || payload != "" {
+		t.Errorf("after write, load = (%q,%q), want (%q,\"\")", kind, payload, StartProactive)
 	}
 	// The directive is one-shot: consumed when read.
-	if got := loadStartDirective("slippy"); got != "" {
-		t.Errorf("directive should be consumed on first read, got %q", got)
+	if kind, _ := loadStartDirective("slippy"); kind != "" {
+		t.Errorf("directive should be consumed on first read, got %q", kind)
 	}
 
 	// Idle round-trips too.
 	writeStartDirective(logf, "slippy", StartIdle)
-	if got := loadStartDirective("slippy"); got != StartIdle {
-		t.Errorf("idle directive, load = %q", got)
+	if kind, _ := loadStartDirective("slippy"); kind != StartIdle {
+		t.Errorf("idle directive, load = %q", kind)
 	}
 
 	// Invalid contents are treated as absent and consumed (no error).
 	if err := os.WriteFile(startDirectivePath("slippy"), []byte("bogus\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := loadStartDirective("slippy"); got != "" {
-		t.Errorf("invalid directive should be ignored, got %q", got)
+	if kind, _ := loadStartDirective("slippy"); kind != "" {
+		t.Errorf("invalid directive should be ignored, got %q", kind)
 	}
 	if len(logged) != 0 {
 		t.Errorf("unexpected warnings: %v", logged)
+	}
+}
+
+// TestPromptDirective covers the invocation-time initial prompt payload shape
+// (pi-msg#35): writePromptDirective → loadStartDirective must yield the prompt
+// kind with the exact task text, survive a multi-line body, be one-shot, and
+// treat blank payloads as absent (no directive, no crash).
+func TestPromptDirective(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	t.Setenv("PI_MSG_CONFIG", cfg)
+
+	var logged []string
+	logf := func(level, msg string) { logged = append(logged, level+": "+msg) }
+
+	// Round-trip a single-line task.
+	task := "resolve zachpmanson/pi-msg#35 and open a PR"
+	writePromptDirective(logf, "slippy", task)
+	kind, payload := loadStartDirective("slippy")
+	if kind != StartPrompt {
+		t.Fatalf("kind = %q, want %q", kind, StartPrompt)
+	}
+	if payload != task {
+		t.Errorf("payload = %q, want %q", payload, task)
+	}
+
+	// One-shot: consumed on first read, like the enum directives.
+	if kind, _ := loadStartDirective("slippy"); kind != "" {
+		t.Errorf("prompt directive should be consumed on first read, got %q", kind)
+	}
+
+	// A multi-line task body survives intact.
+	multi := "resolve issue #1:\n  - run the tests\n  - push the branch"
+	writePromptDirective(logf, "slippy", multi)
+	kind, payload = loadStartDirective("slippy")
+	if kind != StartPrompt || payload != multi {
+		t.Errorf("multi-line round-trip = (%q,%q), want (%q,%q)", kind, payload, StartPrompt, multi)
+	}
+
+	// A file whose payload is all whitespace is treated as absent (consumed).
+	if err := os.WriteFile(startDirectivePath("slippy"), []byte(StartPrompt+"\n   \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if kind, payload := loadStartDirective("slippy"); kind != "" || payload != "" {
+		t.Errorf("blank prompt payload should be absent, got (%q,%q)", kind, payload)
+	}
+
+	// writePromptDirective refuses blank bodies with a warning, no file.
+	writePromptDirective(logf, "slippy", "   ")
+	if kind, _ := loadStartDirective("slippy"); kind != "" {
+		t.Errorf("blank writePromptDirective should not write a directive, got %q", kind)
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "empty prompt payload") {
+		t.Errorf("expected one empty-payload warning, got %v", logged)
 	}
 }

@@ -196,9 +196,14 @@ func saveSessionState(log func(level, msg string), acct, path string) {
 // proactively trigger a reply ("proactive") or stay silent ("idle"). The
 // operator CLIs (deploy-service, persona-ctl) write it to a directive file
 // before restarting; the bridge reads and consumes it once at startup.
+//
+// A third kind, StartPrompt, extends the same file: the directive carries an
+// invocation-time initial prompt — the task an on-demand persona is spawned
+// with — parsed by loadStartDirective and fired by Bridge.fireInitialPrompt.
 const (
 	StartProactive = "proactive" // resume + fire a volunteer turn (agent offers a line)
 	StartIdle      = "idle"      // resume + stay silent (just the resumed presence)
+	StartPrompt    = "prompt"    // fresh on-demand spawn + fire an initial task prompt (payload follows on later lines)
 )
 
 // startDirectivePath returns the per-account restart-directive file, stored
@@ -208,22 +213,42 @@ func startDirectivePath(acct string) string {
 }
 
 // loadStartDirective reads and consumes the per-account restart directive,
-// returning "proactive", "idle", or "" when none is present. The directive is
-// a one-shot handoff from the operator CLI: it is removed once read so it never
-// leaks into a later, unrelated restart. Invalid contents are treated as
-// absent and the file is removed.
-func loadStartDirective(acct string) string {
+// returning the directive kind ("", "proactive", "idle", "prompt") and, for
+// the prompt kind, its payload (the invocation-time initial prompt). The
+// directive is a one-shot handoff from the operator CLI: it is removed once
+// read so it never leaks into a later, unrelated restart. Invalid contents are
+// treated as absent and the file is removed.
+//
+// File format — first line is the kind, a prompt payload follows on the
+// remaining lines (so a multi-line task body survives one write):
+//
+//	proactive\n
+//	idle\n
+//	prompt\n
+//	<any task text, possibly spanning lines>\n
+func loadStartDirective(acct string) (kind, payload string) {
 	p := startDirectivePath(acct)
 	raw, err := os.ReadFile(p)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	_ = os.Remove(p)
-	v := strings.TrimSpace(string(raw))
-	if v != StartProactive && v != StartIdle {
-		return ""
+	raw = []byte(strings.ReplaceAll(string(raw), "\r\n", "\n"))
+	head, body, _ := strings.Cut(strings.TrimRight(string(raw), "\n"), "\n")
+	kind = strings.TrimSpace(head)
+	switch kind {
+	case StartProactive:
+		return StartProactive, ""
+	case StartIdle:
+		return StartIdle, ""
+	case StartPrompt:
+		payload = strings.TrimSpace(body)
+		if payload == "" {
+			return "", "" // empty prompt payload = no directive
+		}
+		return StartPrompt, payload
 	}
-	return v
+	return "", ""
 }
 
 // writeStartDirective records a restart directive so the next launch behaves
@@ -237,6 +262,32 @@ func writeStartDirective(log func(level, msg string), acct string, v string) {
 		return
 	}
 	if err := os.WriteFile(p, []byte(v+"\n"), 0o600); err != nil {
+		if log != nil {
+			log("warning", "start directive: write: "+err.Error())
+		}
+	}
+}
+
+// writePromptDirective records an invocation-time initial prompt so the next
+// launch spawns a fresh on-demand persona with the task as its very first
+// prompt (see loadStartDirective). Empty payloads are ignored. Errors are
+// logged, not fatal.
+func writePromptDirective(log func(level, msg string), acct, prompt string) {
+	body := strings.TrimSpace(prompt)
+	if body == "" {
+		if log != nil {
+			log("warning", "start directive: empty prompt payload ignored")
+		}
+		return
+	}
+	p := startDirectivePath(acct)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		if log != nil {
+			log("warning", "start directive: mkdir: "+err.Error())
+		}
+		return
+	}
+	if err := os.WriteFile(p, []byte(StartPrompt+"\n"+body+"\n"), 0o600); err != nil {
 		if log != nil {
 			log("warning", "start directive: write: "+err.Error())
 		}

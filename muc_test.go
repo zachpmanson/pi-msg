@@ -174,6 +174,35 @@ func TestRoutingSeedOnce(t *testing.T) {
 	}
 }
 
+// TestInitialPromptCompose verifies the invocation-time initial prompt path
+// (pi-msg#35): the task text is composed through the normal prompt path, so a
+// fresh room-mode on-demand spawn receives the routing contract seed followed
+// by the task as a canonical owner message (its reply therefore routes `to:`
+// the owner per the contract), while a 1:1 account gets the task verbatim.
+func TestInitialPromptCompose(t *testing.T) {
+	task := "resolve zachpmanson/pi-msg#35 and open a PR"
+
+	// Fresh room-mode spawn: routingSeeded is false (an initial prompt forces a
+	// fresh session), so the first prompt seeds the routing contract once.
+	b := roomBridge()
+	got := b.composePrompt(task, true, "", b.acct.Owner, "", "", "")
+	if !strings.Contains(got, "routing (pi-msg)") {
+		t.Errorf("fresh room-mode initial prompt should seed the routing contract: %q", got)
+	}
+	if !strings.Contains(got, "from: zach@x.com") {
+		t.Errorf("initial prompt should carry the from: owner header: %q", got)
+	}
+	if !strings.HasSuffix(got, task) {
+		t.Errorf("initial prompt should end with the task text: %q", got)
+	}
+
+	// 1:1 account: the task is delivered verbatim, no routing contract.
+	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	if got := b1.composePrompt(task, true, "", "zach@x.com", "", "", ""); got != task {
+		t.Errorf("1:1 initial prompt = %q, want plain %q", got, task)
+	}
+}
+
 func TestRouteLineNoop(t *testing.T) {
 	cases := []struct {
 		in     string
