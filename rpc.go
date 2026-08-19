@@ -123,6 +123,16 @@ func (c *RPCClient) Start() error {
 	if c.sessionPath != "" {
 		args = append(args, "--session", c.sessionPath)
 	}
+
+	// Safety note (CWE-94 / dangerous-exec-command scan in #38):
+	// exec.Command does NOT invoke a shell, so args are passed verbatim as
+	// argv entries and can never inject shell syntax. Neither the binary nor
+	// the argument list is derived from untrusted input: c.bin defaults to
+	// "pi" and is not configurable at runtime, and args are built only from
+	// operator-controlled config (model, extension path, session path) set at
+	// construction time. Inbound XMPP message content is delivered to pi over
+	// its stdin via the RPC protocol and never reaches exec.Command. There is
+	// therefore no code-injection surface here.
 	cmd := exec.Command(c.bin, args...)
 	cmd.Dir = c.cwd
 	cmd.Env = append(os.Environ(), c.env...)
