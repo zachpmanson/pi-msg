@@ -1730,29 +1730,31 @@ func (b *XMPPBridge) SendRoomTo(room, text string) string {
 
 // SendFile uploads a local file via XEP-0363 and sends its URL to `to` as an
 // XEP-0066 out-of-band message (groupchat if `to` is a joined room, else 1:1),
-// so the recipient's client shows it as a downloadable file.
-func (b *XMPPBridge) SendFile(to, path string) error {
+// so the recipient's client shows it as a downloadable file. It returns the
+// share URL on success so the send_file relay can hand it back to the agent
+// (to reuse elsewhere, e.g. pasted into a PR) rather than discarding it.
+func (b *XMPPBridge) SendFile(to, path string) (string, error) {
 	session := b.currentSession()
 	if session == nil {
-		return fmt.Errorf("not online")
+		return "", fmt.Errorf("not online")
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", path, err)
+		return "", fmt.Errorf("stat %s: %w", path, err)
 	}
 	if fi.IsDir() {
-		return fmt.Errorf("%s is a directory", path)
+		return "", fmt.Errorf("%s is a directory", path)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	svc, err := b.uploadService(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	svcJID, err := jid.Parse(svc)
 	if err != nil {
-		return fmt.Errorf("invalid upload service %q: %w", svc, err)
+		return "", fmt.Errorf("invalid upload service %q: %w", svc, err)
 	}
 	name := filepath.Base(path)
 	ctype := mime.TypeByExtension(filepath.Ext(name))
@@ -1761,33 +1763,36 @@ func (b *XMPPBridge) SendFile(to, path string) error {
 	}
 	slot, err := upload.GetSlot(ctx, upload.File{Name: name, Size: int(fi.Size()), Type: ctype}, svcJID, session)
 	if err != nil {
-		return fmt.Errorf("requesting upload slot: %w", err)
+		return "", fmt.Errorf("requesting upload slot: %w", err)
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 	req, err := slot.Put(ctx, f)
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.ContentLength = fi.Size()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("uploading file: %w", err)
+		return "", fmt.Errorf("uploading file: %w", err)
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("upload rejected (HTTP %d)", resp.StatusCode)
+		return "", fmt.Errorf("upload rejected (HTTP %d)", resp.StatusCode)
 	}
 
 	typ := stanza.ChatMessage
 	if b.isRoomJID(bareJid(to)) {
 		typ = stanza.GroupChatMessage
 	}
-	return b.encodeOOB(to, slot.GetURL.String(), typ)
+	if err := b.encodeOOB(to, slot.GetURL.String(), typ); err != nil {
+		return "", err
+	}
+	return slot.GetURL.String(), nil
 }
 
 // uploadService resolves (and caches) the XEP-0363 upload component JID: the
