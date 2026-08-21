@@ -121,10 +121,11 @@ ${event.systemPrompt}`,
 			name: "send_file",
 			label: "Send file (XMPP)",
 			description:
-				"Upload a local file and deliver it to the human over XMPP (XEP-0363 HTTP Upload). The path must be absolute and readable on this host. Defaults to the current conversation; pass `to` to target a specific allowed JID.",
+				"Upload a local file and deliver it to the human over XMPP (XEP-0363 HTTP Upload). The path must be absolute and readable on this host. Defaults to the current conversation; pass `to` to target a specific allowed JID. Returns the share URL of the uploaded file so you can reuse it elsewhere (e.g. paste the link into a PR).",
 			promptSnippet: "Send a local file (log, diff, image) to the human over chat",
 			promptGuidelines: [
 				"Use send_file to deliver a real local file to the human; give an absolute path. It is for files, not for pasting text.",
+				"The tool result includes the share URL — reuse it (e.g. in a PR description or follow-up message) instead of describing the file.",
 			],
 			parameters: Type.Object({
 				path: Type.String({ description: "Absolute path to a local file on this host" }),
@@ -136,13 +137,17 @@ ${event.systemPrompt}`,
 				if (!path) {
 					throw new Error("path is required");
 				}
+				// The relay returns the XEP-0363 share URL on success, or a failure
+				// reason (not a URL) on error — so a result that is a URL is the
+				// uploaded link, anything else is the failure reason.
 				const result = await relay("file", { path, to: p.to ?? "" });
-				if (result !== "ok") {
+				const url = /^https?:\/\//.test(result) ? result : "";
+				if (!url) {
 					throw new Error(`pi-msg could not send the file ${path}: ${result}`);
 				}
 				return {
-					content: [{ type: "text", text: `Sent file ${path}.` }],
-					details: { path },
+					content: [{ type: "text", text: `Sent file ${path}. Share URL: ${url}` }],
+					details: { path, url },
 				};
 			},
 		});

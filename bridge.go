@@ -501,16 +501,18 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 			return
 		}
 		// The XEP-0363 upload is a network round-trip (up to ~2min); run it off
-		// the RPC event loop and answer the blocked tool when it settles.
+		// the RPC event loop and answer the blocked tool when it settles. On
+		// success the relay returns the share URL so the agent can reuse it
+		// elsewhere (e.g. paste the link into a PR), not just "ok".
 		go func() {
-			err := b.xmpp.SendFile(dest, cmd.Path)
+			url, err := b.xmpp.SendFile(dest, cmd.Path)
 			if err != nil {
 				reason := fmt.Sprintf("send_file %q → %s failed: %v", cmd.Path, dest, err)
 				b.reply("⚠️ " + reason)
 				b.rpc.RespondUIRelay(id, reason)
 				return
 			}
-			b.rpc.RespondUIRelay(id, "ok")
+			b.rpc.RespondUIRelay(id, url)
 		}()
 	default:
 		b.log("warning", "unknown tool-relay action: "+cmd.Action)
@@ -813,7 +815,7 @@ func (b *Bridge) sendDumpFile(name string, content []byte) {
 		dest = b.acct.Owner
 	}
 	go func() {
-		if err := b.xmpp.SendFile(dest, p); err != nil {
+		if _, err := b.xmpp.SendFile(dest, p); err != nil {
 			b.reply(fmt.Sprintf("⚠️ /dump: file upload failed (%v); sending inline", err))
 			inline := string(content)
 			if len(inline) <= maxBody {
