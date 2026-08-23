@@ -673,7 +673,7 @@ func (b *Bridge) handleCanonical(text, origin, sender, reactTo, reactID string) 
 	if t == "" {
 		return
 	}
-	if strings.HasPrefix(t, "/") && b.handleCommand(t) {
+	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!")) && b.handleCommand(t) {
 		return
 	}
 	// A real prompt: point lifecycle/agent reactions at the message that drove it,
@@ -2353,8 +2353,11 @@ func extractText(content any) string {
 }
 
 // splitCommand splits "/name arg..." into a lowercased name and trimmed arg.
+// splitCommand splits "/name arg..." or "!name arg..." into a lowercased
+// name and trimmed arg. "!" is a full alias for "/" on bridged commands.
 func splitCommand(t string) (name, arg string) {
 	body := strings.TrimPrefix(t, "/")
+	body = strings.TrimPrefix(body, "!")
 	if sp := strings.IndexByte(body, ' '); sp >= 0 {
 		return strings.ToLower(body[:sp]), strings.TrimSpace(body[sp+1:])
 	}

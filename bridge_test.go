@@ -42,6 +42,9 @@ func TestSplitCommand(t *testing.T) {
 		{"/model anthropic/claude", "model", "anthropic/claude"},
 		{"/think high", "think", "high"},
 		{"/COMPACT  keep the api notes ", "compact", "keep the api notes"},
+		{"!new", "new", ""},
+		{"!session", "session", ""},
+		{"!model deepseek/", "model", "deepseek/"},
 	}
 	for _, c := range cases {
 		name, arg := splitCommand(c.in)
