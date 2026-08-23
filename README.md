@@ -59,6 +59,10 @@ sequenceDiagram
 | `/dump` (or `/dump pretty`) | send the session transcript to the owner — raw JSONL, or `pretty` for indented per-record JSON (no LLM turn) |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
 
+Every bridged command also works with a `!` prefix — `/new` and `!new` are
+interchangeable. ("/", "!") only matters for the owner: non-owners' messages
+are always treated as literal text.
+
 ## Configuration
 
 Create `~/.config/pi-msg/config.json` (override the path with `PI_MSG_CONFIG`), then
