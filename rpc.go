@@ -27,6 +27,9 @@ func (e Event) Str(k string) string { s, _ := e[k].(string); return s }
 // Bool returns bool field k, or false.
 func (e Event) Bool(k string) bool { b, _ := e[k].(bool); return b }
 
+// F64 returns float64 field k (JSON numbers decode as float64), or 0.
+func (e Event) F64(k string) float64 { f, _ := e[k].(float64); return f }
+
 // Obj returns object field k as an Event, or nil.
 func (e Event) Obj(k string) Event {
 	if m, ok := e[k].(map[string]any); ok {
@@ -331,6 +334,16 @@ func (c *RPCClient) GetAvailableModels(ctx context.Context) (Event, error) {
 // GetState returns current session state (session file path, id, name, model).
 func (c *RPCClient) GetState(ctx context.Context) (Event, error) {
 	return c.Request(ctx, map[string]any{"type": "get_state"}, 30*time.Second)
+}
+
+// GetSessionStats returns token/cost/message tallies for the current session.
+func (c *RPCClient) GetSessionStats(ctx context.Context) (Event, error) {
+	return c.Request(ctx, map[string]any{"type": "get_session_stats"}, 30*time.Second)
+}
+
+// SetSessionName sets the current session's display name.
+func (c *RPCClient) SetSessionName(ctx context.Context, name string) (Event, error) {
+	return c.Request(ctx, map[string]any{"type": "set_session_name", "name": name}, 30*time.Second)
 }
 
 func (c *RPCClient) Abort() { c.Send(map[string]any{"type": "abort"}) }
