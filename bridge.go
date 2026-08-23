@@ -734,6 +734,12 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.reportResult(err, res, "🧠 thinking level: "+arg, "/think")
 	case "model":
 		b.handleModel(arg)
+	case "models":
+		b.handleModels()
+	case "name":
+		b.handleName(arg)
+	case "session":
+		b.handleSession()
 	case "abort", "stop":
 		b.rpc.Abort()
 		b.settleLocally()
@@ -1764,6 +1770,134 @@ func (b *Bridge) handleModel(arg string) {
 	}
 	set, err := b.rpc.SetModel(b.ctx, provider, id)
 	b.reportResult(err, set, fmt.Sprintf("🤖 model set: %s/%s", provider, id), "/model")
+}
+
+// handleModels lists every model pi can select, straight from
+// get_available_models — no LLM turn. The current model is marked.
+func (b *Bridge) handleModels() {
+	res, err := b.rpc.GetState(b.ctx)
+	if err != nil {
+		b.reply("⚠️ /models failed: " + err.Error())
+		return
+	}
+	cur := ""
+	if res.success() {
+		if m := res.Obj("data").Obj("model"); m != nil {
+			cur = m.Str("provider") + "/" + m.Str("id")
+		}
+	}
+	res, err = b.rpc.GetAvailableModels(b.ctx)
+	if err != nil {
+		b.reply("⚠️ /models failed: " + err.Error())
+		return
+	}
+	if !res.success() {
+		b.reply("⚠️ /models failed: " + res.errText())
+		return
+	}
+	models, _ := res.Obj("data")["models"].([]any)
+	if len(models) == 0 {
+		b.reply("🤖 no models available")
+		return
+	}
+	lines := []string{fmt.Sprintf("🤖 %d models (▶ current):", len(models))}
+	for _, m := range models {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		p, _ := mm["provider"].(string)
+		id, _ := mm["id"].(string)
+		line := "- " + p + "/" + id
+		if p+"/"+id == cur {
+			line += " ▶"
+		}
+		if cw, ok := mm["contextWindow"].(float64); ok && cw > 0 {
+			line += fmt.Sprintf(" (ctx %s)", commaInt(int64(cw)))
+		}
+		lines = append(lines, line)
+	}
+	b.reply(strings.Join(lines, "\n"))
+}
+
+// handleName shows the session display name, or sets it when an arg is given.
+func (b *Bridge) handleName(arg string) {
+	if arg == "" {
+		res, err := b.rpc.GetState(b.ctx)
+		if err != nil {
+			b.reply("⚠️ /name failed: " + err.Error())
+			return
+		}
+		if !res.success() {
+			b.reply("⚠️ /name failed: " + res.errText())
+			return
+		}
+		d := res.Obj("data")
+		name := orUnknown(d.Str("sessionName"))
+		b.reply("🏷️ session name: " + name)
+		return
+	}
+	res, err := b.rpc.SetSessionName(b.ctx, arg)
+	b.reportResult(err, res, "🏷️ session name set: "+arg, "/name")
+}
+
+// handleSession reports the current session's id, file, message counts, token
+// usage and cost straight from get_session_stats — no LLM turn.
+func (b *Bridge) handleSession() {
+	res, err := b.rpc.GetSessionStats(b.ctx)
+	if err != nil {
+		b.reply("⚠️ /session failed: " + err.Error())
+		return
+	}
+	if !res.success() {
+		b.reply("⚠️ /session failed: " + res.errText())
+		return
+	}
+	data := res.Obj("data")
+	if data == nil {
+		b.reply("⚠️ /session: no stats data")
+		return
+	}
+	lines := []string{"📊 session " + orUnknown(data.Str("sessionId"))}
+	if f := data.Str("sessionFile"); f != "" {
+		lines = append(lines, "file: "+f)
+	}
+	lines = append(lines, fmt.Sprintf(
+		"messages: %s total (%s user, %s assistant; %s tool calls, %s results)",
+		commaInt(int64(data.F64("totalMessages"))),
+		commaInt(int64(data.F64("userMessages"))),
+		commaInt(int64(data.F64("assistantMessages"))),
+		commaInt(int64(data.F64("toolCalls"))),
+		commaInt(int64(data.F64("toolResults")))))
+	if tok := data.Obj("tokens"); tok != nil {
+		lines = append(lines, fmt.Sprintf(
+			"tokens: %s in, %s out, %s cache-read, %s cache-write (total %s)",
+			commaInt(int64(tok.F64("input"))), commaInt(int64(tok.F64("output"))),
+			commaInt(int64(tok.F64("cacheRead"))), commaInt(int64(tok.F64("cacheWrite"))),
+			commaInt(int64(tok.F64("total")))))
+	}
+	lines = append(lines, fmt.Sprintf("cost: $%.4f", data.F64("cost")))
+	if cu := data.Obj("contextUsage"); cu != nil && cu.F64("percent") > 0 {
+		lines = append(lines, fmt.Sprintf("context: %.1f%% (%s / %s tokens)", cu.F64("percent"),
+			commaInt(int64(cu.F64("tokens"))), commaInt(int64(cu.F64("contextWindow")))))
+	}
+	b.reply(strings.Join(lines, "\n"))
+}
+
+// commaInt formats n with thousands separators.
+func commaInt(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	if len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
 }
 
 // reportResult sends okMsg on success, or a formatted failure for command cmd.

@@ -54,6 +54,9 @@ sequenceDiagram
 | `/new` | `new_session` (fresh session; connection stays up) |
 | `/compact [instructions]` | `compact` |
 | `/model <provider/id>` or `/model <search>` | `set_model` |
+| `/models` | list available models with the current one marked (no LLM turn) |
+| `/session` | session stats — id, file, message counts, tokens, cost (no LLM turn) |
+| `/name [name]` | show the session display name, or set it |
 | `/think <off\|low\|medium\|high\|…>` | `set_thinking_level` |
 | `/abort` (or `/stop`) | `abort` |
 | `/dump` (or `/dump pretty`) | send the session transcript to the owner — raw JSONL, or `pretty` for indented per-record JSON (no LLM turn) |

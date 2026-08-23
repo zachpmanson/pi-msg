@@ -51,6 +51,21 @@ func TestSplitCommand(t *testing.T) {
 	}
 }
 
+func TestCommaInt(t *testing.T) {
+	cases := map[int64]string{
+		0:     "0",
+		999:   "999",
+		1000:  "1,000",
+		12345: "12,345",
+		1e9:   "1,000,000,000",
+	}
+	for in, want := range cases {
+		if got := commaInt(in); got != want {
+			t.Errorf("commaInt(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestMatchModel(t *testing.T) {
 	res := Event{"data": map[string]any{"models": []any{
 		map[string]any{"provider": "anthropic", "id": "claude-sonnet-5"},
