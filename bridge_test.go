@@ -179,6 +179,47 @@ func TestClassifyDest(t *testing.T) {
 	}
 }
 
+// TestStreamTypingTarget pins the room-mode typing decision (issue #44): the
+// indicator is withheld while the reply is still streaming / has not yet
+// written a routing line, and once a completed "to:" line appears it points at
+// that line's 1:1 recipient — or stays dark for a room, noop, or blocked target.
+func TestStreamTypingTarget(t *testing.T) {
+	x := NewXMPPBridge(
+		ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"},
+		func(InboundMessage) {}, func(string, string) {},
+	)
+	x.occupants["team@muc.x"] = map[string]string{"alice": "alice@x"}
+	cases := []struct {
+		buf     string
+		target  string
+		decided bool
+	}{
+		// Not yet a complete routing line → keep waiting.
+		{"", "", false},
+		{"to:", "", false},
+		{"to: zach", "", false},
+		{"to: zach@x", "", false},
+		// Owner 1:1 → indicator on the owner.
+		{"to: zach@x\n", "zach@x", true},
+		{"to: zach@x/phone\n", "zach@x", true},
+		// Known occupant → indicator on the occupant.
+		{"to: alice@x\n", "alice@x", true},
+		// A leading non-routing line is skipped; the routing still resolves.
+		{"sure\nto: zach@x\n", "zach@x", true},
+		// Room, noop, and unknown targets never light the owner's bubble.
+		{"to: team@muc.x\n", "", true},
+		{"to: noop\n", "", true},
+		{"to: stranger@x\n", "", true},
+	}
+	for _, c := range cases {
+		got, decided := streamTypingTarget(c.buf, x)
+		if got != c.target || decided != c.decided {
+			t.Errorf("streamTypingTarget(%q) = (%q,%v), want (%q,%v)",
+				c.buf, got, decided, c.target, c.decided)
+		}
+	}
+}
+
 // TestErrorRoomInvisibleToAgent verifies the write-only error room is NOT in
 // roomBares (so dispatch ignores it) and is NOT an allowed reply/send
 // destination — agents can't read it or route to it.
@@ -392,7 +433,7 @@ func TestIdleAwayClock(t *testing.T) {
 // clock so a quiet stretch still produces an away transition.
 func TestInboundRearmsIdleClock(t *testing.T) {
 	b := roomBridge()
-	b.idleSince = time.Time{}          // e.g. just cleared by a prior markActive
+	b.idleSince = time.Time{} // e.g. just cleared by a prior markActive
 	b.awayAnnounced = false
 
 	// Ambient room message: not from the owner, not addressed to the bot →
@@ -412,7 +453,6 @@ func TestInboundRearmsIdleClock(t *testing.T) {
 		t.Error("onInbound should leave awayAnnounced false so a fresh away can be announced")
 	}
 }
-
 
 // TestIdleTickNoSelfDeadlockWhileStreaming guards against a regression where
 // idleTick held b.mu and then called streaming() (which itself locks b.mu),

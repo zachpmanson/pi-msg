@@ -56,7 +56,6 @@ type Bridge struct {
 	streamingRun   bool
 	repliedThisRun bool
 	shuttingDown   bool
-	directTurn     bool          // active turn arrived as a 1:1 owner DM (drives typing)
 	routingNudges  int           // mis-routed-reply corrections sent this user turn (bounded)
 	pendingNudge   *pendingNudge // staged routing correction, decided at agent_settled (#16)
 	reactTo        string        // full JID of the owner message the current run reacts to
@@ -71,8 +70,11 @@ type Bridge struct {
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
 
-	typingMu   sync.Mutex
-	typingStop chan struct{}
+	typingMu          sync.Mutex
+	typingStop        chan struct{}
+	typingTo          string // JID currently showing "composing" ("" if none)
+	typingStream      string // accumulated streamed reply text (room-mode routing)
+	typingRoutingDone bool   // routing decision for the streaming reply already made
 
 	ambientMu sync.Mutex
 	ambient   []ambientMsg
@@ -526,7 +528,6 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 // commands that need a response block only this handler, not pi's event
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
-	b.setDirectTurn(m.Direct)
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
 	// Any inbound message is activity: come back to available and restart the
 	// idle-away timer from now (a run still in flight keeps dnd — leave its
@@ -1743,9 +1744,6 @@ func routeLine(line string) (dest, inline string, ok bool) {
 // destNoopName is the reserved "discard this segment" routing destination.
 const destNoopName = "noop"
 
-func (b *Bridge) setDirectTurn(v bool) { b.mu.Lock(); b.directTurn = v; b.mu.Unlock() }
-func (b *Bridge) isDirectTurn() bool   { b.mu.Lock(); defer b.mu.Unlock(); return b.directTurn }
-
 func (b *Bridge) handleModel(arg string) {
 	if arg == "" {
 		b.reply("usage: /model <provider/id> or /model <search>")
@@ -1927,9 +1925,21 @@ func (b *Bridge) handleStreamDelta(ev Event) {
 		b.xmpp.SetPresence("dnd", "thinking…")
 	case "text_start":
 		b.xmpp.SetPresence("dnd", "replying…")
-		b.startTyping()
+		// In a room-mode account the reply's destination is only known once
+		// its "to: <jid>" routing line streams in, so typing is withheld
+		// until then rather than lit speculatively on the owner (issue #44).
+		// A pure 1:1 account has no routing — always the owner.
+		if !b.acct.RoomMode() {
+			b.startTypingTo(b.acct.Owner)
+		}
+		b.resetStreamTyping()
+	case "text_delta":
+		if b.acct.RoomMode() {
+			b.streamTypingDelta(ame.Str("delta"))
+		}
 	case "text_end":
 		b.stopTyping()
+		b.resetStreamTyping()
 	}
 }
 
@@ -1962,20 +1972,47 @@ func truncateLabel(s string, max int) string {
 }
 
 // --- typing indicator ---
+// The XEP-0085 typing indicator is a per-recipient 1:1 chat state whose job is
+// "a message is arriving right now". In a room-mode account the destination is
+// only decided by the reply's "to: <jid>" routing line, so typing is withheld
+// rather than lit speculatively on the owner: it is sent only once that routing
+// streams in, and then toward THE recipient it leads to — a reply that heads
+// to a room or to "noop" keeps the composer dark (issue #44). A pure 1:1
+// account has no routing and always points at the owner.
 
-func (b *Bridge) startTyping() {
-	// Typing is a 1:1-owner chat-state; only lit when the active turn is an owner
-	// DM (pure 1:1, or a DM while also in a room). Room turns skip it — but
-	// enabling a room no longer disables typing on the owner's 1:1.
-	if !b.isDirectTurn() {
+// resetStreamTyping clears the text stream used to re-assemble a streamed
+// reply's routing decision. Called before every text_start / text_end from the
+// event-loop goroutine (single thread), so the buffer needs no extra lock.
+func (b *Bridge) resetStreamTyping() {
+	b.typingStream = ""
+	b.typingRoutingDone = false
+}
+
+// startTypingTo lights the "composing" chat-state toward a specific recipient,
+// re-issuing it every typingRefresh so clients don't auto-clear the bubble
+// while the agent keeps working. Redirects cleanly if the streamed routing line
+// later points at a different 1:1 recipient than the one already lit.
+func (b *Bridge) startTypingTo(to string) {
+	if to == "" {
 		return
 	}
 	b.typingMu.Lock()
 	defer b.typingMu.Unlock()
-	b.xmpp.ChatState("composing")
 	if b.typingStop != nil {
-		return
+		if b.typingTo == to {
+			return // already typing toward this recipient; keep the live ticker
+		}
+		// Redirect to a different recipient: clear the old bubble first.
+		old := b.typingTo
+		close(b.typingStop)
+		b.typingStop = nil
+		b.typingTo = ""
+		if old != "" {
+			b.xmpp.ChatStateTo("active", old)
+		}
 	}
+	b.xmpp.ChatStateTo("composing", to)
+	b.typingTo = to
 	stop := make(chan struct{})
 	b.typingStop = stop
 	go func() {
@@ -1986,22 +2023,80 @@ func (b *Bridge) startTyping() {
 			case <-stop:
 				return
 			case <-tk.C:
-				b.xmpp.ChatState("composing")
+				b.xmpp.ChatStateTo("composing", to)
 			}
 		}
 	}()
 }
 
+// streamTypingDelta feeds one streamed text chunk into the room-mode typing
+// decision. Once the reply's first complete routing line is recognised it
+// lights typing toward that line's 1:1 recipient, or leaves it dark when the
+// reply heads to a room / "noop" / nowhere. After a decision the buffer is
+// frozen for the rest of the message.
+func (b *Bridge) streamTypingDelta(delta string) {
+	if delta == "" || b.typingRoutingDone {
+		return
+	}
+	b.typingStream += delta
+	target, decided := streamTypingTarget(b.typingStream, b.xmpp)
+	if !decided {
+		return
+	}
+	b.typingRoutingDone = true
+	if target == "" {
+		b.stopTyping()
+		return
+	}
+	b.startTypingTo(target)
+}
+
+// streamTypingTarget inspects the partial streamed text for a completed routing
+// line and maps it to a typing recipient. It returns (target, true) once a
+// routing line resolves — target "" means the composer must stay dark — or
+// ("", false) while the text is still streaming and no complete line exists.
+// Only a destination that classifies as a 1:1 chat (the owner or a plain
+// occupant) earns an indicator; a room, "noop", or blocked target never lights
+// the owner's bubble.
+func streamTypingTarget(buf string, xm *XMPPBridge) (target string, decided bool) {
+	hasEnd := strings.HasSuffix(buf, "\n")
+	lines := strings.Split(buf, "\n")
+	end := len(lines)
+	if !hasEnd {
+		end = len(lines) - 1 // the trailing fragment is still mid-stream
+	}
+	for i := 0; i < end; i++ {
+		l := lines[i]
+		l = strings.TrimRight(l, "\r")
+		dest, _, ok := routeLine(l)
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(dest, destNoopName) {
+			return "", true
+		}
+		if xm.classifyDest(dest) == destUser {
+			return bareJid(dest), true
+		}
+		return "", true // room, blocked, or otherwise not a 1:1 chat
+	}
+	return "", false
+}
+
 // stopTyping is unconditional so a running indicator can always be cleared
 // (avoiding a stuck "composing" if the reply channel flips mid-turn). It only
-// emits the "active" chat-state if typing was actually running.
+// emits the "active" chat-state if typing was actually running, and does so
+// toward the recipient the bubble was lit on.
 func (b *Bridge) stopTyping() {
 	b.typingMu.Lock()
 	defer b.typingMu.Unlock()
 	if b.typingStop != nil {
 		close(b.typingStop)
 		b.typingStop = nil
-		b.xmpp.ChatState("active")
+	}
+	if b.typingTo != "" {
+		b.xmpp.ChatStateTo("active", b.typingTo)
+		b.typingTo = ""
 	}
 }
 
