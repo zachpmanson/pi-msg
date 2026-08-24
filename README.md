@@ -112,9 +112,12 @@ Multiple accounts: add more keys under `accounts`; `default` is used unless you 
 
 Set `room` on an account (a single MUC JID, or an array of them) and pi-msg
 **also** joins each. **The owner's 1:1 stays the primary channel** — joining a
-room is purely additive and doesn't change 1:1 behaviour (typing indicator,
-lifecycle notices, and unsolicited output all still go to the owner). Each reply
-goes back to whichever channel the message arrived on, including the specific
+room is purely additive and doesn't change 1:1 behaviour (lifecycle notices, and
+unsolicited output all still go to the owner). The **typing indicator** now tails
+the reply's `to:` routing line (issue #44): it points at whichever 1:1 recipient
+the reply names — the DM, another agent — and stays dark when the reply heads
+to a room or `to: noop`. Each reply goes back to wherever its routing line
+points, including the specific
 room when several are joined. Room messages are handled on **two independent
 axes**:
 

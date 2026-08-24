@@ -1277,10 +1277,18 @@ func (b *XMPPBridge) GoOffline(status string) {
 // ChatState sends an XEP-0085 chat-state notification to the owner (the
 // "typing…" indicator). "composing" shows typing; "active" clears it.
 func (b *XMPPBridge) ChatState(state string) {
+	b.ChatStateTo(state, b.acct.Owner)
+}
+
+// ChatStateTo sends an XEP-0085 chat-state notification to a specific JID. The
+// typing indicator is a per-recipient 1:1 chat state, so a reply routed to (or
+// from) someone other than the owner points the bubble at that recipient rather
+// than always lighting the owner (issue #44).
+func (b *XMPPBridge) ChatStateTo(state, to string) {
 	if b.currentSession() == nil {
 		return
 	}
-	if err := b.encodeChatState(b.acct.Owner, state, stanza.ChatMessage); err != nil {
+	if err := b.encodeChatState(to, state, stanza.ChatMessage); err != nil {
 		b.log("warning", "chatstate failed: "+err.Error())
 	}
 }
