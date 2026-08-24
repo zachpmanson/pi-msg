@@ -681,9 +681,7 @@ func (b *Bridge) handleCanonical(text, origin, sender, reactTo, reactID string) 
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
 	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo), b.steerBehavior())
-	// Immediate "got it, working" ack; agent_start confirms it shortly (deduped).
-	// Typing is no longer lit here — it now tracks literal text streaming.
-	b.xmpp.SetPresence("dnd", "thinking…")
+	b.busyPresence("thinking…")
 }
 
 // dispatchCommentary sends a non-owner addressed message as an untrusted
@@ -697,7 +695,7 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
 	b.rpc.Prompt(b.composePrompt(t, false, nick, origin, sender, reactID, reactTo), b.steerBehavior())
-	b.xmpp.SetPresence("dnd", "thinking…")
+	b.busyPresence("thinking…")
 }
 
 // handleCommand runs a recognized control command and returns true. Unknown
@@ -2249,6 +2247,20 @@ func (b *Bridge) steerBehavior() string {
 		return "steer"
 	}
 	return ""
+}
+
+// busyPresence sets the busy presence (<show>=dnd) with the given status label,
+// but only when a run is NOT already in flight. When the agent is streaming and
+// this prompt is a steer, the status label must stay truthful: the previously
+// shown "! <tool>" command is still running and the queued steer isn't read
+// until it returns. Flipping to "thinking…" here would claim the agent had
+// picked up the message when it hasn't; the label self-corrects from the actual
+// agent_* / message_update activity the moment it truly does.
+func (b *Bridge) busyPresence(label string) {
+	if b.streaming() {
+		return // steering an in-flight run — don't overwrite the running-tool status
+	}
+	b.xmpp.SetPresence("dnd", label)
 }
 
 // startLabel renders a human-readable directive value for logs.
