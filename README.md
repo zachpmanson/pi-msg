@@ -60,7 +60,8 @@ sequenceDiagram
 | `/think <off\|low\|medium\|high\|…>` | `set_thinking_level` |
 | `/abort` (or `/stop`) | `abort` |
 | `/dump` (or `/dump pretty`) | send the session transcript to the owner — raw JSONL, or `pretty` for indented per-record JSON (no LLM turn) |
-| `/export` (or `/share`) | render the session to HTML and stage it in the shared-files scratchpad, replying with the browseable URL. `/share` is an alias — both always use the naboo shared-files route (never a GitHub gist) and run deterministically via pi's `export_html` RPC, no agent turn |
+| `/export` | render the current session to HTML and stage it in the shared-files scratchpad, replying with the browseable URL — **deterministic**, runs via pi's `export_html` RPC (no agent turn) |
+| `/share` | **context-dependent** — forwarded to the agent, who picks the artifact to share based on conversation context; the agent is seeded with a policy to ALWAYS use the naboo shared-files route (`https://naboo.zachmanson.com/files/...`), never a GitHub gist |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
 
 Every bridged command also works with a `!` prefix — `/new` and `!new` are

@@ -762,7 +762,7 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.dumpSession(arg)
 	case "dump-all", "dumpall":
 		b.dumpAllSessions(arg)
-	case "export", "share":
+	case "export":
 		b.handleExport(arg)
 	default:
 		return false
@@ -772,9 +772,11 @@ func (b *Bridge) handleCommand(t string) bool {
 
 // handleExport renders the current session to HTML (deterministically, via pi's
 // export_html RPC — no agent turn) and stages the file in the shared-files
-// scratchpad, then replies with the browseable URL. /share is an alias for
-// /export here: both always use the naboo shared-files route rather than a
-// GitHub gist, matching the fleet's /share convention.
+// scratchpad, then replies with the browseable URL. This is the deterministic
+// half of sharing: /export always does exactly this for the current session.
+// /share is deliberately NOT intercepted here — it is context-dependent, so it
+// falls through to the agent, who picks the artifact to share based on
+// conversation context (see the /share policy seeded in routingContract).
 func (b *Bridge) handleExport(_ string) {
 	dir := b.acct.ExportDir
 	if dir == "" {
@@ -1147,7 +1149,8 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName) +
+		" " + fmt.Sprintf("[share policy (pi-msg): /share is context-dependent — decide from conversation context what to share; /export is deterministic and already handled by the bridge. Whenever you /share, ALWAYS deliver via the naboo shared-files route (stage the file in /var/lib/shared-files and reply with the https://naboo.zachmanson.com/files/... URL), never a GitHub gist.")
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
