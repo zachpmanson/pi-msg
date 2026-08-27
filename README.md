@@ -61,7 +61,6 @@ sequenceDiagram
 | `/abort` (or `/stop`) | `abort` |
 | `/dump` (or `/dump pretty`) | send the session transcript to the owner — raw JSONL, or `pretty` for indented per-record JSON (no LLM turn) |
 | `/export` | render the current session to HTML via pi's `export_html` RPC and **send it as a file over XMPP** (XEP-0363 HTTP Upload) — **deterministic**, no agent turn; the rendered session lands as an inline, downloadable file |
-| `/share` | **context-dependent** — forwarded to the agent, who picks the artifact to share based on conversation context; the agent is seeded with a policy to ALWAYS use the naboo shared-files route (`https://naboo.zachmanson.com/files/...`), never a GitHub gist |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
 
 Every bridged command also works with a `!` prefix — `/new` and `!new` are

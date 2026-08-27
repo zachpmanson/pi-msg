@@ -21,10 +21,6 @@ import (
 // it (~30s), so the typing indicator stays lit while the agent works.
 const typingRefresh = 20 * time.Second
 
-// sharedFilesURL is the naboo shared-files base URL, referenced in the /share
-// routing policy so agents always deliver via naboo (never a GitHub gist).
-const sharedFilesURL = "https://naboo.zachmanson.com/files"
-
 // Bridge wires an XMPP connection to a `pi --mode rpc` child: owner chat
 // becomes pi commands, and pi's events become chat replies / presence /
 // typing.
@@ -769,11 +765,11 @@ func (b *Bridge) handleCommand(t string) bool {
 // handleExport renders the current session to HTML (deterministically, via pi's
 // export_html RPC — no agent turn) and delivers the file directly to chat via
 // XEP-0363 HTTP Upload (the same file-send path used by /dump), so the rendered
-// session lands as an inline, downloadable file. This is the deterministic half
-// of sharing: /export always does exactly this for the current session. /share
-// is deliberately NOT intercepted here — it is context-dependent, so it falls
-// through to the agent, who picks the artifact to share based on conversation
-// context (see the /share policy seeded in routingContract).
+// session lands as an inline, downloadable file. This is deterministic /export.
+// /share is deliberately NOT intercepted here — it is context-dependent, so it
+// falls through to the agent, who picks the artifact to share based on
+// conversation context (the /share → always-naboo policy lives in the fleet's
+// beltino `share` skill, not in pi-msg).
 func (b *Bridge) handleExport(_ string) {
 	slug := fmt.Sprintf("%s-session-%s", b.acct.Name, time.Now().Format("20060102-150405"))
 	tmpHTML := filepath.Join(os.TempDir(), slug+".html")
@@ -1132,8 +1128,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName) +
-		" " + fmt.Sprintf("[share policy (pi-msg): /share is context-dependent — decide from conversation context what to share; /export is deterministic and already handled by the bridge. Whenever you /share, ALWAYS deliver via the naboo shared-files route (stage the file in /var/lib/shared-files and reply with the https://naboo.zachmanson.com/files/... URL), never a GitHub gist.")
+	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
