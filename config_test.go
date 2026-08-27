@@ -381,3 +381,30 @@ func TestPromptDirective(t *testing.T) {
 		t.Errorf("expected one empty-payload warning, got %v", logged)
 	}
 }
+
+func TestResolveAccountCreditWatch(t *testing.T) {
+	cfg := &Config{Accounts: map[string]Account{
+		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com",
+			CreditWatch: &CreditWatch{MinBelowUsd: 2}},
+	}}
+	got, err := resolveAccount(cfg, "")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got.MinCreditUsd != 2 {
+		t.Fatalf("MinCreditUsd = %v, want 2", got.MinCreditUsd)
+	}
+}
+
+func TestResolveAccountCreditWatchDisabled(t *testing.T) {
+	cfg := &Config{Accounts: map[string]Account{
+		"default": {JID: "j@chat.example.com", Password: "pw", Owner: "zach@chat.example.com"},
+	}}
+	got, err := resolveAccount(cfg, "")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got.MinCreditUsd != 0 {
+		t.Fatalf("MinCreditUsd = %v, want 0", got.MinCreditUsd)
+	}
+}

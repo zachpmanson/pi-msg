@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -713,6 +714,9 @@ func (b *Bridge) handleCommand(t string) bool {
 		res, err := b.rpc.NewSession(b.ctx)
 		b.reportResult(err, res, "🆕 new session ready", "/new")
 		if err == nil {
+			// /new also reports OpenRouter credit when a creditWatch floor is
+			// configured (see reportCreditIfWatched).
+			b.reportCreditIfWatched()
 			// /new swaps to a brand-new session, but pi does NOT emit a
 			// session_start event over the RPC stream (it's a lifecycle hook the
 			// extension sees via pi.on(), not an event the bridge receives — the
@@ -1907,6 +1911,93 @@ func (b *Bridge) reportResult(err error, res Event, okMsg, cmd string) {
 		return
 	}
 	b.reply(fmt.Sprintf("⚠️ %s failed: %s", cmd, res.errText()))
+}
+
+// reportCreditIfWatched reports the remaining OpenRouter credit after /new,
+// but only when a creditWatch floor is configured AND pi's OpenRouter key is
+// discoverable. Silent otherwise (no threshold = no une":)"), so it adds
+// nothing to a stock setup.
+func (b *Bridge) reportCreditIfWatched() {
+	if b.acct.MinCreditUsd <= 0 {
+		return
+	}
+	key := openRouterKey()
+	if key == "" {
+		b.log("warning", "creditWatch configured but no OpenRouter key found; skipping credit report")
+		return
+	}
+	total, used, err := openRouterCredits(key)
+	if err != nil {
+		b.reply("⚠️ could not fetch OpenRouter credit: " + err.Error())
+		return
+	}
+	remaining := total - used
+	lines := []string{
+		fmt.Sprintf("💳 OpenRouter credit: $%.2f remaining (of $%.2f loaded, $%.2f used)", remaining, total, used),
+	}
+	if remaining < b.acct.MinCreditUsd {
+		lines = append(lines, fmt.Sprintf("⚠️ below your $%.2f floor — reload soon", b.acct.MinCreditUsd))
+	}
+	b.reply(strings.Join(lines, "\n"))
+}
+
+// openRouterKey returns pi's configured OpenRouter API key from the auth file
+// (<config-dir>/auth.json, where config-dir is $PI_CODING_AGENT_DIR or
+// ~/.pi/agent). Empty when absent.
+func openRouterKey() string {
+	dir := os.Getenv("PI_CODING_AGENT_DIR")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".pi", "agent")
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "auth.json"))
+	if err != nil {
+		return ""
+	}
+	var auth struct {
+		OpenRouter struct {
+			Key string `json:"key"`
+		} `json:"openrouter"`
+	}
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.OpenRouter.Key)
+}
+
+// creditEndpoint is the OpenRouter credits endpoint; a var so tests can stub it.
+var creditEndpoint = "https://openrouter.ai/api/v1/credits"
+
+// openRouterCredits queries the OpenRouter credits endpoint and returns total
+// loaded credits and total used.
+func openRouterCredits(key string) (total, used float64, err error) {
+	req, err := http.NewRequest(http.MethodGet, creditEndpoint, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("openrouter returned %s", resp.Status)
+	}
+	var body struct {
+		Data struct {
+			TotalCredits float64 `json:"total_credits"`
+			TotalUsage   float64 `json:"total_usage"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return 0, 0, err
+	}
+	return body.Data.TotalCredits, body.Data.TotalUsage, nil
 }
 
 // handleStreamDelta maps an assistant streaming delta (message_update) to the

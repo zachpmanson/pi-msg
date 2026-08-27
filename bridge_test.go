@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -586,3 +589,25 @@ type nopClose struct{ buf *bytes.Buffer }
 
 func (n *nopClose) Write(p []byte) (int, error) { return n.buf.Write(p) }
 func (n *nopClose) Close() error                { return nil }
+
+func TestOpenRouterCreditsParse(t *testing.T) {
+	// Build a throwaway HTTP server to avoid hitting the real endpoint.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-or-test" {
+			t.Errorf("auth header = %q, want Bearer sk-or-test", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":{"total_credits":85,"total_usage":81.11}}`)
+	}))
+	defer srv.Close()
+	orig := creditEndpoint
+	creditEndpoint = srv.URL
+	defer func() { creditEndpoint = orig }()
+	total, used, err := openRouterCredits("sk-or-test")
+	if err != nil {
+		t.Fatalf("openRouterCredits: %v", err)
+	}
+	if total != 85 || used != 81.11 {
+		t.Fatalf("got total=%v used=%v, want 85 / 81.11", total, used)
+	}
+}

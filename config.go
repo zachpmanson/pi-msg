@@ -99,6 +99,20 @@ type Account struct {
 	// XEP-0153 vCard avatar on connect. Optional; a missing/invalid file is a
 	// logged warning, not fatal.
 	Avatar string `json:"avatar,omitempty"`
+	// CreditWatch, when set, reports the remaining OpenRouter credit whenever
+	// the agent runs /new (a fresh session). Only active when the configured
+	// pi provider is OpenRouter (i.e. an openrouter api key is found in pi's
+	// auth file).
+	CreditWatch *CreditWatch `json:"creditWatch,omitempty"`
+}
+
+// CreditWatch configures the on-\/new OpenRouter credit report.
+type CreditWatch struct {
+	// MinBelowUsd is the remaining-credit floor in USD. If remaining credit
+	// (total_credits - total_usage) is below this, the /new notice highlights
+	// it as low. The report always shows the current remaining credit; this
+	// only controls the alert emphasis.
+	MinBelowUsd float64 `json:"minBelowUsd,omitempty"`
 }
 
 // Config is the on-disk config: an arbitrary number of named accounts.
@@ -128,6 +142,7 @@ type ResolvedAccount struct {
 	PingInterval  time.Duration
 	Avatar        string
 	ErrorRoom     string
+	MinCreditUsd  float64
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
@@ -510,7 +525,17 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		PingInterval:  pingInterval,
 		Avatar:        strings.TrimSpace(acct.Avatar),
 		ErrorRoom:     strings.TrimSpace(acct.ErrorRoom),
+		MinCreditUsd:  maxCreditUsd(acct.CreditWatch),
 	}, nil
+}
+
+// maxCreditUsd extracts the remaining-credit floor from a CreditWatch config
+// (0 / empty when the watch is disabled).
+func maxCreditUsd(cw *CreditWatch) float64 {
+	if cw == nil {
+		return 0
+	}
+	return cw.MinBelowUsd
 }
 
 // accountNames returns the configured account names (unsorted).
