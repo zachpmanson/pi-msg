@@ -104,14 +104,6 @@ type Account struct {
 	// pi provider is OpenRouter (i.e. an openrouter api key is found in pi's
 	// auth file).
 	CreditWatch *CreditWatch `json:"creditWatch,omitempty"`
-	// ExportDir is the directory where /export stages the rendered session
-	// HTML. Defaults to the shared-files scratchpad. Must be visible to the
-	// serving host (Caddy), which runs PrivateTmp/ProtectHome.
-	ExportDir string `json:"exportDir,omitempty"`
-	// ExportURLBase is the browseable base URL corresponding to ExportDir
-	// (each exported file is served at <ExportURLBase>/<slug>.html). Defaults
-	// to the naboo shared-files URL.
-	ExportURLBase string `json:"exportURLBase,omitempty"`
 }
 
 // CreditWatch configures the on-\/new OpenRouter credit report.
@@ -151,8 +143,6 @@ type ResolvedAccount struct {
 	Avatar        string
 	ErrorRoom     string
 	MinCreditUsd  float64
-	ExportDir     string
-	ExportURLBase string
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
@@ -533,8 +523,6 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		RoomTrigger:   trigger,
 		UploadService: strings.TrimSpace(acct.UploadService),
 		PingInterval:  pingInterval,
-		ExportDir:     strings.TrimSpace(acct.ExportDir),
-		ExportURLBase: strings.TrimSpace(acct.ExportURLBase),
 		Avatar:        strings.TrimSpace(acct.Avatar),
 		ErrorRoom:     strings.TrimSpace(acct.ErrorRoom),
 		MinCreditUsd:  maxCreditUsd(acct.CreditWatch),

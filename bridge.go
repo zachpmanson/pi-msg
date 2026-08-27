@@ -21,13 +21,9 @@ import (
 // it (~30s), so the typing indicator stays lit while the agent works.
 const typingRefresh = 20 * time.Second
 
-// sharedFilesDir / sharedFilesURL are the /export staging defaults: the naboo
-// shared-files scratchpad served by Caddy at naboo.zachmanson.com/files/.
-// Both can be overridden per-account via exportDir / exportURLBase.
-const (
-	sharedFilesDir = "/var/lib/shared-files"
-	sharedFilesURL = "https://naboo.zachmanson.com/files"
-)
+// sharedFilesURL is the naboo shared-files base URL, referenced in the /share
+// routing policy so agents always deliver via naboo (never a GitHub gist).
+const sharedFilesURL = "https://naboo.zachmanson.com/files"
 
 // Bridge wires an XMPP connection to a `pi --mode rpc` child: owner chat
 // becomes pi commands, and pi's events become chat replies / presence /
@@ -771,28 +767,17 @@ func (b *Bridge) handleCommand(t string) bool {
 }
 
 // handleExport renders the current session to HTML (deterministically, via pi's
-// export_html RPC — no agent turn) and stages the file in the shared-files
-// scratchpad, then replies with the browseable URL. This is the deterministic
-// half of sharing: /export always does exactly this for the current session.
-// /share is deliberately NOT intercepted here — it is context-dependent, so it
-// falls through to the agent, who picks the artifact to share based on
-// conversation context (see the /share policy seeded in routingContract).
+// export_html RPC — no agent turn) and delivers the file directly to chat via
+// XEP-0363 HTTP Upload (the same file-send path used by /dump), so the rendered
+// session lands as an inline, downloadable file. This is the deterministic half
+// of sharing: /export always does exactly this for the current session. /share
+// is deliberately NOT intercepted here — it is context-dependent, so it falls
+// through to the agent, who picks the artifact to share based on conversation
+// context (see the /share policy seeded in routingContract).
 func (b *Bridge) handleExport(_ string) {
-	dir := b.acct.ExportDir
-	if dir == "" {
-		dir = sharedFilesDir
-	}
-	base := b.acct.ExportURLBase
-	if base == "" {
-		base = sharedFilesURL
-	}
-	if err := os.MkdirAll(dir, 0o775); err != nil {
-		b.reply("⚠️ /export: cannot create export dir: " + err.Error())
-		return
-	}
-
 	slug := fmt.Sprintf("%s-session-%s", b.acct.Name, time.Now().Format("20060102-150405"))
 	tmpHTML := filepath.Join(os.TempDir(), slug+".html")
+	b.reply("📄 exporting session…")
 	res, err := b.rpc.ExportHTML(b.ctx, tmpHTML)
 	if err != nil {
 		b.reply("⚠️ /export failed: " + err.Error())
@@ -802,22 +787,20 @@ func (b *Bridge) handleExport(_ string) {
 		b.reply("⚠️ /export failed: " + res.errText())
 		return
 	}
+	b.sendRenderedFile(slug+".html", tmpHTML)
+}
 
-	dest := filepath.Join(dir, slug+".html")
-	if err := os.Rename(tmpHTML, dest); err != nil {
-		// cross-filesystem fallback (temp on a different mount than the dir)
-		data, rerr := os.ReadFile(tmpHTML)
-		if rerr != nil {
-			b.reply("⚠️ /export: rendered but could not stage: " + rerr.Error())
-			return
-		}
-		if werr := os.WriteFile(dest, data, 0o644); werr != nil {
-			b.reply("⚠️ /export: rendered but could not stage: " + werr.Error())
-			return
-		}
-		os.Remove(tmpHTML)
+// sendRenderedFile uploads a locally-rendered file to the current turn's
+// destination (falling back to the owner) via XEP-0363 HTTP Upload, the same
+// network round-trip path used by /dump. On failure it falls back to sending
+// the file content inline.
+func (b *Bridge) sendRenderedFile(name, path string) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		b.reply("⚠️ /export: rendered but could not read file: " + err.Error())
+		return
 	}
-	b.reply(fmt.Sprintf("✅ Exported session → %s/%s.html", base, slug))
+	b.sendDumpFile(name, content)
 }
 
 // dumpSession sends the current session's transcript to the owner, straight
@@ -876,7 +859,7 @@ func (b *Bridge) dumpSession(arg string) {
 func (b *Bridge) sendDumpFile(name string, content []byte) {
 	p := filepath.Join(os.TempDir(), fmt.Sprintf("pi-msg-%s-%d-%s", b.acct.Name, time.Now().UnixNano(), name))
 	if err := os.WriteFile(p, content, 0o600); err != nil {
-		b.reply("⚠️ /dump: cannot write temp file: " + err.Error())
+		b.reply("⚠️ cannot write temp file: " + err.Error())
 		return
 	}
 	dest := b.currentTurnDest()
@@ -885,7 +868,7 @@ func (b *Bridge) sendDumpFile(name string, content []byte) {
 	}
 	go func() {
 		if _, err := b.xmpp.SendFile(dest, p); err != nil {
-			b.reply(fmt.Sprintf("⚠️ /dump: file upload failed (%v); sending inline", err))
+			b.reply(fmt.Sprintf("⚠️ file upload failed (%v); sending inline", err))
 			inline := string(content)
 			if len(inline) <= maxBody {
 				b.reply(inline)

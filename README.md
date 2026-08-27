@@ -60,7 +60,7 @@ sequenceDiagram
 | `/think <off\|low\|medium\|high\|…>` | `set_thinking_level` |
 | `/abort` (or `/stop`) | `abort` |
 | `/dump` (or `/dump pretty`) | send the session transcript to the owner — raw JSONL, or `pretty` for indented per-record JSON (no LLM turn) |
-| `/export` | render the current session to HTML and stage it in the shared-files scratchpad, replying with the browseable URL — **deterministic**, runs via pi's `export_html` RPC (no agent turn) |
+| `/export` | render the current session to HTML via pi's `export_html` RPC and **send it as a file over XMPP** (XEP-0363 HTTP Upload) — **deterministic**, no agent turn; the rendered session lands as an inline, downloadable file |
 | `/share` | **context-dependent** — forwarded to the agent, who picks the artifact to share based on conversation context; the agent is seeded with a policy to ALWAYS use the naboo shared-files route (`https://naboo.zachmanson.com/files/...`), never a GitHub gist |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
 
@@ -107,8 +107,6 @@ Per-account fields:
 | `reactions` | no | `false` | XEP-0444 emoji reactions on 1:1 owner messages: lifecycle → 👀 picked up / ✅ done / ⛔ aborted, and enables the agent-driven `send_reaction` tool (see [Agent tools](#agent-tools)) |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
 | `creditWatch` | no | — | when set with a `minBelowUsd` floor, reports the remaining OpenRouter credit balance every time the agent runs `/new`. e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped. The remaining credit is shown on every `/new`; it's flagged as low when it drops below the floor |
-| `exportDir` | no | `/var/lib/shared-files` | directory where `/export` stages the rendered session HTML (must be visible to the serving host/Caddy) |
-| `exportURLBase` | no | `https://naboo.zachmanson.com/files` | browseable base URL for `exportDir`; each session renders at `<exportURLBase>/<agent>-session-<ts>.html` |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
 `PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
