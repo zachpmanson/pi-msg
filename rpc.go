@@ -336,6 +336,14 @@ func (c *RPCClient) GetState(ctx context.Context) (Event, error) {
 	return c.Request(ctx, map[string]any{"type": "get_state"}, 30*time.Second)
 }
 
+// ExportHTML renders the current session to a static HTML file at
+// outputPath and returns the path the exporter actually wrote. Mirrors pi's
+// `export_html` RPC command (the CLI /export equivalent), so /export is
+// deterministic and never requires an agent turn.
+func (c *RPCClient) ExportHTML(ctx context.Context, outputPath string) (Event, error) {
+	return c.Request(ctx, map[string]any{"type": "export_html", "outputPath": outputPath}, 60*time.Second)
+}
+
 // GetSessionStats returns token/cost/message tallies for the current session.
 func (c *RPCClient) GetSessionStats(ctx context.Context) (Event, error) {
 	return c.Request(ctx, map[string]any{"type": "get_session_stats"}, 30*time.Second)

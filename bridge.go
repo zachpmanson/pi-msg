@@ -21,6 +21,14 @@ import (
 // it (~30s), so the typing indicator stays lit while the agent works.
 const typingRefresh = 20 * time.Second
 
+// sharedFilesDir / sharedFilesURL are the /export staging defaults: the naboo
+// shared-files scratchpad served by Caddy at naboo.zachmanson.com/files/.
+// Both can be overridden per-account via exportDir / exportURLBase.
+const (
+	sharedFilesDir = "/var/lib/shared-files"
+	sharedFilesURL = "https://naboo.zachmanson.com/files"
+)
+
 // Bridge wires an XMPP connection to a `pi --mode rpc` child: owner chat
 // becomes pi commands, and pi's events become chat replies / presence /
 // typing.
@@ -754,10 +762,60 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.dumpSession(arg)
 	case "dump-all", "dumpall":
 		b.dumpAllSessions(arg)
+	case "export", "share":
+		b.handleExport(arg)
 	default:
 		return false
 	}
 	return true
+}
+
+// handleExport renders the current session to HTML (deterministically, via pi's
+// export_html RPC — no agent turn) and stages the file in the shared-files
+// scratchpad, then replies with the browseable URL. /share is an alias for
+// /export here: both always use the naboo shared-files route rather than a
+// GitHub gist, matching the fleet's /share convention.
+func (b *Bridge) handleExport(_ string) {
+	dir := b.acct.ExportDir
+	if dir == "" {
+		dir = sharedFilesDir
+	}
+	base := b.acct.ExportURLBase
+	if base == "" {
+		base = sharedFilesURL
+	}
+	if err := os.MkdirAll(dir, 0o775); err != nil {
+		b.reply("⚠️ /export: cannot create export dir: " + err.Error())
+		return
+	}
+
+	slug := fmt.Sprintf("%s-session-%s", b.acct.Name, time.Now().Format("20060102-150405"))
+	tmpHTML := filepath.Join(os.TempDir(), slug+".html")
+	res, err := b.rpc.ExportHTML(b.ctx, tmpHTML)
+	if err != nil {
+		b.reply("⚠️ /export failed: " + err.Error())
+		return
+	}
+	if !res.success() {
+		b.reply("⚠️ /export failed: " + res.errText())
+		return
+	}
+
+	dest := filepath.Join(dir, slug+".html")
+	if err := os.Rename(tmpHTML, dest); err != nil {
+		// cross-filesystem fallback (temp on a different mount than the dir)
+		data, rerr := os.ReadFile(tmpHTML)
+		if rerr != nil {
+			b.reply("⚠️ /export: rendered but could not stage: " + rerr.Error())
+			return
+		}
+		if werr := os.WriteFile(dest, data, 0o644); werr != nil {
+			b.reply("⚠️ /export: rendered but could not stage: " + werr.Error())
+			return
+		}
+		os.Remove(tmpHTML)
+	}
+	b.reply(fmt.Sprintf("✅ Exported session → %s/%s.html", base, slug))
 }
 
 // dumpSession sends the current session's transcript to the owner, straight
