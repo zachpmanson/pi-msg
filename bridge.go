@@ -1913,10 +1913,10 @@ func (b *Bridge) reportResult(err error, res Event, okMsg, cmd string) {
 	b.reply(fmt.Sprintf("⚠️ %s failed: %s", cmd, res.errText()))
 }
 
-// reportCreditIfWatched reports the remaining OpenRouter credit after /new,
-// but only when a creditWatch floor is configured AND pi's OpenRouter key is
-// discoverable. Silent otherwise (no threshold = no une":)"), so it adds
-// nothing to a stock setup.
+// reportCreditIfWatched reports the OpenRouter credit after /new, but only
+// when it has dropped below the configured creditWatch floor AND pi's
+// OpenRouter key is discoverable. Silent above the floor — no threshold means
+// no update at all — so it adds nothing to a stock setup.
 func (b *Bridge) reportCreditIfWatched() {
 	if b.acct.MinCreditUsd <= 0 {
 		return
@@ -1932,13 +1932,10 @@ func (b *Bridge) reportCreditIfWatched() {
 		return
 	}
 	remaining := total - used
-	lines := []string{
-		fmt.Sprintf("💳 OpenRouter credit: $%.2f remaining (of $%.2f loaded, $%.2f used)", remaining, total, used),
+	if remaining >= b.acct.MinCreditUsd {
+		return
 	}
-	if remaining < b.acct.MinCreditUsd {
-		lines = append(lines, fmt.Sprintf("⚠️ below your $%.2f floor — reload soon", b.acct.MinCreditUsd))
-	}
-	b.reply(strings.Join(lines, "\n"))
+	b.reply(fmt.Sprintf("⚠️ OpenRouter credit: $%.2f remaining — below your $%.2f floor, reload soon", remaining, b.acct.MinCreditUsd))
 }
 
 // openRouterKey returns pi's configured OpenRouter API key from the auth file
