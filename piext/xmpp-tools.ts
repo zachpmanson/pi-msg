@@ -121,7 +121,7 @@ ${event.systemPrompt}`,
 			name: "send_file",
 			label: "Send file (XMPP)",
 			description:
-				"Upload a local file and deliver it to the human over XMPP (XEP-0363 HTTP Upload). The path must be absolute and readable on this host. Defaults to the current conversation; pass `to` to target a specific allowed JID. Returns the share URL of the uploaded file so you can reuse it elsewhere (e.g. paste the link into a PR).",
+				"Upload a local file and deliver it to the human over XMPP (XEP-0363 HTTP Upload). The path must be absolute and readable on this host. Defaults to the current conversation; pass `to` to target a specific allowed JID. Returns the share URL of the uploaded file, but DO NOT repeat the URL in the XMPP chat itself — the recipient can already see the file there. The URL is only for reuse in other places (e.g. a GitHub PR description).",
 			promptSnippet: "Send a local file (log, diff, image) to the human over chat",
 			promptGuidelines: [
 				"Use send_file to deliver a real local file to the human; give an absolute path. It is for files, not for pasting text.",
