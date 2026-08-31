@@ -1350,19 +1350,16 @@ func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) e
 	return b.encode(ctx, session, msg)
 }
 
-// sendReceipts acknowledges an accepted 1:1 owner message: a XEP-0184 delivery
-// receipt if the sender requested one, and a XEP-0333 "displayed" chat marker
-// if the message was markable — a genuine read receipt, since the agent is
-// about to act on it. Sent to the message's full from-JID so it routes back to
-// the originating resource. Best-effort; failures are logged, not fatal.
+// sendReceipts acknowledges an accepted 1:1 owner message with a single
+// XEP-0333 "displayed" chat marker if the message was markable — a genuine
+// read receipt, since the agent is about to act on it. Sent to the message's
+// full from-JID so it routes back to the originating resource. Only one ack is
+// sent per message (a lone XEP-0333 marker, not both a delivery receipt AND a
+// marker), so chat clients don't show a doubled acknowledgment. Best-effort;
+// failures are logged, not fatal.
 func (b *XMPPBridge) sendReceipts(m incomingMsg) {
 	if m.id == "" || m.from == "" {
 		return
-	}
-	if m.wantReceipt {
-		if err := b.encodeReceipt(m.from, receiptsNS, "received", m.id); err != nil {
-			b.log("warning", "delivery receipt failed: "+err.Error())
-		}
 	}
 	if m.markable {
 		if err := b.encodeReceipt(m.from, chatMarkersNS, "displayed", m.id); err != nil {

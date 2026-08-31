@@ -42,9 +42,8 @@ sequenceDiagram
   when idle), and a presence **status** label of the current activity (`thinking…`,
   `running: <cmd>`, `replying…`, `retrying…`, `listening`). When a run settles with
   **no** text you get a `✅ done (no reply) — your turn` nudge.
-- Messages you send are acknowledged with **read receipts** — XEP-0184 delivery
-  receipts and XEP-0333 chat markers (`displayed`) — when the agent takes them in, if
-  your client requests them.
+- Messages you send are acknowledged with a single **read receipt** — a XEP-0333
+  chat marker (`displayed`) — when the agent takes them in, if your client requests it.
 - Your chat messages → routed to Pi:
 
 | You send | Becomes |
