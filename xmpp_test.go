@@ -123,6 +123,29 @@ func TestReceiptAckMarshal(t *testing.T) {
 	}
 }
 
+// replyEl / replyPayload mirror the wire struct built by encodeChat when a
+// XEP-0359 reply target is set, so the threaded-reply form can be asserted
+// without a live session.
+func replyPayload(forID string) any {
+	return struct {
+		XMLName xml.Name
+		To      string `xml:"to,attr"`
+	}{XMLName: xml.Name{Space: "urn:xmpp:reply:0", Local: "reply"}, To: forID}
+}
+
+func TestReplyMarshal(t *testing.T) {
+	out, err := xml.Marshal(replyPayload("msg-42"))
+	if err != nil {
+		t.Fatalf("marshal reply: %v", err)
+	}
+	got := string(out)
+	for _, want := range []string{"<reply", `xmlns="urn:xmpp:reply:0"`, `to="msg-42"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reply payload = %q, missing %q", got, want)
+		}
+	}
+}
+
 // reactionEl / reactionsPayload mirror the wire struct built by encodeReaction,
 // so the XEP-0444 form can be asserted without a live session.
 type reactionEl struct {
