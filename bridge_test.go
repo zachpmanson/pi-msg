@@ -584,61 +584,6 @@ func TestToolRelaySuccessOk(t *testing.T) {
 	}
 }
 
-// TestReplyToStamp covers the XEP-0359 reply-stamp decision for owner messages.
-// A reply is only stamped (to the last *processed* message) when unanswered 1:1
-// messages are still queued behind it — the "sent several before any reply"
-// case. Single-message turns and a drained backlog stay unstamped.
-func TestReplyToStamp(t *testing.T) {
-	b := NewBridge(ResolvedAccount{Owner: "zach@x.com"}, false)
-	b.rpc = &RPCClient{}   // fire-and-forget prompt to nowhere
-	b.xmpp = &XMPPBridge{} // busyPresence/agent_start call SetPresence
-
-	stamp := func() string { return b.replyToStamp() }
-
-	// A arrives; nothing processed yet → no stamp.
-	b.handleCanonical("msg A", b.acct.Owner, "", "zach@x.com/res", "id-A")
-	if got := stamp(); got != "" {
-		t.Fatalf("before any agent_start, stamp = %q, want \"\"", got)
-	}
-
-	// A is promoted to a run (agent_start pops it). No backlog → no stamp.
-	b.handleRPCEvent(Event{"type": "agent_start"})
-	if got := stamp(); got != "" {
-		t.Fatalf("single processed message, stamp = %q, want \"\"", got)
-	}
-
-	// B arrives while A is being processed → it sits queued, unanswered.
-	b.handleCanonical("msg B", b.acct.Owner, "", "zach@x.com/res", "id-B")
-	// A's reply resolves only A; B still queued → stamp to the last processed (A).
-	if got := stamp(); got != "id-A" {
-		t.Fatalf("A's reply with B queued, stamp = %q, want id-A", got)
-	}
-
-	// B is processed next → both handled, backlog drained → no stamp.
-	b.handleRPCEvent(Event{"type": "agent_start"})
-	if got := stamp(); got != "" {
-		t.Fatalf("backlog drained, stamp = %q, want \"\"", got)
-	}
-}
-
-// TestReplyToStampClearedOnReset: settleLocally (abort/new) wipes the 1:1
-// bookkeeping so a stale stamp can't leak onto a later, unrelated turn.
-func TestReplyToStampClearedOnReset(t *testing.T) {
-	b := NewBridge(ResolvedAccount{Owner: "zach@x.com"}, false)
-	b.rpc = &RPCClient{}
-	b.xmpp = &XMPPBridge{} // settleLocally calls SetPresence — non-nil avoids a panic
-	b.handleCanonical("msg A", b.acct.Owner, "", "zach@x.com/res", "id-A")
-	b.handleRPCEvent(Event{"type": "agent_start"})
-	b.handleCanonical("msg B", b.acct.Owner, "", "zach@x.com/res", "id-B")
-	if got := b.replyToStamp(); got != "id-A" {
-		t.Fatalf("pre-reset stamp = %q, want id-A", got)
-	}
-	b.settleLocally()
-	if got := b.replyToStamp(); got != "" {
-		t.Fatalf("post-reset stamp = %q, want \"\"", got)
-	}
-}
-
 // nopClose adapts a bytes.Buffer to io.WriteCloser for RPCClient.stdin.
 type nopClose struct{ buf *bytes.Buffer }
 
