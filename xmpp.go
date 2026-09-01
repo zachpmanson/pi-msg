@@ -292,12 +292,6 @@ type XMPPBridge struct {
 	onMsg     func(InboundMessage)
 	logf      func(level, msg string)
 
-	// onSendChat records a chat-send routing decision (test hook): called once
-	// per sendChat with the destination, last chunk, and the XEP-0359 reply
-	// target. Fires before the online check so route selection (stamped vs
-	// plain) is observable without a live session.
-	onSendChat func(to, text, replyTo string)
-
 	mu       sync.Mutex
 	session  *xmpp.Session
 	online   bool
@@ -1161,14 +1155,11 @@ func (b *XMPPBridge) SendChatTo(to, text string) string {
 // element referencing the stanza ID of the owner message it answers (""
 // disables the stamp). Used to thread replies to one of several messages sent
 // before any reply.
-func (b *XMPPBridge) SendChatToReplyTo(to, text, replyTo string) string {
-	return b.sendChat(to, text, replyTo)
+func (b *XMPPBridge) SendChatToReplyTo(text, replyTo string) string {
+	return b.sendChat(b.acct.Owner, text, replyTo)
 }
 
 func (b *XMPPBridge) sendChat(to, text, replyTo string) string {
-	if b.onSendChat != nil {
-		b.onSendChat(to, text, replyTo)
-	}
 	if b.currentSession() == nil {
 		b.log("warning", "send skipped: not online")
 		return ""

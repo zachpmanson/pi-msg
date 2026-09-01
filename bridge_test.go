@@ -639,51 +639,6 @@ func TestReplyToStampClearedOnReset(t *testing.T) {
 	}
 }
 
-// TestReplyToStampRoomMode: the live beltino account is room-mode (it has a
-// room configured), so owner replies are routed as "to: <jid>" segments. A
-// segment addressed to the owner must get the same XEP-0359 stamp decision as
-// a pure-1:1 reply — and a room segment must never be stamped with an
-// owner-message id.
-func TestReplyToStampRoomMode(t *testing.T) {
-	b := roomBridge() // rooms + owner zach@x.com
-	b.rpc = &RPCClient{}
-	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com", roomBares: map[string]bool{"team@muc.x.com": true}}
-
-	// Owner sends two messages; the run for A is in flight (agent_start popped
-	// A), B is queued behind it.
-	b.handleCanonical("msg A", b.acct.Owner, "", "zach@x.com/res", "id-A")
-	b.handleRPCEvent(Event{"type": "agent_start"})
-	b.handleCanonical("msg B", b.acct.Owner, "", "zach@x.com/res", "id-B")
-
-	// The reply to A carries an owner 1:1 segment (stamps) and a room segment.
-	// The room segment routes via SendRoomTo (no XEP-0359 plumbing at all), so
-	// only the owner chat send is observable through onSendChat — that's the
-	// point: rooms can never carry an owner stamp.
-	ownerSends := 0
-	b.xmpp.onSendChat = func(to, text, replyTo string) {
-		ownerSends++
-		if bareJid(to) != b.acct.Owner {
-			t.Errorf("onSendChat fired for non-owner %q — rooms must use SendRoomTo", to)
-		}
-		if replyTo != "id-A" {
-			t.Errorf("owner segment: replyTo = %q, want id-A", replyTo)
-		}
-	}
-	b.deliverReply("to: zach@x.com\nfor A\nto: team@muc.x.com\nroom note")
-	if ownerSends != 1 {
-		t.Errorf("deliverReply made %d owner chat sends, want 1", ownerSends)
-	}
-
-	// B's run drains the backlog — its owner segment must not stamp.
-	b.handleRPCEvent(Event{"type": "agent_start"})
-	b.xmpp.onSendChat = func(to, text, replyTo string) {
-		if bareJid(to) == b.acct.Owner && replyTo != "" {
-			t.Errorf("drained run: owner replyTo = %q, want \"\"", replyTo)
-		}
-	}
-	b.deliverReply("to: zach@x.com\nfor B")
-}
-
 // nopClose adapts a bytes.Buffer to io.WriteCloser for RPCClient.stdin.
 type nopClose struct{ buf *bytes.Buffer }
 

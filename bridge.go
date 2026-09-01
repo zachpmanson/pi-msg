@@ -1589,7 +1589,7 @@ func (b *Bridge) deliverReply(text string) {
 			// single-message turn unstamped so every reply isn't a threaded bubble.
 			var stanzaID string
 			if rt := b.replyToStamp(); rt != "" {
-				stanzaID = b.xmpp.SendChatToReplyTo(b.acct.Owner, text, rt)
+				stanzaID = b.xmpp.SendChatToReplyTo(text, rt)
 			} else {
 				stanzaID = b.xmpp.Send(text)
 			}
@@ -1638,17 +1638,6 @@ func (b *Bridge) deliverReply(text string) {
 				// nobody and reports nothing, so the sender believes the
 				// handoff landed.
 				b.warnHandleProblems(bareJid(s.dest), s.body)
-			} else if bareJid(s.dest) == b.acct.Owner {
-				// Owner 1:1 segment (room-mode reply routed to the owner's
-				// personal chat): same XEP-0359 stamping decision as the pure
-				// 1:1 branch — stamp when unanswered owner messages are still
-				// queued behind this reply. Never stamp reaches to other JIDs;
-				// the pending1to1 queue only ever holds owner messages.
-				if rt := b.replyToStamp(); rt != "" {
-					stanzaID = b.xmpp.SendChatToReplyTo(s.dest, s.body, rt)
-				} else {
-					stanzaID = b.xmpp.SendChatTo(s.dest, s.body)
-				}
 			} else {
 				stanzaID = b.xmpp.SendChatTo(s.dest, s.body)
 			}
