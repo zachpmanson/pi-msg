@@ -71,14 +71,6 @@ type Bridge struct {
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
 
-	// pending1to1 is the FIFO of owner 1:1 stanza IDs received but not yet
-	// processed into a run. It answers "are there more messages behind this
-	// reply?" (XEP-0359 reply stamping): a reply only carries <reply> to the
-	// last processed message when this queue is still non-empty at deliver time
-	// — i.e. the owner sent more than that reply resolves.
-	pending1to1 []string
-	lastReplyTo string // stanza ID of the most recently processed 1:1 message
-
 	typingMu          sync.Mutex
 	typingStop        chan struct{}
 	typingTo          string // JID currently showing "composing" ("" if none)
@@ -359,14 +351,6 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setHandleWarned(false)
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
 		b.reactionAckRun = false
-		// This run is processing the oldest unanswered 1:1 message — promote it
-		// so replies stamp against the last processed message (XEP-0359).
-		b.mu.Lock()
-		if len(b.pending1to1) > 0 {
-			b.lastReplyTo = b.pending1to1[0]
-			b.pending1to1 = b.pending1to1[1:]
-		}
-		b.mu.Unlock()
 		b.markActive() // a run is in flight — not idle
 		b.xmpp.SetPresence("dnd", "thinking…")
 		b.lifecycleReact("👀") // picked up (opt-in via the reactions flag)
@@ -698,15 +682,6 @@ func (b *Bridge) handleCanonical(text, origin, sender, reactTo, reactID string) 
 	// and remember where a reply (or tool-driven file) should go by default.
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
-	// Owner 1:1 (origin is the owner, no room): stage this message as an
-	// unanswered inbound for XEP-0359 reply stamping. It sits in pending1to1
-	// until agent_start promotes it to lastReplyTo. Control commands return
-	// above, so they never enter this queue.
-	if origin == b.acct.Owner && reactID != "" {
-		b.mu.Lock()
-		b.pending1to1 = append(b.pending1to1, reactID)
-		b.mu.Unlock()
-	}
 	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
@@ -1583,16 +1558,7 @@ func (b *Bridge) deliverReply(text string) {
 		// Deliberate reactions are the send_reaction tool's job now; a 1:1 reply
 		// is just its text.
 		if strings.TrimSpace(text) != "" {
-			// If unanswered owner messages are still queued behind this reply, stamp
-			// it with a XEP-0359 <reply> to the last processed one (which message
-			// this answers when several arrived at once). Keep the common
-			// single-message turn unstamped so every reply isn't a threaded bubble.
-			var stanzaID string
-			if rt := b.replyToStamp(); rt != "" {
-				stanzaID = b.xmpp.SendChatToReplyTo(b.acct.Owner, text, rt)
-			} else {
-				stanzaID = b.xmpp.Send(text)
-			}
+			stanzaID := b.xmpp.Send(text)
 			// Update reaction target to the just-sent message so subsequent
 			// send_reaction calls target the agent's own message.
 			if stanzaID != "" {
@@ -1638,17 +1604,6 @@ func (b *Bridge) deliverReply(text string) {
 				// nobody and reports nothing, so the sender believes the
 				// handoff landed.
 				b.warnHandleProblems(bareJid(s.dest), s.body)
-			} else if bareJid(s.dest) == b.acct.Owner {
-				// Owner 1:1 segment (room-mode reply routed to the owner's
-				// personal chat): same XEP-0359 stamping decision as the pure
-				// 1:1 branch — stamp when unanswered owner messages are still
-				// queued behind this reply. Never stamp reaches to other JIDs;
-				// the pending1to1 queue only ever holds owner messages.
-				if rt := b.replyToStamp(); rt != "" {
-					stanzaID = b.xmpp.SendChatToReplyTo(s.dest, s.body, rt)
-				} else {
-					stanzaID = b.xmpp.SendChatTo(s.dest, s.body)
-				}
 			} else {
 				stanzaID = b.xmpp.SendChatTo(s.dest, s.body)
 			}
@@ -2270,20 +2225,6 @@ func (b *Bridge) stopTyping() {
 	}
 }
 
-// replyToStamp returns the XEP-0359 target for the current 1:1 reply (the
-// stanza ID of the last processed owner message), but only when unanswered 1:1
-// messages are still queued behind it. Returns "" — no stamp — otherwise, so a
-// reply that resolves the whole backlog (or an idle single-message turn) stays
-// flat.
-func (b *Bridge) replyToStamp() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.pending1to1) == 0 {
-		return ""
-	}
-	return b.lastReplyTo
-}
-
 // settleLocally resets run-scoped UI (streaming flag, typing indicator,
 // presence) when a control command ends the current run directly. Pi answers
 // `abort` with an `error`(aborted) event rather than `agent_settled`, so the
@@ -2297,12 +2238,6 @@ func (b *Bridge) settleLocally() {
 	b.markIdle()
 	b.xmpp.SetPresence("", "listening")
 	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
-	// Aborted/new run: drop the unanswered-1:1 bookkeeping so a stale lastReplyTo
-	// can't leak a reply-stamp onto a later, unrelated turn.
-	b.mu.Lock()
-	b.pending1to1 = nil
-	b.lastReplyTo = ""
-	b.mu.Unlock()
 }
 
 // idleAwayTimeout is how long the agent may sit idle before its presence

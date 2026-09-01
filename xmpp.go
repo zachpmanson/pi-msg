@@ -292,12 +292,6 @@ type XMPPBridge struct {
 	onMsg     func(InboundMessage)
 	logf      func(level, msg string)
 
-	// onSendChat records a chat-send routing decision (test hook): called once
-	// per sendChat with the destination, last chunk, and the XEP-0359 reply
-	// target. Fires before the online check so route selection (stamped vs
-	// plain) is observable without a live session.
-	onSendChat func(to, text, replyTo string)
-
 	mu       sync.Mutex
 	session  *xmpp.Session
 	online   bool
@@ -1154,32 +1148,13 @@ func (b *XMPPBridge) Send(text string) string { return b.SendChatTo(b.acct.Owner
 // SendChatTo posts a 1:1 chat message to an arbitrary JID, splitting long text.
 // Returns the stanza ID of the last chunk sent, or "" if nothing was sent.
 func (b *XMPPBridge) SendChatTo(to, text string) string {
-	return b.sendChat(to, text, "")
-}
-
-// SendChatToReplyTo posts a 1:1 chat message carrying a XEP-0359 <reply>
-// element referencing the stanza ID of the owner message it answers (""
-// disables the stamp). Used to thread replies to one of several messages sent
-// before any reply.
-func (b *XMPPBridge) SendChatToReplyTo(to, text, replyTo string) string {
-	return b.sendChat(to, text, replyTo)
-}
-
-func (b *XMPPBridge) sendChat(to, text, replyTo string) string {
-	if b.onSendChat != nil {
-		b.onSendChat(to, text, replyTo)
-	}
 	if b.currentSession() == nil {
 		b.log("warning", "send skipped: not online")
 		return ""
 	}
 	var lastID string
-	for i, part := range chunk(text, maxBody) {
-		rt := replyTo
-		if i > 0 {
-			rt = "" // only the first chunk of a split reply carries the thread stamp
-		}
-		id, err := b.encodeChat(to, part, stanza.ChatMessage, rt)
+	for _, part := range chunk(text, maxBody) {
+		id, err := b.encodeChat(to, part, stanza.ChatMessage)
 		if err != nil {
 			b.log("error", "send failed: "+err.Error())
 			break
@@ -1329,7 +1304,7 @@ func (b *XMPPBridge) currentSession() *xmpp.Session {
 
 // --- stanza encoders ---
 
-func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, replyTo string) (string, error) {
+func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType) (string, error) {
 	session := b.currentSession()
 	if session == nil {
 		return "", fmt.Errorf("not online")
@@ -1341,26 +1316,15 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, replyTo
 	id := newStanzaID()
 	msg := struct {
 		stanza.Message
-		Body  string     `xml:"body"`
-		Reply *replyElem `xml:",omitempty"`
+		Body string `xml:"body"`
 	}{
 		Message: stanza.Message{ID: id, To: toJID, Type: typ},
 		Body:    body,
-	}
-	if replyTo != "" {
-		msg.Reply = &replyElem{To: replyTo}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	b.recordMessage(id, to)
 	return id, b.encode(ctx, session, msg)
-}
-
-// replyElem is the XEP-0359 stanza-identification reply element: minimal form
-// of "this message is a reply to message <to>".
-type replyElem struct {
-	XMLName xml.Name `xml:"urn:xmpp:reply:0 reply"`
-	To      string   `xml:"to,attr"`
 }
 
 func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) error {
@@ -1756,7 +1720,7 @@ func (b *XMPPBridge) SendRoomTo(room, text string) string {
 	}
 	var lastID string
 	for _, part := range chunk(text, maxBody) {
-		id, err := b.encodeChat(room, part, stanza.GroupChatMessage, "")
+		id, err := b.encodeChat(room, part, stanza.GroupChatMessage)
 		if err != nil {
 			b.log("error", "room send failed: "+err.Error())
 			break
