@@ -744,10 +744,20 @@ func (b *Bridge) handleCommand(t string) bool {
 	case "session":
 		b.handleSession()
 	case "abort", "stop":
+		// Drain the queue BEFORE aborting. `abort` alone leaves queued steers
+		// and follow-ups in the session, so pi starts a fresh run the moment
+		// the aborted one stops — the opposite of what "⛔ aborted" promises.
+		dropped := b.clearQueue()
 		b.rpc.Abort()
 		b.settleLocally()
 		b.lifecycleReact("⛔") // aborted
-		b.reply("⛔ aborted")
+		msg := "⛔ aborted"
+		if dropped == 1 {
+			msg += " (1 queued message dropped)"
+		} else if dropped > 1 {
+			msg += fmt.Sprintf(" (%d queued messages dropped)", dropped)
+		}
+		b.reply(msg)
 	case "quit", "exit":
 		b.shutdown("requested over chat")
 	case "dump":
@@ -2223,6 +2233,25 @@ func (b *Bridge) stopTyping() {
 		b.xmpp.ChatStateTo("active", b.typingTo)
 		b.typingTo = ""
 	}
+}
+
+// clearQueue drops pi's queued steering and follow-up messages and returns how
+// many it dropped. Requires pi >= 0.84.4 (`clear_queue`). On an older pi the
+// command is unknown, so the request fails; that is logged at info and reported
+// as 0 dropped, leaving the caller's abort to proceed exactly as before.
+func (b *Bridge) clearQueue() int {
+	res, err := b.rpc.ClearQueue(b.ctx)
+	if err != nil {
+		b.log("info", "clear_queue failed: "+err.Error())
+		return 0
+	}
+	if !res.success() {
+		// Expected against pi < 0.84.4 — not a warning.
+		b.log("info", "clear_queue unavailable: "+res.errText())
+		return 0
+	}
+	data := res.Obj("data")
+	return len(data.Arr("steering")) + len(data.Arr("followUp"))
 }
 
 // settleLocally resets run-scoped UI (streaming flag, typing indicator,
