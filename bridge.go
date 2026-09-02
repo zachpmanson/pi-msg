@@ -1862,7 +1862,10 @@ func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
 		return false
 	}
 	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
-	b.rpc.Prompt(fmt.Sprintf("This run took in %d chat messages but sent %d replies. Messages that arrive while you are working are injected mid-run, so it is easy to read a new one and never answer the previous one. Check each message of this run. Send a reply for any that still needs its own answer. If you already addressed all of them, reply with \"to: noop\".", inbound, delivered), b.steerBehavior())
+	// Once "to: <stanza-id>" routing lands (issue #54), the destination form
+	// below becomes the stanza id, so each outstanding reply can name the
+	// message it answers.
+	b.rpc.Prompt(fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid>\".", inbound, delivered, delivered, inbound), b.steerBehavior())
 	return true
 }
 
