@@ -57,9 +57,10 @@ sequenceDiagram
   need an answer. The hint asks for `to: <jid|stanza-id>` and prefers the
   stanza id, which is exactly the case a bare JID cannot disambiguate: an id
   both routes the reply and marks it as a reply to the message it answers. The
-  agent replies with those answers, or with `to: noop` if it already covered
-  everything. `to: noop` counts as an answer, so deliberate silence is never
-  flagged.
+  agent answers them all in that one turn, with several `to:` lines, or replies
+  `to: noop` if it already covered everything. The run that answers a hint is
+  never hinted about in turn. `to: noop` counts as an answer, so deliberate
+  silence is never flagged.
 - Messages you send are acknowledged with a single **read receipt** — a XEP-0333
   chat marker (`displayed`) — when the agent takes them in, if your client requests it.
 - Your chat messages → routed to Pi:

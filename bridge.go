@@ -80,9 +80,14 @@ type Bridge struct {
 	// result returns — so the model can read a new question before it writes the
 	// answer to the last one, and that answer is then never written at all.
 	// Comparing the two counts at settle catches exactly that.
-	runInbound     int
-	runDeliveries  int
-	hintNudges     int       // unanswered-message hints sent this user turn (bounded)
+	runInbound    int
+	runDeliveries int
+	hintNudges    int // unanswered-message hints sent this user turn (bounded)
+	// hintPending marks the run the agent starts in answer to a hint. That run
+	// must never be hinted about in turn: the agent has just been asked to catch
+	// up, so whatever it sends IS the catch-up. Hinting again would ask it to
+	// check its own correction, and could do so for as long as the budget lasts.
+	hintPending    bool
 	idleSince      time.Time // when the agent last became idle; zero while a run is in flight
 	awayAnnounced  bool      // the away transition has been announced this idle period
 	lastAwayStatus string    // the last pithy activity shown while away (skip repeats across periods)
@@ -394,7 +399,10 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// injects a steer the moment a tool yields, so the model can read the
 		// next question before answering the last — and then never answer it.
 		// Ask it to check, with an explicit way to say it already did.
-		if !recovering {
+		// A run that answered a hint is never hinted about itself, however its
+		// tally looks. takeHintPending consumes the mark, so the run after it is
+		// judged normally again.
+		if !recovering && !b.takeHintPending() {
 			if n, m, ok := b.unansweredRun(); ok {
 				recovering = b.fireUnansweredHint(n, m)
 			}
@@ -1883,6 +1891,7 @@ func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
 	}
 	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
 	b.rpc.Prompt(unansweredHintText(inbound, delivered), b.steerBehavior())
+	b.markHintPending()
 	return true
 }
 
@@ -1893,8 +1902,25 @@ func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
 // several messages are in play, which is the case a bare jid cannot
 // disambiguate. An id both routes the reply and marks it as a reply to the
 // message it answers, so the owner can see which one each reply is for.
+//
+// It also names the multi-destination form: the hint asks for every outstanding
+// reply, and several "to:" lines in one reply fan out, so the agent can clear
+// the whole backlog in the single turn the hint buys it.
 func unansweredHintText(inbound, delivered int) string {
-	return fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid|stanza-id>\" — prefer the \"stanza-id:\" value of the message you are answering, so each reply is marked as a reply to it.", inbound, delivered, delivered, inbound)
+	return fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid|stanza-id>\" — prefer the \"stanza-id:\" value of the message you are answering, so each reply is marked as a reply to it. Several \"to:\" lines in one reply fan out to different destinations, so you can answer every outstanding message in this one turn.", inbound, delivered, delivered, inbound)
+}
+
+// markHintPending records that the next run answers a hint.
+func (b *Bridge) markHintPending() { b.mu.Lock(); b.hintPending = true; b.mu.Unlock() }
+
+// takeHintPending reports whether the run that just settled was answering a
+// hint, and clears the mark so the following run is judged normally.
+func (b *Bridge) takeHintPending() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pending := b.hintPending
+	b.hintPending = false
+	return pending
 }
 
 // bumpHintNudge consumes one unit of the per-turn hint budget.
@@ -2531,6 +2557,7 @@ func (b *Bridge) settleLocally() {
 	// prompt can't fire for work the user already cancelled.
 	b.resetTailTracking()
 	b.resetRunCounts()
+	b.takeHintPending() // aborted: no catch-up run is coming
 }
 
 // idleAwayTimeout is how long the agent may sit idle before its presence

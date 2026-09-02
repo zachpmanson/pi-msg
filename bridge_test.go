@@ -834,3 +834,37 @@ func TestSettleClearsRunCounts(t *testing.T) {
 		t.Error("settleLocally must clear the run tally")
 	}
 }
+
+// TestHintNotRepeatedOnTheCatchUpRun verifies the run that answers a hint is
+// never hinted about in turn. The agent has just been told to catch up, so
+// whatever it sends IS the catch-up — asking again would have it check its own
+// correction.
+func TestHintNotRepeatedOnTheCatchUpRun(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markHintPending() // as fireUnansweredHint does
+	// The catch-up run: even an unbalanced tally must not hint again.
+	b.countInbound()
+	b.countInbound()
+	b.countInbound()
+	if !b.takeHintPending() {
+		t.Fatal("the run after a hint must be marked as the catch-up run")
+	}
+	// The mark is one-shot: the run after the catch-up is judged normally.
+	if b.takeHintPending() {
+		t.Error("the catch-up mark must clear after one settle")
+	}
+	if _, _, ok := b.unansweredRun(); !ok {
+		t.Error("a later unbalanced run should hint again")
+	}
+}
+
+// TestAbortClearsHintPending verifies an aborted run drops the catch-up mark:
+// no catch-up is coming, so the next real run must be judged on its own tally.
+func TestAbortClearsHintPending(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markHintPending()
+	b.settleLocally()
+	if b.takeHintPending() {
+		t.Error("settleLocally must clear the catch-up mark")
+	}
+}
