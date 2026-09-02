@@ -737,3 +737,100 @@ func TestSettleLocallyClearsTailTracking(t *testing.T) {
 		t.Error("settleLocally must clear the empty-tail bookkeeping")
 	}
 }
+
+// TestUnansweredRunCounts covers the steer drop seen live: five messages went
+// into one run and only the last one got an answer, because pi injects each
+// queued message the instant a tool yields and the model moves on to it.
+func TestUnansweredRunCounts(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	// The live A–E burst: 5 messages in, 1 reply out.
+	for range 5 {
+		b.countInbound()
+	}
+	b.countDelivery()
+	in, out, ok := b.unansweredRun()
+	if !ok || in != 5 || out != 1 {
+		t.Errorf("A–E burst = (%d,%d,%v), want (5,1,true)", in, out, ok)
+	}
+	// Every message answered → silent.
+	b.resetRunCounts()
+	for range 3 {
+		b.countInbound()
+		b.countDelivery()
+	}
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a run that answered every message must not hint")
+	}
+	// A single unanswered message is the empty-tail case, not this one: the
+	// "done (no reply)" banner and the tail recovery already cover it.
+	b.resetRunCounts()
+	b.countInbound()
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a single-message run must not hint")
+	}
+	// Volunteer and reaction-ack runs stay quiet even when unbalanced.
+	b.resetRunCounts()
+	b.countInbound()
+	b.countInbound()
+	b.volunteered = true
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a volunteer run must not hint")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a reaction-ack run must not hint")
+	}
+}
+
+// TestUnansweredHintBounded verifies the hint can't loop: one per user turn,
+// refilled when the next message arrives.
+func TestUnansweredHintBounded(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	for i := 1; i <= maxHintNudges; i++ {
+		if !b.bumpHintNudge() {
+			t.Errorf("hint %d should be allowed (cap %d)", i, maxHintNudges)
+		}
+	}
+	if b.bumpHintNudge() {
+		t.Error("hint past the cap should be denied")
+	}
+	b.resetHintNudges()
+	if !b.bumpHintNudge() {
+		t.Error("after a fresh user turn, a hint should be allowed again")
+	}
+}
+
+// TestNoopCountsTowardAnsweredRun verifies deliberate silence balances the
+// tally, so a run the agent answered with "to: noop" is never nagged.
+func TestNoopCountsTowardAnsweredRun(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	b.countInbound()
+	b.countInbound()
+	if !b.deliverReply("to: zach@x\n\nanswered one") {
+		// Offline, so this send reports undelivered; count it by hand to model
+		// the online case.
+		b.countDelivery()
+	}
+	if b.deliverReply("to: noop\n\nnothing more to add") {
+		b.countDelivery()
+	}
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a run answered with a reply plus to: noop must not hint")
+	}
+}
+
+// TestSettleClearsRunCounts verifies an aborted run can't carry its tally into
+// the next one and fire a hint for cancelled work.
+func TestSettleClearsRunCounts(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.countInbound()
+	b.countInbound()
+	if _, _, ok := b.unansweredRun(); !ok {
+		t.Fatal("precondition: 2 in / 0 out should hint")
+	}
+	b.settleLocally()
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("settleLocally must clear the run tally")
+	}
+}

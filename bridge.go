@@ -72,10 +72,20 @@ type Bridge struct {
 	// delivery. With finalMsgHadText it separates a run that stopped mid-work
 	// from one that deliberately said nothing (to: noop).
 	toolSinceDelivery bool
-	tailNudges        int       // empty-tail recovery prompts sent this user turn (bounded)
-	idleSince         time.Time // when the agent last became idle; zero while a run is in flight
-	awayAnnounced     bool      // the away transition has been announced this idle period
-	lastAwayStatus    string    // the last pithy activity shown while away (skip repeats across periods)
+	tailNudges        int // empty-tail recovery prompts sent this user turn (bounded)
+	// runInbound counts the chat messages that entered the current run: the one
+	// that started it plus every steer that landed while it was in flight.
+	// runDeliveries counts the replies that actually reached a destination. Pi
+	// injects a steer at the first yield point — typically the instant a tool
+	// result returns — so the model can read a new question before it writes the
+	// answer to the last one, and that answer is then never written at all.
+	// Comparing the two counts at settle catches exactly that.
+	runInbound     int
+	runDeliveries  int
+	hintNudges     int       // unanswered-message hints sent this user turn (bounded)
+	idleSince      time.Time // when the agent last became idle; zero while a run is in flight
+	awayAnnounced  bool      // the away transition has been announced this idle period
+	lastAwayStatus string    // the last pithy activity shown while away (skip repeats across periods)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -380,6 +390,17 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// once rather than letting the work vanish. A deliberate silence uses
 		// "to: noop", which delivers and so never reaches here.
 		recovering := b.needsEmptyTailRecovery() && b.fireTailRecovery()
+		// Several messages entered this run but fewer replies left it. Pi
+		// injects a steer the moment a tool yields, so the model can read the
+		// next question before answering the last — and then never answer it.
+		// Ask it to check, with an explicit way to say it already did.
+		if !recovering {
+			if n, m, ok := b.unansweredRun(); ok {
+				recovering = b.fireUnansweredHint(n, m)
+			}
+		}
+		// The counts belong to the run that just ended, whatever we decided.
+		b.resetRunCounts()
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
@@ -429,6 +450,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		if b.deliverReply(text) {
 			b.setReplied(true)
 			b.clearToolSinceDelivery()
+			b.countDelivery()
 		}
 	case "extension_error":
 		b.reply("⚠️ extension error: " + orUnknown(ev.Str("error")))
@@ -560,6 +582,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
 	b.resetTailNudges()    // fresh user turn — allow one empty-tail recovery again
+	b.resetHintNudges()    // fresh user turn — allow one unanswered-message hint again
 	// Any inbound message is activity: come back to available and restart the
 	// idle-away timer from now (a run still in flight keeps dnd — leave its
 	// presence alone).
@@ -712,6 +735,7 @@ func (b *Bridge) handleCanonical(text, origin, sender, reactTo, reactID string) 
 	// and remember where a reply (or tool-driven file) should go by default.
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
+	b.countInbound()
 	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
@@ -726,6 +750,7 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 	}
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
+	b.countInbound()
 	b.rpc.Prompt(b.composePrompt(t, false, nick, origin, sender, reactID, reactTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
@@ -1786,6 +1811,75 @@ func (b *Bridge) bumpTailNudge() bool {
 // resetTailNudges refills the recovery budget at the start of a user turn.
 func (b *Bridge) resetTailNudges() { b.mu.Lock(); b.tailNudges = 0; b.mu.Unlock() }
 
+// maxHintNudges bounds how many unanswered-message hints we send per user turn.
+const maxHintNudges = 1
+
+// countInbound records that a chat message entered the current run. Called for
+// the message that starts a run and for every steer that lands while it runs.
+func (b *Bridge) countInbound() { b.mu.Lock(); b.runInbound++; b.mu.Unlock() }
+
+// countDelivery records that a reply reached a destination in the current run.
+func (b *Bridge) countDelivery() { b.mu.Lock(); b.runDeliveries++; b.mu.Unlock() }
+
+// resetRunCounts clears the per-run message/reply tally. Called at settle,
+// AFTER the decision, and on an aborted run.
+//
+// The counters are reset at settle rather than at agent_start because
+// handleCanonical counts a message before pi reports the run started: resetting
+// at agent_start would zero the very message that opened the run.
+func (b *Bridge) resetRunCounts() {
+	b.mu.Lock()
+	b.runInbound = 0
+	b.runDeliveries = 0
+	b.mu.Unlock()
+}
+
+// unansweredRun reports whether the run took in more messages than it answered,
+// and returns both counts. It only fires when at least two messages entered the
+// run: a single message with no reply is the empty-tail case, already covered by
+// needsEmptyTailRecovery and the "done (no reply)" banner.
+//
+// "to: noop" counts as a delivery, so a run the agent deliberately answered with
+// silence is never flagged.
+func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.volunteered || b.reactionAckRun {
+		return 0, 0, false
+	}
+	return b.runInbound, b.runDeliveries, b.runInbound > 1 && b.runInbound > b.runDeliveries
+}
+
+// fireUnansweredHint asks the agent to check whether any message of the run
+// still needs its own reply. It reports whether a prompt went out so the caller
+// can hold the "done (no reply)" banner while the check is in flight.
+//
+// The hint is a prompt, not a chat message: it never reaches the owner. The
+// agent answers it with real replies, or with "to: noop" if it already covered
+// everything — so a correctly-handled run costs one cheap turn and no noise.
+func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
+	if !b.bumpHintNudge() {
+		return false
+	}
+	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
+	// Once "to: <stanza-id>" routing lands (issue #54), the destination form
+	// below becomes the stanza id, so each outstanding reply can name the
+	// message it answers.
+	b.rpc.Prompt(fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid>\".", inbound, delivered, delivered, inbound), b.steerBehavior())
+	return true
+}
+
+// bumpHintNudge consumes one unit of the per-turn hint budget.
+func (b *Bridge) bumpHintNudge() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.hintNudges++
+	return b.hintNudges <= maxHintNudges
+}
+
+// resetHintNudges refills the hint budget at the start of a user turn.
+func (b *Bridge) resetHintNudges() { b.mu.Lock(); b.hintNudges = 0; b.mu.Unlock() }
+
 // fireTailRecovery asks the agent for the reply its run never wrote. It reports
 // whether a prompt went out, so the caller can hold the "done (no reply)"
 // banner while the retry is in flight. Returns false once the budget is spent,
@@ -2363,6 +2457,7 @@ func (b *Bridge) settleLocally() {
 	// Aborted or replaced run: drop the empty-tail bookkeeping so a recovery
 	// prompt can't fire for work the user already cancelled.
 	b.resetTailTracking()
+	b.resetRunCounts()
 }
 
 // idleAwayTimeout is how long the agent may sit idle before its presence

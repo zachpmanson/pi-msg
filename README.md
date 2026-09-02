@@ -49,6 +49,14 @@ sequenceDiagram
   after it, the answer was never written and nothing can be sent. The bridge
   asks the agent once per turn to write the reply, then falls back to the
   `done (no reply)` nudge if that also produces nothing.
+- **Unanswered-message hint**: a message that arrives mid-run is injected as a
+  steer at the next yield point, usually the moment a tool result returns. The
+  agent can read the new question before it writes the answer to the previous
+  one, and then never write it. When a run takes in more messages than it sends
+  replies, the bridge asks it once per turn to check for messages that still
+  need an answer. The agent replies with those answers, or with `to: noop` if it
+  already covered everything. `to: noop` counts as an answer, so deliberate
+  silence is never flagged.
 - Messages you send are acknowledged with a single **read receipt** — a XEP-0333
   chat marker (`displayed`) — when the agent takes them in, if your client requests it.
 - Your chat messages → routed to Pi:
