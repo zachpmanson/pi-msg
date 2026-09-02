@@ -38,6 +38,14 @@ func (e Event) Obj(k string) Event {
 	return nil
 }
 
+// Arr returns array field k as []any, or nil.
+func (e Event) Arr(k string) []any {
+	if a, ok := e[k].([]any); ok {
+		return a
+	}
+	return nil
+}
+
 // success reports whether a response event indicates success.
 func (e Event) success() bool { return e.Bool("success") }
 
@@ -355,6 +363,20 @@ func (c *RPCClient) SetSessionName(ctx context.Context, name string) (Event, err
 }
 
 func (c *RPCClient) Abort() { c.Send(map[string]any{"type": "abort"}) }
+
+// ClearQueue removes pi's queued steering and follow-up messages and returns
+// their text under data.steering / data.followUp. Requires pi >= 0.84.4; older
+// pi answers with an unknown-command failure, which callers must tolerate.
+//
+// Pi's documented order is clear_queue BEFORE abort: `abort` on its own leaves
+// the queue intact, so a steer that landed mid-run would start a fresh run the
+// instant the aborted one stops.
+func (c *RPCClient) ClearQueue(ctx context.Context) (Event, error) {
+	// Short timeout on purpose: this sits in front of /abort, which must feel
+	// immediate. Pi reads its stdin continuously, so a live pi answers well
+	// inside this. An unresponsive one costs the drain, not the abort.
+	return c.Request(ctx, map[string]any{"type": "clear_queue"}, 3*time.Second)
+}
 
 // CancelUI declines a pi UI request dialog (nobody is at the TUI to answer).
 func (c *RPCClient) CancelUI(id string) {

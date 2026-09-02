@@ -57,7 +57,7 @@ sequenceDiagram
 | `/session` | session stats — id, file, message counts, tokens, cost (no LLM turn) |
 | `/name [name]` | show the session display name, or set it |
 | `/think <off\|low\|medium\|high\|…>` | `set_thinking_level` |
-| `/abort` (or `/stop`) | `abort` |
+| `/abort` (or `/stop`) | `clear_queue`, then `abort` — the queue drain stops a steer that landed mid-run from starting a fresh run the instant the aborted one stops. The reply names how many queued messages it dropped. |
 | `/dump` (or `/dump pretty`) | send the session transcript to the owner — raw JSONL, or `pretty` for indented per-record JSON (no LLM turn) |
 | `/export` | render the current session to HTML via pi's `export_html` RPC and **send it as a file over XMPP** (XEP-0363 HTTP Upload) — **deterministic**, no agent turn; the rendered session lands as an inline, downloadable file |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
@@ -209,6 +209,19 @@ side-effect actions are tools.
 ```bash
 go build -o pi-msg . && ./pi-msg     # from the repo
 ```
+
+### Supported pi version
+
+pi-msg targets **pi 0.84.0 or later**. Two reasons:
+
+- Pi 0.84.0 removed the cumulative `message` field and
+  `assistantMessageEvent.partial` from the `message_update` RPC event. pi-msg
+  drives the typing indicator and the presence label from the deltas alone
+  (`TestStreamDeltaContract` pins this), so it works on both shapes — but no
+  new code may reach for the removed fields.
+- `/abort` uses `clear_queue`, added in pi 0.84.4. On an older pi the command
+  is unknown, so pi-msg logs the failure at `info` and aborts exactly as
+  before, reporting no dropped messages.
 
 ### Nix
 

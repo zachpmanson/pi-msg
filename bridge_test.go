@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"io"
@@ -503,16 +504,16 @@ func TestLoadAwayActivities(t *testing.T) {
 // learns *why* something failed (issue #34: e.g. an upload rejected by the
 // server as too large never reached the agent).
 func TestToolRelayCarriesReason(t *testing.T) {
-	var buf bytes.Buffer
+	stdin := &nopClose{buf: &bytes.Buffer{}}
 	b := roomBridge()
-	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.rpc = &RPCClient{stdin: stdin, mu: sync.Mutex{}}
 	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com"} // owner allowlisted; SendFile fails fast ("not online")
 
 	readLine := func(t *testing.T) map[string]any {
 		t.Helper()
 		deadline := time.Now().Add(2 * time.Second)
 		for {
-			if line, err := buf.ReadString('\n'); err == nil {
+			if line, err := stdin.readString('\n'); err == nil {
 				var resp map[string]any
 				if err := json.Unmarshal([]byte(line), &resp); err != nil {
 					t.Fatalf("bad relay response line %q: %v", line, err)
@@ -520,7 +521,7 @@ func TestToolRelayCarriesReason(t *testing.T) {
 				return resp
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+				t.Fatalf("no relay response within 2s (buf=%q)", stdin.contents())
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -557,9 +558,9 @@ func TestToolRelayCarriesReason(t *testing.T) {
 // TestToolRelaySuccessOk: a successful relay answers "ok", which the extension
 // maps to a clean tool result (as opposed to a generic failure).
 func TestToolRelaySuccessOk(t *testing.T) {
-	var buf bytes.Buffer
+	stdin := &nopClose{buf: &bytes.Buffer{}}
 	b := roomBridge()
-	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.rpc = &RPCClient{stdin: stdin, mu: sync.Mutex{}}
 	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com"}
 
 	// The react path is synchronous and doesn't need a live session: a missing
@@ -570,12 +571,12 @@ func TestToolRelaySuccessOk(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	var line string
 	for {
-		if l, err := buf.ReadString('\n'); err == nil {
+		if l, err := stdin.readString('\n'); err == nil {
 			line = l
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+			t.Fatalf("no relay response within 2s (buf=%q)", stdin.contents())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -585,10 +586,36 @@ func TestToolRelaySuccessOk(t *testing.T) {
 }
 
 // nopClose adapts a bytes.Buffer to io.WriteCloser for RPCClient.stdin.
-type nopClose struct{ buf *bytes.Buffer }
+//
+// The mutex is not decoration: the relay handler writes from its own goroutine
+// while the test reads the same buffer, so both sides must go through the lock.
+// Read the buffer with readString/contents, never through the wrapped buffer.
+type nopClose struct {
+	mu  sync.Mutex
+	buf *bytes.Buffer
+}
 
-func (n *nopClose) Write(p []byte) (int, error) { return n.buf.Write(p) }
-func (n *nopClose) Close() error                { return nil }
+func (n *nopClose) Write(p []byte) (int, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.buf.Write(p)
+}
+
+func (n *nopClose) Close() error { return nil }
+
+// readString consumes one delimited line, mirroring bytes.Buffer.ReadString.
+func (n *nopClose) readString(delim byte) (string, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.buf.ReadString(delim)
+}
+
+// contents returns everything still buffered, for failure messages.
+func (n *nopClose) contents() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.buf.String()
+}
 
 func TestOpenRouterCreditsParse(t *testing.T) {
 	// Build a throwaway HTTP server to avoid hitting the real endpoint.
@@ -609,5 +636,114 @@ func TestOpenRouterCreditsParse(t *testing.T) {
 	}
 	if total != 85 || used != 81.11 {
 		t.Fatalf("got total=%v used=%v, want 85 / 81.11", total, used)
+	}
+}
+
+// newTestBridge builds a Bridge with an offline XMPP bridge attached.
+// NewBridge leaves b.xmpp nil, and handleStreamDelta dereferences it, so the
+// field must be set by hand. SetPresence and ChatStateTo both return early
+// while offline, so presence/typing state is observable without a connection.
+func newTestBridge(acct ResolvedAccount) *Bridge {
+	b := NewBridge(acct, false)
+	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, func(string, string) {})
+	return b
+}
+
+// streamDelta builds a pi >= 0.84.0 message_update event: an
+// assistantMessageEvent delta and nothing else. Pi 0.84.0 removed the
+// cumulative `message` field and `assistantMessageEvent.partial`, so any event
+// this helper cannot express is one pi no longer sends.
+func streamDelta(ame map[string]any) Event {
+	return Event{"type": "message_update", "assistantMessageEvent": ame}
+}
+
+// TestStreamDeltaContract pins pi's post-0.84.0 message_update contract:
+// handleStreamDelta must drive presence and the typing bubble from deltas
+// alone. If a future edit reaches for a cumulative field, this test fails
+// because the events here never carry one.
+func TestStreamDeltaContract(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "thinking_start"}))
+	if b.xmpp.show != "dnd" || b.xmpp.presence != "thinking…" {
+		t.Errorf("thinking_start presence = (%q,%q), want (dnd,thinking…)",
+			b.xmpp.show, b.xmpp.presence)
+	}
+
+	// 1:1 account: text_start lights the owner's composer immediately.
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
+	if b.xmpp.presence != "replying…" {
+		t.Errorf("text_start presence = %q, want replying…", b.xmpp.presence)
+	}
+	if b.typingTo != "zach@x" {
+		t.Errorf("text_start typing target = %q, want zach@x", b.typingTo)
+	}
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": "hello"}))
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
+	if b.typingTo != "" {
+		t.Errorf("text_end typing target = %q, want empty", b.typingTo)
+	}
+
+	// An event with no assistantMessageEvent is ignored, not a panic.
+	b.handleStreamDelta(Event{"type": "message_update"})
+}
+
+// TestStreamDeltaContractRoomMode covers the room-mode branch, where the
+// typing target is decided from the accumulated text_delta chunks rather than
+// lit on the owner at text_start. Only the deltas carry that text now, so this
+// pins streamTypingDelta to ame["delta"].
+func TestStreamDeltaContractRoomMode(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}})
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
+	if b.typingTo != "" {
+		t.Errorf("room-mode text_start typing target = %q, want empty (route unknown)", b.typingTo)
+	}
+
+	// The routing line arrives split across deltas, as it does on the wire.
+	for _, d := range []string{"to: ", "zach", "@x\n", "hi"} {
+		b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": d}))
+	}
+	if b.typingTo != "zach@x" {
+		t.Errorf("room-mode typing target = %q, want zach@x", b.typingTo)
+	}
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
+	if b.typingTo != "" {
+		t.Errorf("room-mode text_end typing target = %q, want empty", b.typingTo)
+	}
+}
+
+// TestClearQueueCounts verifies /abort's queue drain: the dropped count is the
+// sum of pi's steering and follow-up queues.
+func TestClearQueueCounts(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.ctx = context.Background()
+	b.rpc = NewRPCClient(fakePiRespond(t, clearQueueOK), "", "", "", nil)
+	if err := b.rpc.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.rpc.Stop()
+
+	if got := b.clearQueue(); got != 2 {
+		t.Errorf("clearQueue() = %d, want 2 (1 steer + 1 follow-up)", got)
+	}
+}
+
+// TestClearQueueOldPi verifies the degrade path: pi < 0.84.4 has no
+// clear_queue, and an unknown-command failure must report 0 dropped rather
+// than blocking the abort that follows it.
+func TestClearQueueOldPi(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.ctx = context.Background()
+	b.rpc = NewRPCClient(fakePiRespond(t, clearQueueUnknown), "", "", "", nil)
+	if err := b.rpc.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.rpc.Stop()
+
+	if got := b.clearQueue(); got != 0 {
+		t.Errorf("clearQueue() against pi < 0.84.4 = %d, want 0", got)
 	}
 }
