@@ -63,6 +63,12 @@ to: a8508c81-0e1b-4e48-ae16-61256b837670
 B
 ```
 
+**When to use it.** The stanza-id form answers one of several messages in a
+single prompt (several people in a room, or a batch from one sender). When the
+latest prompt contains exactly one message, a plain `to: <jid>` already
+identifies what you are answering — the stanza-id form is redundant there and
+should not be used.
+
 The bridge does two things with the id:
 
 1. It looks the id up in `msgHistory` (`xmpp.go`) and sends to the author of
