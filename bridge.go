@@ -1907,7 +1907,7 @@ func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
 // reply, and several "to:" lines in one reply fan out, so the agent can clear
 // the whole backlog in the single turn the hint buys it.
 func unansweredHintText(inbound, delivered int) string {
-	return fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid|stanza-id>\" — prefer the \"stanza-id:\" value of the message you are answering, so each reply is marked as a reply to it. Several \"to:\" lines in one reply fan out to different destinations, so you can answer every outstanding message in this one turn.", inbound, delivered, delivered, inbound)
+	return fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If anything is outstanding reply to them now using \"to: <jid|stanza-id>\" — prefer the \"stanza-id:\" value of the message you are answering, so each reply is marked as a reply to it. Several \"to:\" lines in one reply fan out to different destinations, so you can answer every outstanding message in this one turn.", inbound, delivered, delivered, inbound)
 }
 
 // markHintPending records that the next run answers a hint.
