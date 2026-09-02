@@ -64,9 +64,18 @@ type Bridge struct {
 	turnDest       string        // reply destination for the current turn (owner or room jid)
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
-	idleSince      time.Time     // when the agent last became idle; zero while a run is in flight
-	awayAnnounced  bool          // the away transition has been announced this idle period
-	lastAwayStatus string        // the last pithy activity shown while away (skip repeats across periods)
+	// finalMsgHadText records whether the most recent assistant message of this
+	// run carried deliverable text. A run that ends on a tool call leaves it
+	// false: the answer was never written, so nothing could be delivered.
+	finalMsgHadText bool
+	// toolSinceDelivery records that a tool ran after the last successful
+	// delivery. With finalMsgHadText it separates a run that stopped mid-work
+	// from one that deliberately said nothing (to: noop).
+	toolSinceDelivery bool
+	tailNudges        int       // empty-tail recovery prompts sent this user turn (bounded)
+	idleSince         time.Time // when the agent last became idle; zero while a run is in flight
+	awayAnnounced     bool      // the away transition has been announced this idle period
+	lastAwayStatus    string    // the last pithy activity shown while away (skip repeats across periods)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -350,6 +359,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setReplied(false)
 		b.setHandleWarned(false)
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
+		b.resetTailTracking() // fresh run: no message seen, no tool since delivery
 		b.reactionAckRun = false
 		b.markActive() // a run is in flight — not idle
 		b.xmpp.SetPresence("dnd", "thinking…")
@@ -365,11 +375,17 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// the run's FINAL message was malformed (pending nudge set AND nothing
 		// successfully delivered after it). Not before.
 		b.firePendingNudge()
+		// A run that ended on a tool call never wrote its answer: the tool
+		// result came back and no assistant text followed it. Ask for the reply
+		// once rather than letting the work vanish. A deliberate silence uses
+		// "to: noop", which delivers and so never reaches here.
+		recovering := b.needsEmptyTailRecovery() && b.fireTailRecovery()
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
-		// stay silent after a to:noop without spamming the owner.
-		if !b.replied() && !b.volunteered && !b.reactionAckRun {
+		// stay silent after a to:noop without spamming the owner. A recovery
+		// prompt is in flight, so hold the banner: the retry may still answer.
+		if !b.replied() && !b.volunteered && !b.reactionAckRun && !recovering {
 			b.reply("✅ done (no reply) — your turn")
 		}
 		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
@@ -379,6 +395,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// A tool is running, not text streaming: drop the typing bubble and
 		// label the activity.
 		b.stopTyping()
+		b.markToolSinceDelivery()
 		b.xmpp.SetPresence("dnd", toolLabel(ev))
 	case "auto_retry_start":
 		b.stopTyping()
@@ -397,9 +414,21 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		if msg == nil || msg.Str("role") != "assistant" {
 			return
 		}
-		if text := FixToolCallXML(extractText(msg["content"])); text != "" {
-			b.deliverReply(text)
+		// Record whether THIS message carried text before delivering it: at
+		// settle, only the last message's answer matters, and a run whose final
+		// message is tool-only never wrote its reply at all.
+		text := FixToolCallXML(extractText(msg["content"]))
+		b.setFinalMsgHadText(text != "")
+		if text == "" {
+			return
+		}
+		// "replied" must mean "reached a destination", not "text existed".
+		// A malformed reply goes to the error room, which the owner never
+		// reads — counting that as a reply would suppress the settle-time
+		// "done (no reply)" banner and leave the owner with silence.
+		if b.deliverReply(text) {
 			b.setReplied(true)
+			b.clearToolSinceDelivery()
 		}
 	case "extension_error":
 		b.reply("⚠️ extension error: " + orUnknown(ev.Str("error")))
@@ -530,6 +559,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
+	b.resetTailNudges()    // fresh user turn — allow one empty-tail recovery again
 	// Any inbound message is activity: come back to available and restart the
 	// idle-away timer from now (a run still in flight keeps dnd — leave its
 	// presence alone).
@@ -1553,7 +1583,8 @@ func (b *Bridge) reply(text string) {
 // known occupant → 1:1. Text with no "to:" line, text before the first "to:",
 // or a non-allowlisted target is forwarded to the owner with a note and the
 // agent is nudged to resend correctly.
-func (b *Bridge) deliverReply(text string) {
+func (b *Bridge) deliverReply(text string) bool {
+	delivered := false
 	if !b.acct.RoomMode() {
 		// Deliberate reactions are the send_reaction tool's job now; a 1:1 reply
 		// is just its text.
@@ -1563,16 +1594,17 @@ func (b *Bridge) deliverReply(text string) {
 			// send_reaction calls target the agent's own message.
 			if stanzaID != "" {
 				b.setReactTarget(b.acct.Owner, stanzaID)
+				delivered = true
 			}
 		}
-		return
+		return delivered
 	}
 	segs, leading := splitReplySegments(text)
 	if len(segs) == 0 {
 		if body := strings.TrimSpace(text); body != "" {
 			b.rejectReply(body, "it had no \"to: <jid>\" routing line")
 		}
-		return
+		return false
 	}
 	if leading != "" {
 		b.rejectReply(leading, "this text came before the first \"to:\" line, so it had no destination")
@@ -1589,6 +1621,9 @@ func (b *Bridge) deliverReply(text string) {
 			b.log("notice", "agent chose silence (to: noop)")
 			b.clearPendingNudge()
 			b.setReplied(true)
+			// Deliberate silence IS an answer: it must not look like a run that
+			// died before writing one, or the recovery would argue with it.
+			delivered = true
 			continue
 		}
 		kind := b.xmpp.classifyDest(s.dest)
@@ -1612,6 +1647,7 @@ func (b *Bridge) deliverReply(text string) {
 			// "a later message routed fine" discards the staged nudge).
 			if stanzaID != "" {
 				b.clearPendingNudge()
+				delivered = true
 			}
 			// Update reaction target to the last-segment message so subsequent
 			// send_reaction calls target the agent's own most recent message.
@@ -1624,6 +1660,7 @@ func (b *Bridge) deliverReply(text string) {
 			}
 		}
 	}
+	return delivered
 }
 
 // maxRoutingNudges bounds how many routing reminders we send per user turn, so
@@ -1682,6 +1719,91 @@ func (b *Bridge) takeStagedNudge() string {
 		return ""
 	}
 	return p.reason
+}
+
+// maxTailNudges bounds how many empty-tail recovery prompts we send per user
+// turn. One retry recovers the common case; more would loop against a model
+// that keeps ending its runs on a tool call.
+const maxTailNudges = 1
+
+// resetTailTracking clears the empty-tail bookkeeping at the start of a run.
+func (b *Bridge) resetTailTracking() {
+	b.mu.Lock()
+	b.finalMsgHadText = false
+	b.toolSinceDelivery = false
+	b.mu.Unlock()
+}
+
+// setFinalMsgHadText records whether the assistant message that just ended
+// carried deliverable text. Only the last such call before settle matters.
+func (b *Bridge) setFinalMsgHadText(v bool) {
+	b.mu.Lock()
+	b.finalMsgHadText = v
+	b.mu.Unlock()
+}
+
+// markToolSinceDelivery notes that a tool started after the last delivery, so
+// the run has work in flight that an answer should still report on.
+func (b *Bridge) markToolSinceDelivery() {
+	b.mu.Lock()
+	b.toolSinceDelivery = true
+	b.mu.Unlock()
+}
+
+// clearToolSinceDelivery is called when a reply actually reaches a destination:
+// the work up to this point has been reported.
+func (b *Bridge) clearToolSinceDelivery() {
+	b.mu.Lock()
+	b.toolSinceDelivery = false
+	b.mu.Unlock()
+}
+
+// needsEmptyTailRecovery reports whether the run stopped mid-work: a tool ran
+// after the last delivered text, and the run's final assistant message carried
+// no text at all. That combination means the answer was never written — the
+// bridge has nothing to send and the owner would see silence.
+//
+// A run that delivered its reply after the tool clears toolSinceDelivery, so it
+// never matches. Nor does a run that simply had nothing to do (no tool). A
+// volunteer or reaction-ack run is allowed to end quietly.
+func (b *Bridge) needsEmptyTailRecovery() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.volunteered || b.reactionAckRun {
+		return false
+	}
+	return b.toolSinceDelivery && !b.finalMsgHadText
+}
+
+// bumpTailNudge consumes one unit of the per-turn recovery budget.
+func (b *Bridge) bumpTailNudge() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tailNudges++
+	return b.tailNudges <= maxTailNudges
+}
+
+// resetTailNudges refills the recovery budget at the start of a user turn.
+func (b *Bridge) resetTailNudges() { b.mu.Lock(); b.tailNudges = 0; b.mu.Unlock() }
+
+// fireTailRecovery asks the agent for the reply its run never wrote. It reports
+// whether a prompt went out, so the caller can hold the "done (no reply)"
+// banner while the retry is in flight. Returns false once the budget is spent,
+// and the banner then tells the owner nothing came back.
+func (b *Bridge) fireTailRecovery() bool {
+	if !b.bumpTailNudge() {
+		return false
+	}
+	b.log("notice", "run ended on a tool call with no reply: asking the agent to write it")
+	// A pure 1:1 account has no routing contract, so don't ask it for a "to:"
+	// line it must not write.
+	const base = "Your last run ended after a tool call without writing any reply, so nothing was delivered to the chat. The tool result is above. Write the reply now."
+	prompt := base
+	if b.acct.RoomMode() {
+		prompt = fmt.Sprintf("%s Begin it with a \"to: <jid>\" line (e.g. \"to: %s\" for the owner). If you truly have nothing to say, reply with \"to: noop\".", base, b.acct.Owner)
+	}
+	b.rpc.Prompt(prompt, b.steerBehavior())
+	return true
 }
 
 // firePendingNudge sends the staged routing reminder, if the run settled on a
@@ -2238,6 +2360,9 @@ func (b *Bridge) settleLocally() {
 	b.markIdle()
 	b.xmpp.SetPresence("", "listening")
 	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
+	// Aborted or replaced run: drop the empty-tail bookkeeping so a recovery
+	// prompt can't fire for work the user already cancelled.
+	b.resetTailTracking()
 }
 
 // idleAwayTimeout is how long the agent may sit idle before its presence

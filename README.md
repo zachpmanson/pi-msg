@@ -40,8 +40,15 @@ sequenceDiagram
 - Agent state shows on three independent signals (1:1): a **typing indicator** while a
   reply is actually being written, presence **`<show>`** (`dnd` while busy, available
   when idle), and a presence **status** label of the current activity (`thinking…`,
-  `running: <cmd>`, `replying…`, `retrying…`, `listening`). When a run settles with
-  **no** text you get a `✅ done (no reply) — your turn` nudge.
+  `running: <cmd>`, `replying…`, `retrying…`, `listening`). When a run settles
+  without delivering anything you get a `✅ done (no reply) — your turn` nudge.
+  A reply that was written but could not be routed does **not** count as
+  delivered, so a dropped reply still raises the nudge instead of passing as an
+  answer.
+- **Empty-tail recovery**: when a run ends on a tool call with no reply text
+  after it, the answer was never written and nothing can be sent. The bridge
+  asks the agent once per turn to write the reply, then falls back to the
+  `done (no reply)` nudge if that also produces nothing.
 - Messages you send are acknowledged with a single **read receipt** — a XEP-0333
   chat marker (`displayed`) — when the agent takes them in, if your client requests it.
 - Your chat messages → routed to Pi:

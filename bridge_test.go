@@ -611,3 +611,129 @@ func TestOpenRouterCreditsParse(t *testing.T) {
 		t.Fatalf("got total=%v used=%v, want 85 / 81.11", total, used)
 	}
 }
+
+// newTestBridge builds an offline bridge: sends return "" (not online), which
+// is exactly the "nothing reached a destination" case deliverReply must report.
+func newTestBridge(acct ResolvedAccount) *Bridge {
+	b := NewBridge(acct, false)
+	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, b.log)
+	return b
+}
+
+// TestRepliedOnlyOnDelivery pins the core of the dropped-reply fix: "replied"
+// must mean "reached a destination", not "text existed". A malformed reply goes
+// to the write-only error room, which the owner never reads, so counting it as
+// a reply would suppress the settle-time banner and leave the owner in silence.
+func TestRepliedOnlyOnDelivery(t *testing.T) {
+	room := ResolvedAccount{Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", Owner: "zach@x"}
+	b := newTestBridge(room)
+	if b.deliverReply("no routing line here") {
+		t.Error("a reply with no \"to:\" line must not count as delivered")
+	}
+	if b.deliverReply("to: errors@muc.x\n\nsneaky") {
+		t.Error("a blocked destination must not count as delivered")
+	}
+	// Offline: a well-formed reply still can't reach anyone.
+	if b.deliverReply("to: zach@x\n\nhello") {
+		t.Error("an offline send must not count as delivered")
+	}
+	// Pure 1:1 accounts take the other branch; offline is still not delivered.
+	solo := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	if solo.deliverReply("hello") {
+		t.Error("an offline 1:1 send must not count as delivered")
+	}
+}
+
+// TestNoopStillCountsAsReplied verifies deliberate silence stays an answer:
+// "to: noop" emits no stanza but must never look like a run that died before
+// writing a reply, or the empty-tail recovery would argue with it.
+func TestNoopStillCountsAsReplied(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	if !b.deliverReply("to: noop\n\nnothing to add") {
+		t.Error("to: noop must count as delivered")
+	}
+	if !b.replied() {
+		t.Error("to: noop must set replied")
+	}
+}
+
+// TestPreambleDoesNotDisarmNoReplyNet covers the failure that dropped replies
+// live: the agent writes a preamble alongside its tool call, the tool returns,
+// and the run ends with no further text. The delivered preamble used to mark
+// the run as answered, so no banner and no retry fired — the owner just got a
+// "running…" line and then silence.
+func TestPreambleDoesNotDisarmNoReplyNet(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	b.resetTailTracking()
+	// Preamble message: text delivered, then the tool starts.
+	b.setFinalMsgHadText(true)
+	b.clearToolSinceDelivery()
+	b.markToolSinceDelivery()
+	// The tool result arrives and the run ends with a tool-only message.
+	b.setFinalMsgHadText(false)
+	if !b.needsEmptyTailRecovery() {
+		t.Error("a run ending on a tool call after a preamble needs recovery")
+	}
+	// The winning shape: the reply text comes after the tool result.
+	b.setFinalMsgHadText(true)
+	b.clearToolSinceDelivery()
+	if b.needsEmptyTailRecovery() {
+		t.Error("a run that replied after its tool needs no recovery")
+	}
+}
+
+// TestNoRecoveryWithoutTool verifies a run that never ran a tool is left alone:
+// an empty final message there is the model saying nothing, which the existing
+// "done (no reply)" banner already covers.
+func TestNoRecoveryWithoutTool(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.resetTailTracking()
+	if b.needsEmptyTailRecovery() {
+		t.Error("no tool ran — recovery must not fire")
+	}
+	// Volunteer and reaction-ack runs are allowed to end quietly even mid-work.
+	b.markToolSinceDelivery()
+	b.volunteered = true
+	if b.needsEmptyTailRecovery() {
+		t.Error("a volunteer run must not trigger recovery")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if b.needsEmptyTailRecovery() {
+		t.Error("a reaction-ack run must not trigger recovery")
+	}
+}
+
+// TestEmptyTailRecoveryBounded verifies the retry can't loop against a model
+// that keeps ending its runs on a tool call: one prompt per user turn, then the
+// banner takes over and tells the owner nothing came back.
+func TestEmptyTailRecoveryBounded(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	for i := 1; i <= maxTailNudges; i++ {
+		if !b.bumpTailNudge() {
+			t.Errorf("recovery %d should be allowed (cap %d)", i, maxTailNudges)
+		}
+	}
+	if b.bumpTailNudge() {
+		t.Error("recovery past the cap should be denied")
+	}
+	b.resetTailNudges()
+	if !b.bumpTailNudge() {
+		t.Error("after a fresh user turn, recovery should be allowed again")
+	}
+}
+
+// TestSettleLocallyClearsTailTracking verifies an aborted or replaced run can't
+// leave state behind that fires a recovery prompt for cancelled work.
+func TestSettleLocallyClearsTailTracking(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markToolSinceDelivery()
+	b.setFinalMsgHadText(false)
+	if !b.needsEmptyTailRecovery() {
+		t.Fatal("precondition: mid-work run should need recovery")
+	}
+	b.settleLocally()
+	if b.needsEmptyTailRecovery() {
+		t.Error("settleLocally must clear the empty-tail bookkeeping")
+	}
+}
