@@ -64,9 +64,33 @@ type Bridge struct {
 	turnDest       string        // reply destination for the current turn (owner or room jid)
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
-	idleSince      time.Time     // when the agent last became idle; zero while a run is in flight
-	awayAnnounced  bool          // the away transition has been announced this idle period
-	lastAwayStatus string        // the last pithy activity shown while away (skip repeats across periods)
+	// finalMsgHadText records whether the most recent assistant message of this
+	// run carried deliverable text. A run that ends on a tool call leaves it
+	// false: the answer was never written, so nothing could be delivered.
+	finalMsgHadText bool
+	// toolSinceDelivery records that a tool ran after the last successful
+	// delivery. With finalMsgHadText it separates a run that stopped mid-work
+	// from one that deliberately said nothing (to: noop).
+	toolSinceDelivery bool
+	tailNudges        int // empty-tail recovery prompts sent this user turn (bounded)
+	// runInbound counts the chat messages that entered the current run: the one
+	// that started it plus every steer that landed while it was in flight.
+	// runDeliveries counts the replies that actually reached a destination. Pi
+	// injects a steer at the first yield point — typically the instant a tool
+	// result returns — so the model can read a new question before it writes the
+	// answer to the last one, and that answer is then never written at all.
+	// Comparing the two counts at settle catches exactly that.
+	runInbound    int
+	runDeliveries int
+	hintNudges    int // unanswered-message hints sent this user turn (bounded)
+	// hintPending marks the run the agent starts in answer to a hint. That run
+	// must never be hinted about in turn: the agent has just been asked to catch
+	// up, so whatever it sends IS the catch-up. Hinting again would ask it to
+	// check its own correction, and could do so for as long as the budget lasts.
+	hintPending    bool
+	idleSince      time.Time // when the agent last became idle; zero while a run is in flight
+	awayAnnounced  bool      // the away transition has been announced this idle period
+	lastAwayStatus string    // the last pithy activity shown while away (skip repeats across periods)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -350,6 +374,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setReplied(false)
 		b.setHandleWarned(false)
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
+		b.resetTailTracking() // fresh run: no message seen, no tool since delivery
 		b.reactionAckRun = false
 		b.markActive() // a run is in flight — not idle
 		b.xmpp.SetPresence("dnd", "thinking…")
@@ -365,11 +390,31 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// the run's FINAL message was malformed (pending nudge set AND nothing
 		// successfully delivered after it). Not before.
 		b.firePendingNudge()
+		// A run that ended on a tool call never wrote its answer: the tool
+		// result came back and no assistant text followed it. Ask for the reply
+		// once rather than letting the work vanish. A deliberate silence uses
+		// "to: noop", which delivers and so never reaches here.
+		recovering := b.needsEmptyTailRecovery() && b.fireTailRecovery()
+		// Several messages entered this run but fewer replies left it. Pi
+		// injects a steer the moment a tool yields, so the model can read the
+		// next question before answering the last — and then never answer it.
+		// Ask it to check, with an explicit way to say it already did.
+		// A run that answered a hint is never hinted about itself, however its
+		// tally looks. takeHintPending consumes the mark, so the run after it is
+		// judged normally again.
+		if !recovering && !b.takeHintPending() {
+			if n, m, ok := b.unansweredRun(); ok {
+				recovering = b.fireUnansweredHint(n, m)
+			}
+		}
+		// The counts belong to the run that just ended, whatever we decided.
+		b.resetRunCounts()
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
-		// stay silent after a to:noop without spamming the owner.
-		if !b.replied() && !b.volunteered && !b.reactionAckRun {
+		// stay silent after a to:noop without spamming the owner. A recovery
+		// prompt is in flight, so hold the banner: the retry may still answer.
+		if !b.replied() && !b.volunteered && !b.reactionAckRun && !recovering {
 			b.reply("✅ done (no reply) — your turn")
 		}
 		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
@@ -379,6 +424,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// A tool is running, not text streaming: drop the typing bubble and
 		// label the activity.
 		b.stopTyping()
+		b.markToolSinceDelivery()
 		b.xmpp.SetPresence("dnd", toolLabel(ev))
 	case "auto_retry_start":
 		b.stopTyping()
@@ -397,9 +443,22 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		if msg == nil || msg.Str("role") != "assistant" {
 			return
 		}
-		if text := FixToolCallXML(extractText(msg["content"])); text != "" {
-			b.deliverReply(text)
+		// Record whether THIS message carried text before delivering it: at
+		// settle, only the last message's answer matters, and a run whose final
+		// message is tool-only never wrote its reply at all.
+		text := FixToolCallXML(extractText(msg["content"]))
+		b.setFinalMsgHadText(text != "")
+		if text == "" {
+			return
+		}
+		// "replied" must mean "reached a destination", not "text existed".
+		// A malformed reply goes to the error room, which the owner never
+		// reads — counting that as a reply would suppress the settle-time
+		// "done (no reply)" banner and leave the owner with silence.
+		if b.deliverReply(text) {
 			b.setReplied(true)
+			b.clearToolSinceDelivery()
+			b.countDelivery()
 		}
 	case "extension_error":
 		b.reply("⚠️ extension error: " + orUnknown(ev.Str("error")))
@@ -530,6 +589,8 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
+	b.resetTailNudges()    // fresh user turn — allow one empty-tail recovery again
+	b.resetHintNudges()    // fresh user turn — allow one unanswered-message hint again
 	// Any inbound message is activity: come back to available and restart the
 	// idle-away timer from now (a run still in flight keeps dnd — leave its
 	// presence alone).
@@ -647,20 +708,23 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	}
 	switch action {
 	case actionCanonical:
-		// Room reactions enabled → use the room JID and stanza ID so auto-reacts
-		// and send_reaction target the room message. Otherwise clear any stale
-		// 1:1 reaction target.
-		reactTo, reactID := "", ""
+		// The stanza id always travels: it is the handle for "to: <stanza-id>"
+		// reply routing (#54), which works whether or not reactions are on.
+		// Room reactions enabled → also use the room JID as the reaction target,
+		// so auto-reacts and send_reaction hit the room message. Every reaction
+		// path needs BOTH a target jid and an id, so an id with no jid reacts to
+		// nothing.
+		reactTo := ""
 		if b.acct.RoomReactions {
-			reactTo, reactID = m.Room, m.ID
+			reactTo = m.Room
 		}
-		b.handleCanonical(body, m.Room, m.RealJID, reactTo, reactID)
+		b.handleCanonical(body, m.Room, m.RealJID, reactTo, m.ID)
 	case actionCommentary:
-		reactTo, reactID := "", ""
+		reactTo := ""
 		if b.acct.RoomReactions {
-			reactTo, reactID = m.Room, m.ID
+			reactTo = m.Room
 		}
-		b.dispatchCommentary(body, m.Nick, m.Room, m.RealJID, reactTo, reactID)
+		b.dispatchCommentary(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID)
 	case actionAmbient:
 		b.bufferAmbient(m.Nick, m.Body)
 	}
@@ -682,6 +746,7 @@ func (b *Bridge) handleCanonical(text, origin, sender, reactTo, reactID string) 
 	// and remember where a reply (or tool-driven file) should go by default.
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
+	b.countInbound()
 	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
@@ -696,6 +761,7 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 	}
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
+	b.countInbound()
 	b.rpc.Prompt(b.composePrompt(t, false, nick, origin, sender, reactID, reactTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
@@ -1138,7 +1204,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Instead of a jid you may write \"to: <stanza-id>\" — a message's \"stanza-id:\" value — which sends to that message's author AND marks your text as a reply to it, so the owner can see which message you answered; use it whenever you answer one of several messages. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -1174,8 +1240,10 @@ func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender
 			fmt.Fprintf(&sb, "sender: %s\n", sender)
 		}
 	}
-	// Include the stanza ID and target JID so the agent can pass them to
-	// send_reaction as messageId and from-JID respectively.
+	// Include the stanza ID so the agent can name this message later — as
+	// send_reaction's messageId, or as a "to: <stanza-id>" reply route (#54).
+	// react-to is the reaction target jid, and appears only when reactions are
+	// enabled for this channel.
 	if reactID != "" {
 		fmt.Fprintf(&sb, "stanza-id: %s\n", reactID)
 		if reactTo != "" {
@@ -1563,7 +1631,8 @@ func (b *Bridge) reply(text string) {
 // known occupant → 1:1. Text with no "to:" line, text before the first "to:",
 // or a non-allowlisted target is forwarded to the owner with a note and the
 // agent is nudged to resend correctly.
-func (b *Bridge) deliverReply(text string) {
+func (b *Bridge) deliverReply(text string) bool {
+	delivered := false
 	if !b.acct.RoomMode() {
 		// Deliberate reactions are the send_reaction tool's job now; a 1:1 reply
 		// is just its text.
@@ -1573,21 +1642,37 @@ func (b *Bridge) deliverReply(text string) {
 			// send_reaction calls target the agent's own message.
 			if stanzaID != "" {
 				b.setReactTarget(b.acct.Owner, stanzaID)
+				delivered = true
 			}
 		}
-		return
+		return delivered
 	}
 	segs, leading := splitReplySegments(text)
 	if len(segs) == 0 {
 		if body := strings.TrimSpace(text); body != "" {
 			b.rejectReply(body, "it had no \"to: <jid>\" routing line")
 		}
-		return
+		return false
 	}
 	if leading != "" {
 		b.rejectReply(leading, "this text came before the first \"to:\" line, so it had no destination")
 	}
 	for _, s := range segs {
+		// A stanza-id route (#54) names the message to answer. Resolve it to
+		// that message's author, then continue through the unchanged
+		// classifyDest path — a room message records "room@muc/nick", which
+		// bareJid collapses to the room, and the reply stamp keeps the occupant
+		// jid so the client can attribute it.
+		var reply *replyTarget
+		if s.replyTo != "" {
+			author := b.xmpp.lookupMessage(s.replyTo)
+			if author == "" {
+				b.rejectReply(s.body, fmt.Sprintf("%q is an unknown stanza id", s.replyTo))
+				continue
+			}
+			s.dest = bareJid(author)
+			reply = &replyTarget{author: author, id: s.replyTo}
+		}
 		// "to: noop" — the agent deliberately has nothing to send. Drop the body
 		// without emitting a stanza, and count it as having replied so the
 		// "done (no reply)" nudge doesn't turn room silence into DM noise.
@@ -1599,6 +1684,9 @@ func (b *Bridge) deliverReply(text string) {
 			b.log("notice", "agent chose silence (to: noop)")
 			b.clearPendingNudge()
 			b.setReplied(true)
+			// Deliberate silence IS an answer: it must not look like a run that
+			// died before writing one, or the recovery would argue with it.
+			delivered = true
 			continue
 		}
 		kind := b.xmpp.classifyDest(s.dest)
@@ -1609,19 +1697,20 @@ func (b *Bridge) deliverReply(text string) {
 		if s.body != "" {
 			var stanzaID string
 			if kind == destRoom {
-				stanzaID = b.xmpp.SendRoomTo(bareJid(s.dest), s.body)
+				stanzaID = b.xmpp.SendRoomReply(bareJid(s.dest), s.body, reply)
 				// A mistyped mention — or a self-tag — is inert: it addresses
 				// nobody and reports nothing, so the sender believes the
 				// handoff landed.
 				b.warnHandleProblems(bareJid(s.dest), s.body)
 			} else {
-				stanzaID = b.xmpp.SendChatTo(s.dest, s.body)
+				stanzaID = b.xmpp.SendChatReply(s.dest, s.body, reply)
 			}
 			// A message routed successfully — any staged correction no longer
 			// applies (#16: nudge only if the FINAL message was malformed, and
 			// "a later message routed fine" discards the staged nudge).
 			if stanzaID != "" {
 				b.clearPendingNudge()
+				delivered = true
 			}
 			// Update reaction target to the last-segment message so subsequent
 			// send_reaction calls target the agent's own most recent message.
@@ -1634,6 +1723,7 @@ func (b *Bridge) deliverReply(text string) {
 			}
 		}
 	}
+	return delivered
 }
 
 // maxRoutingNudges bounds how many routing reminders we send per user turn, so
@@ -1694,6 +1784,186 @@ func (b *Bridge) takeStagedNudge() string {
 	return p.reason
 }
 
+// maxTailNudges bounds how many empty-tail recovery prompts we send per user
+// turn. One retry recovers the common case; more would loop against a model
+// that keeps ending its runs on a tool call.
+const maxTailNudges = 1
+
+// resetTailTracking clears the empty-tail bookkeeping at the start of a run.
+func (b *Bridge) resetTailTracking() {
+	b.mu.Lock()
+	b.finalMsgHadText = false
+	b.toolSinceDelivery = false
+	b.mu.Unlock()
+}
+
+// setFinalMsgHadText records whether the assistant message that just ended
+// carried deliverable text. Only the last such call before settle matters.
+func (b *Bridge) setFinalMsgHadText(v bool) {
+	b.mu.Lock()
+	b.finalMsgHadText = v
+	b.mu.Unlock()
+}
+
+// markToolSinceDelivery notes that a tool started after the last delivery, so
+// the run has work in flight that an answer should still report on.
+func (b *Bridge) markToolSinceDelivery() {
+	b.mu.Lock()
+	b.toolSinceDelivery = true
+	b.mu.Unlock()
+}
+
+// clearToolSinceDelivery is called when a reply actually reaches a destination:
+// the work up to this point has been reported.
+func (b *Bridge) clearToolSinceDelivery() {
+	b.mu.Lock()
+	b.toolSinceDelivery = false
+	b.mu.Unlock()
+}
+
+// needsEmptyTailRecovery reports whether the run stopped mid-work: a tool ran
+// after the last delivered text, and the run's final assistant message carried
+// no text at all. That combination means the answer was never written — the
+// bridge has nothing to send and the owner would see silence.
+//
+// A run that delivered its reply after the tool clears toolSinceDelivery, so it
+// never matches. Nor does a run that simply had nothing to do (no tool). A
+// volunteer or reaction-ack run is allowed to end quietly.
+func (b *Bridge) needsEmptyTailRecovery() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.volunteered || b.reactionAckRun {
+		return false
+	}
+	return b.toolSinceDelivery && !b.finalMsgHadText
+}
+
+// bumpTailNudge consumes one unit of the per-turn recovery budget.
+func (b *Bridge) bumpTailNudge() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tailNudges++
+	return b.tailNudges <= maxTailNudges
+}
+
+// resetTailNudges refills the recovery budget at the start of a user turn.
+func (b *Bridge) resetTailNudges() { b.mu.Lock(); b.tailNudges = 0; b.mu.Unlock() }
+
+// maxHintNudges bounds how many unanswered-message hints we send per user turn.
+const maxHintNudges = 1
+
+// countInbound records that a chat message entered the current run. Called for
+// the message that starts a run and for every steer that lands while it runs.
+func (b *Bridge) countInbound() { b.mu.Lock(); b.runInbound++; b.mu.Unlock() }
+
+// countDelivery records that a reply reached a destination in the current run.
+func (b *Bridge) countDelivery() { b.mu.Lock(); b.runDeliveries++; b.mu.Unlock() }
+
+// resetRunCounts clears the per-run message/reply tally. Called at settle,
+// AFTER the decision, and on an aborted run.
+//
+// The counters are reset at settle rather than at agent_start because
+// handleCanonical counts a message before pi reports the run started: resetting
+// at agent_start would zero the very message that opened the run.
+func (b *Bridge) resetRunCounts() {
+	b.mu.Lock()
+	b.runInbound = 0
+	b.runDeliveries = 0
+	b.mu.Unlock()
+}
+
+// unansweredRun reports whether the run took in more messages than it answered,
+// and returns both counts. It only fires when at least two messages entered the
+// run: a single message with no reply is the empty-tail case, already covered by
+// needsEmptyTailRecovery and the "done (no reply)" banner.
+//
+// "to: noop" counts as a delivery, so a run the agent deliberately answered with
+// silence is never flagged.
+func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.volunteered || b.reactionAckRun {
+		return 0, 0, false
+	}
+	return b.runInbound, b.runDeliveries, b.runInbound > 1 && b.runInbound > b.runDeliveries
+}
+
+// fireUnansweredHint asks the agent to check whether any message of the run
+// still needs its own reply. It reports whether a prompt went out so the caller
+// can hold the "done (no reply)" banner while the check is in flight.
+//
+// The hint is a prompt, not a chat message: it never reaches the owner. The
+// agent answers it with real replies, or with "to: noop" if it already covered
+// everything — so a correctly-handled run costs one cheap turn and no noise.
+func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
+	if !b.bumpHintNudge() {
+		return false
+	}
+	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
+	b.rpc.Prompt(unansweredHintText(inbound, delivered), b.steerBehavior())
+	b.markHintPending()
+	return true
+}
+
+// unansweredHintText builds the hint prompt. Split out from fireUnansweredHint
+// so a test can read the wording without an rpc client.
+//
+// The routing form names the stanza id (#54): this hint fires exactly when
+// several messages are in play, which is the case a bare jid cannot
+// disambiguate. An id both routes the reply and marks it as a reply to the
+// message it answers, so the owner can see which one each reply is for.
+//
+// It also names the multi-destination form: the hint asks for every outstanding
+// reply, and several "to:" lines in one reply fan out, so the agent can clear
+// the whole backlog in the single turn the hint buys it.
+func unansweredHintText(inbound, delivered int) string {
+	return fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If anything is outstanding reply to them now using \"to: <jid|stanza-id>\" — prefer the \"stanza-id:\" value of the message you are answering, so each reply is marked as a reply to it. Several \"to:\" lines in one reply fan out to different destinations, so you can answer every outstanding message in this one turn.", inbound, delivered, delivered, inbound)
+}
+
+// markHintPending records that the next run answers a hint.
+func (b *Bridge) markHintPending() { b.mu.Lock(); b.hintPending = true; b.mu.Unlock() }
+
+// takeHintPending reports whether the run that just settled was answering a
+// hint, and clears the mark so the following run is judged normally.
+func (b *Bridge) takeHintPending() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pending := b.hintPending
+	b.hintPending = false
+	return pending
+}
+
+// bumpHintNudge consumes one unit of the per-turn hint budget.
+func (b *Bridge) bumpHintNudge() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.hintNudges++
+	return b.hintNudges <= maxHintNudges
+}
+
+// resetHintNudges refills the hint budget at the start of a user turn.
+func (b *Bridge) resetHintNudges() { b.mu.Lock(); b.hintNudges = 0; b.mu.Unlock() }
+
+// fireTailRecovery asks the agent for the reply its run never wrote. It reports
+// whether a prompt went out, so the caller can hold the "done (no reply)"
+// banner while the retry is in flight. Returns false once the budget is spent,
+// and the banner then tells the owner nothing came back.
+func (b *Bridge) fireTailRecovery() bool {
+	if !b.bumpTailNudge() {
+		return false
+	}
+	b.log("notice", "run ended on a tool call with no reply: asking the agent to write it")
+	// A pure 1:1 account has no routing contract, so don't ask it for a "to:"
+	// line it must not write.
+	const base = "Your last run ended after a tool call without writing any reply, so nothing was delivered to the chat. The tool result is above. Write the reply now."
+	prompt := base
+	if b.acct.RoomMode() {
+		prompt = fmt.Sprintf("%s Begin it with a \"to: <jid>\" line (e.g. \"to: %s\" for the owner). If you truly have nothing to say, reply with \"to: noop\".", base, b.acct.Owner)
+	}
+	b.rpc.Prompt(prompt, b.steerBehavior())
+	return true
+}
+
 // firePendingNudge sends the staged routing reminder, if the run settled on a
 // malformed final message. Called from agent_settled only; the reminder is a
 // prompt, so it isn't confused for a real user.
@@ -1727,17 +1997,20 @@ func (b *Bridge) bumpRoutingNudge() bool {
 
 func (b *Bridge) resetRoutingNudges() { b.mu.Lock(); b.routingNudges = 0; b.mu.Unlock() }
 
-// replySegment is one routed chunk of an agent reply: a destination jid and the
-// text to send there.
+// replySegment is one routed chunk of an agent reply: a destination and the
+// text to send there. Exactly one of dest and replyTo is set. dest is a jid (or
+// the reserved "noop"). replyTo is the stanza id of the message this segment
+// answers, which deliverReply resolves to a destination through msgHistory.
 type replySegment struct {
-	dest string
-	body string
+	dest    string
+	replyTo string
+	body    string
 }
 
-// splitReplySegments parses an agent reply into "to: <jid>" segments. A line
-// whose first token after "to:" looks like a jid (contains "@") starts a new
-// segment; other lines form the body (that line's remainder plus subsequent
-// lines up to the next "to:"). Text before the first "to:" line is returned as
+// splitReplySegments parses an agent reply into "to: <target>" segments. A line
+// whose first token after "to:" looks like a jid (contains "@"), or like a
+// stanza id, starts a new segment; other lines form the body (that line's
+// remainder plus subsequent lines up to the next "to:"). Text before the first "to:" line is returned as
 // leading (a routing error). This lets one agent output fan out to several
 // destinations.
 func splitReplySegments(text string) (segs []replySegment, leading string) {
@@ -1745,8 +2018,8 @@ func splitReplySegments(text string) (segs []replySegment, leading string) {
 	cur := -1
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if dest, inline, ok := routeLine(line); ok {
-			segs = append(segs, replySegment{dest: dest, body: inline})
+		if dest, replyTo, inline, ok := routeLine(line); ok {
+			segs = append(segs, replySegment{dest: dest, replyTo: replyTo, body: inline})
 			cur = len(segs) - 1
 			continue
 		}
@@ -1766,34 +2039,68 @@ func splitReplySegments(text string) (segs []replySegment, leading string) {
 	return segs, strings.TrimSpace(strings.Join(leadingLines, "\n"))
 }
 
-// routeLine reports whether line is a "to: <jid>" routing directive, returning
-// the jid and any inline body after it. The jid must contain "@" so ordinary
-// prose beginning with "to:" isn't mistaken for a route.
-func routeLine(line string) (dest, inline string, ok bool) {
+// routeLine reports whether line is a "to: <target>" routing directive,
+// returning what it named and any inline body after it. Three target forms are
+// accepted, and exactly one of dest and replyTo comes back set:
+//
+//	to: noop          → dest = "noop" (send nothing)
+//	to: <jid>         → dest = the jid (contains "@")
+//	to: <stanza-id>   → replyTo = the stanza id (a UUID)
+//
+// A jid must contain "@", and a stanza id must match the UUID shape, so
+// ordinary prose beginning with "to:" is not mistaken for a route.
+func routeLine(line string) (dest, replyTo, inline string, ok bool) {
 	t := strings.TrimLeft(line, " \t")
 	if len(t) < len("to:") || !strings.EqualFold(t[:len("to:")], "to:") {
-		return "", "", false
+		return "", "", "", false
 	}
 	after := strings.TrimLeft(t[len("to:"):], " \t")
-	jid := after
+	target := after
 	if i := strings.IndexAny(after, " \t"); i >= 0 {
-		jid, inline = after[:i], strings.TrimSpace(after[i:])
+		target, inline = after[:i], strings.TrimSpace(after[i:])
 	}
 	// "to: noop" is a real destination meaning "send nothing" (#20). It must be
 	// recognized here rather than falling through to the reject path, or an
 	// agent's attempt at silence would be dumped to the error room AND nudged
 	// for a resend — generating the very turn it was trying to avoid.
-	if strings.EqualFold(jid, destNoopName) {
-		return destNoopName, inline, true
+	if strings.EqualFold(target, destNoopName) {
+		return destNoopName, "", inline, true
 	}
-	if !strings.Contains(jid, "@") {
-		return "", "", false
+	// A stanza id names the message to answer, not a channel (#54). deliverReply
+	// resolves it to that message's author and stamps the outbound reply. The
+	// UUID shape is checked before the "@" test: a UUID has no "@", so this form
+	// is purely additive and no routing line that works today changes meaning.
+	if isStanzaID(target) {
+		return "", target, inline, true
 	}
-	return jid, inline, true
+	if !strings.Contains(target, "@") {
+		return "", "", "", false
+	}
+	return target, "", inline, true
 }
 
 // destNoopName is the reserved "discard this segment" routing destination.
 const destNoopName = "noop"
+
+// stanzaIDRe matches the two stanza-id shapes a routing line can name.
+//
+// The first is the strict 8-4-4-4-12 hex UUID that most clients put on a
+// message, and the shape #54 specifies. The second is pi-msg's own format:
+// newStanzaID emits 16 bare hex characters, so an id the bridge generated would
+// never match a UUID pattern.
+//
+// Both alternatives are checked in full, and a partial id matches neither. That
+// is on purpose: the recorded tradeoff on #54 is that a mistyped id costs the
+// message, so a wrong id is loud rather than quietly mis-delivered. Widening
+// the shape does not weaken that — an id of the right shape that names no
+// recorded message still takes the reject path.
+//
+// A client whose ids match neither shape cannot be answered by id. If that
+// turns up in practice, the fix is to widen this pattern, not to guess.
+var stanzaIDRe = regexp.MustCompile(`^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16})$`)
+
+// isStanzaID reports whether s has the shape of a stanza id.
+func isStanzaID(s string) bool { return stanzaIDRe.MatchString(s) }
 
 func (b *Bridge) handleModel(arg string) {
 	if arg == "" {
@@ -2203,12 +2510,20 @@ func streamTypingTarget(buf string, xm *XMPPBridge) (target string, decided bool
 	for i := 0; i < end; i++ {
 		l := lines[i]
 		l = strings.TrimRight(l, "\r")
-		dest, _, ok := routeLine(l)
+		dest, replyTo, _, ok := routeLine(l)
 		if !ok {
 			continue
 		}
 		if strings.EqualFold(dest, destNoopName) {
 			return "", true
+		}
+		// A stanza-id route lights the composer only if the id resolves; an
+		// unknown id is a routing failure, and a failure never types.
+		if replyTo != "" {
+			dest = xm.lookupMessage(replyTo)
+			if dest == "" {
+				return "", true
+			}
 		}
 		if xm.classifyDest(dest) == destUser {
 			return bareJid(dest), true
@@ -2267,6 +2582,11 @@ func (b *Bridge) settleLocally() {
 	b.markIdle()
 	b.xmpp.SetPresence("", "listening")
 	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
+	// Aborted or replaced run: drop the empty-tail bookkeeping so a recovery
+	// prompt can't fire for work the user already cancelled.
+	b.resetTailTracking()
+	b.resetRunCounts()
+	b.takeHintPending() // aborted: no catch-up run is coming
 }
 
 // idleAwayTimeout is how long the agent may sit idle before its presence

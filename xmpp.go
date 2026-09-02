@@ -64,6 +64,17 @@ const (
 // message with emoji (e.g. 👀 picked up, ✅ done, ⛔ aborted).
 const reactionsNS = "urn:xmpp:reactions:0"
 
+// replyNS is XEP-0461 Message Replies. An outbound message stamped with this
+// element names the message it answers, so a client threads it under that
+// message instead of showing it as a fresh line.
+//
+// Note the history. An earlier attempt (PRs #50/#51, reverted in #52) emitted
+// this namespace with a `to` attribute that held the *stanza id*, and no `id`
+// attribute at all, and called it XEP-0359. XEP-0461 wants `to` = the author of
+// the answered message, and `id` = that message's stanza id. Both attributes
+// are mandatory. One of them alone threads nowhere.
+const replyNS = "urn:xmpp:reply:0"
+
 // discoInfoNS is XEP-0030 service discovery: the bridge answers disco#info
 // queries so contacts can resolve its XEP-0115 capabilities hash.
 const discoInfoNS = "http://jabber.org/protocol/disco#info"
@@ -98,6 +109,7 @@ var discoFeatures = []string{
 	"urn:xmpp:ping",
 	"urn:xmpp:reactions:0",
 	"urn:xmpp:receipts",
+	replyNS,
 	"vcard-temp",
 	"vcard-temp:x:update",
 }
@@ -802,6 +814,8 @@ type incomingMsg struct {
 	markable    bool      // carried a XEP-0333 <markable/> (chat marker)
 	reactions   []string  // XEP-0444 reactions: the emoji set, if this is a reaction
 	reactionFor string    // XEP-0444 reactions id: stanza id of the message being reacted to
+	replyToID   string    // XEP-0461 <reply id>: stanza id of the message this one answers
+	replyToJID  string    // XEP-0461 <reply to>: author of the message this one answers
 }
 
 // handle is the mellium read-loop callback for one inbound stanza.
@@ -821,6 +835,15 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 		if re, ok := element(toks, reactionsNS, "reactions"); ok {
 			m.reactionFor = attr(re.Attr, "id")
 			m.reactions = reactionEmojis(toks)
+		}
+		// XEP-0461: log what a real client puts on the wire. The reverted
+		// attempt (#50/#51) shipped a malformed <reply/> twice because nobody
+		// read one, so record every inbound stamp at notice level. This is the
+		// live confirmation of the attribute names and the namespace.
+		if re, ok := element(toks, replyNS, "reply"); ok {
+			m.replyToID = attr(re.Attr, "id")
+			m.replyToJID = attr(re.Attr, "to")
+			b.log("notice", fmt.Sprintf("inbound XEP-0461 reply stamp from %s: to=%q id=%q", m.from, m.replyToJID, m.replyToID))
 		}
 		if d, ok := element(toks, "urn:xmpp:delay", "delay"); ok {
 			m.delay = true
@@ -1148,13 +1171,21 @@ func (b *XMPPBridge) Send(text string) string { return b.SendChatTo(b.acct.Owner
 // SendChatTo posts a 1:1 chat message to an arbitrary JID, splitting long text.
 // Returns the stanza ID of the last chunk sent, or "" if nothing was sent.
 func (b *XMPPBridge) SendChatTo(to, text string) string {
+	return b.SendChatReply(to, text, nil)
+}
+
+// SendChatReply is SendChatTo with an optional XEP-0461 reply stamp. Only the
+// first chunk of a split message carries the stamp. A client threads on the
+// first stanza, and a repeat of the element on every chunk makes each chunk a
+// separate reply to the same parent.
+func (b *XMPPBridge) SendChatReply(to, text string, reply *replyTarget) string {
 	if b.currentSession() == nil {
 		b.log("warning", "send skipped: not online")
 		return ""
 	}
 	var lastID string
-	for _, part := range chunk(text, maxBody) {
-		id, err := b.encodeChat(to, part, stanza.ChatMessage)
+	for i, part := range chunk(text, maxBody) {
+		id, err := b.encodeChat(to, part, stanza.ChatMessage, replyForChunk(i, reply))
 		if err != nil {
 			b.log("error", "send failed: "+err.Error())
 			break
@@ -1304,7 +1335,57 @@ func (b *XMPPBridge) currentSession() *xmpp.Session {
 
 // --- stanza encoders ---
 
-func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType) (string, error) {
+// replyTarget names the message an outbound message answers (XEP-0461).
+// author is the JID recorded for that message: an occupant JID
+// (room@muc/nick) for a room message, the sender's JID for a 1:1. id is that
+// message's stanza id.
+type replyTarget struct {
+	author string
+	id     string
+}
+
+// replyElem is the XEP-0461 <reply/> child. Both attributes are mandatory.
+type replyElem struct {
+	XMLName xml.Name `xml:"urn:xmpp:reply:0 reply"`
+	To      string   `xml:"to,attr"`
+	ID      string   `xml:"id,attr"`
+}
+
+// chatMessage is one outbound message stanza as it goes on the wire.
+type chatMessage struct {
+	stanza.Message
+	Body  string     `xml:"body"`
+	Reply *replyElem `xml:"reply,omitempty"`
+}
+
+// chatStanza builds one outbound message stanza. reply, when it names both an
+// author and an id, adds the XEP-0461 <reply/> child. A half-filled reply adds
+// nothing: one attribute alone threads nowhere, and an element with a missing
+// attribute is worse than no element.
+func chatStanza(id string, to jid.JID, typ stanza.MessageType, body string, reply *replyTarget) chatMessage {
+	msg := chatMessage{
+		Message: stanza.Message{ID: id, To: to, Type: typ},
+		Body:    body,
+	}
+	if reply != nil && reply.author != "" && reply.id != "" {
+		msg.Reply = &replyElem{To: reply.author, ID: reply.id}
+	}
+	return msg
+}
+
+// replyForChunk returns the reply stamp for chunk i of a split message: the
+// first chunk only. A client threads on the first stanza, so a stamp repeated
+// on every chunk makes each chunk a separate reply to the same parent.
+func replyForChunk(i int, reply *replyTarget) *replyTarget {
+	if i == 0 {
+		return reply
+	}
+	return nil
+}
+
+// encodeChat sends one message stanza. A non-nil reply adds the XEP-0461
+// <reply/> child that names the message this one answers.
+func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, reply *replyTarget) (string, error) {
 	session := b.currentSession()
 	if session == nil {
 		return "", fmt.Errorf("not online")
@@ -1314,13 +1395,7 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType) (string
 		return "", fmt.Errorf("invalid recipient %q: %w", to, err)
 	}
 	id := newStanzaID()
-	msg := struct {
-		stanza.Message
-		Body string `xml:"body"`
-	}{
-		Message: stanza.Message{ID: id, To: toJID, Type: typ},
-		Body:    body,
-	}
+	msg := chatStanza(id, toJID, typ, body, reply)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	b.recordMessage(id, to)
@@ -1714,13 +1789,20 @@ func (b *XMPPBridge) publishAvatar() error {
 // SendRoomTo posts a groupchat message to a room JID, splitting long text.
 // Returns the stanza ID of the last chunk sent, or "" if nothing was sent.
 func (b *XMPPBridge) SendRoomTo(room, text string) string {
+	return b.SendRoomReply(room, text, nil)
+}
+
+// SendRoomReply is SendRoomTo with an optional XEP-0461 reply stamp, carried on
+// the first chunk only. Rooms are in scope for the stamp because the agent
+// names the answered message. The bridge never infers one.
+func (b *XMPPBridge) SendRoomReply(room, text string, reply *replyTarget) string {
 	if b.currentSession() == nil {
 		b.log("warning", "room send skipped: not online")
 		return ""
 	}
 	var lastID string
-	for _, part := range chunk(text, maxBody) {
-		id, err := b.encodeChat(room, part, stanza.GroupChatMessage)
+	for i, part := range chunk(text, maxBody) {
+		id, err := b.encodeChat(room, part, stanza.GroupChatMessage, replyForChunk(i, reply))
 		if err != nil {
 			b.log("error", "room send failed: "+err.Error())
 			break

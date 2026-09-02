@@ -639,14 +639,261 @@ func TestOpenRouterCreditsParse(t *testing.T) {
 	}
 }
 
-// newTestBridge builds a Bridge with an offline XMPP bridge attached.
-// NewBridge leaves b.xmpp nil, and handleStreamDelta dereferences it, so the
-// field must be set by hand. SetPresence and ChatStateTo both return early
-// while offline, so presence/typing state is observable without a connection.
+// newTestBridge builds an offline bridge: sends return "" (not online), which
+// is exactly the "nothing reached a destination" case deliverReply must report.
 func newTestBridge(acct ResolvedAccount) *Bridge {
 	b := NewBridge(acct, false)
-	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, func(string, string) {})
+	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, b.log)
 	return b
+}
+
+// TestRepliedOnlyOnDelivery pins the core of the dropped-reply fix: "replied"
+// must mean "reached a destination", not "text existed". A malformed reply goes
+// to the write-only error room, which the owner never reads, so counting it as
+// a reply would suppress the settle-time banner and leave the owner in silence.
+func TestRepliedOnlyOnDelivery(t *testing.T) {
+	room := ResolvedAccount{Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", Owner: "zach@x"}
+	b := newTestBridge(room)
+	if b.deliverReply("no routing line here") {
+		t.Error("a reply with no \"to:\" line must not count as delivered")
+	}
+	if b.deliverReply("to: errors@muc.x\n\nsneaky") {
+		t.Error("a blocked destination must not count as delivered")
+	}
+	// Offline: a well-formed reply still can't reach anyone.
+	if b.deliverReply("to: zach@x\n\nhello") {
+		t.Error("an offline send must not count as delivered")
+	}
+	// Pure 1:1 accounts take the other branch; offline is still not delivered.
+	solo := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	if solo.deliverReply("hello") {
+		t.Error("an offline 1:1 send must not count as delivered")
+	}
+}
+
+// TestNoopStillCountsAsReplied verifies deliberate silence stays an answer:
+// "to: noop" emits no stanza but must never look like a run that died before
+// writing a reply, or the empty-tail recovery would argue with it.
+func TestNoopStillCountsAsReplied(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	if !b.deliverReply("to: noop\n\nnothing to add") {
+		t.Error("to: noop must count as delivered")
+	}
+	if !b.replied() {
+		t.Error("to: noop must set replied")
+	}
+}
+
+// TestPreambleDoesNotDisarmNoReplyNet covers the failure that dropped replies
+// live: the agent writes a preamble alongside its tool call, the tool returns,
+// and the run ends with no further text. The delivered preamble used to mark
+// the run as answered, so no banner and no retry fired — the owner just got a
+// "running…" line and then silence.
+func TestPreambleDoesNotDisarmNoReplyNet(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	b.resetTailTracking()
+	// Preamble message: text delivered, then the tool starts.
+	b.setFinalMsgHadText(true)
+	b.clearToolSinceDelivery()
+	b.markToolSinceDelivery()
+	// The tool result arrives and the run ends with a tool-only message.
+	b.setFinalMsgHadText(false)
+	if !b.needsEmptyTailRecovery() {
+		t.Error("a run ending on a tool call after a preamble needs recovery")
+	}
+	// The winning shape: the reply text comes after the tool result.
+	b.setFinalMsgHadText(true)
+	b.clearToolSinceDelivery()
+	if b.needsEmptyTailRecovery() {
+		t.Error("a run that replied after its tool needs no recovery")
+	}
+}
+
+// TestNoRecoveryWithoutTool verifies a run that never ran a tool is left alone:
+// an empty final message there is the model saying nothing, which the existing
+// "done (no reply)" banner already covers.
+func TestNoRecoveryWithoutTool(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.resetTailTracking()
+	if b.needsEmptyTailRecovery() {
+		t.Error("no tool ran — recovery must not fire")
+	}
+	// Volunteer and reaction-ack runs are allowed to end quietly even mid-work.
+	b.markToolSinceDelivery()
+	b.volunteered = true
+	if b.needsEmptyTailRecovery() {
+		t.Error("a volunteer run must not trigger recovery")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if b.needsEmptyTailRecovery() {
+		t.Error("a reaction-ack run must not trigger recovery")
+	}
+}
+
+// TestEmptyTailRecoveryBounded verifies the retry can't loop against a model
+// that keeps ending its runs on a tool call: one prompt per user turn, then the
+// banner takes over and tells the owner nothing came back.
+func TestEmptyTailRecoveryBounded(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	for i := 1; i <= maxTailNudges; i++ {
+		if !b.bumpTailNudge() {
+			t.Errorf("recovery %d should be allowed (cap %d)", i, maxTailNudges)
+		}
+	}
+	if b.bumpTailNudge() {
+		t.Error("recovery past the cap should be denied")
+	}
+	b.resetTailNudges()
+	if !b.bumpTailNudge() {
+		t.Error("after a fresh user turn, recovery should be allowed again")
+	}
+}
+
+// TestSettleLocallyClearsTailTracking verifies an aborted or replaced run can't
+// leave state behind that fires a recovery prompt for cancelled work.
+func TestSettleLocallyClearsTailTracking(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markToolSinceDelivery()
+	b.setFinalMsgHadText(false)
+	if !b.needsEmptyTailRecovery() {
+		t.Fatal("precondition: mid-work run should need recovery")
+	}
+	b.settleLocally()
+	if b.needsEmptyTailRecovery() {
+		t.Error("settleLocally must clear the empty-tail bookkeeping")
+	}
+}
+
+// TestUnansweredRunCounts covers the steer drop seen live: five messages went
+// into one run and only the last one got an answer, because pi injects each
+// queued message the instant a tool yields and the model moves on to it.
+func TestUnansweredRunCounts(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	// The live A–E burst: 5 messages in, 1 reply out.
+	for range 5 {
+		b.countInbound()
+	}
+	b.countDelivery()
+	in, out, ok := b.unansweredRun()
+	if !ok || in != 5 || out != 1 {
+		t.Errorf("A–E burst = (%d,%d,%v), want (5,1,true)", in, out, ok)
+	}
+	// Every message answered → silent.
+	b.resetRunCounts()
+	for range 3 {
+		b.countInbound()
+		b.countDelivery()
+	}
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a run that answered every message must not hint")
+	}
+	// A single unanswered message is the empty-tail case, not this one: the
+	// "done (no reply)" banner and the tail recovery already cover it.
+	b.resetRunCounts()
+	b.countInbound()
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a single-message run must not hint")
+	}
+	// Volunteer and reaction-ack runs stay quiet even when unbalanced.
+	b.resetRunCounts()
+	b.countInbound()
+	b.countInbound()
+	b.volunteered = true
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a volunteer run must not hint")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a reaction-ack run must not hint")
+	}
+}
+
+// TestUnansweredHintBounded verifies the hint can't loop: one per user turn,
+// refilled when the next message arrives.
+func TestUnansweredHintBounded(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	for i := 1; i <= maxHintNudges; i++ {
+		if !b.bumpHintNudge() {
+			t.Errorf("hint %d should be allowed (cap %d)", i, maxHintNudges)
+		}
+	}
+	if b.bumpHintNudge() {
+		t.Error("hint past the cap should be denied")
+	}
+	b.resetHintNudges()
+	if !b.bumpHintNudge() {
+		t.Error("after a fresh user turn, a hint should be allowed again")
+	}
+}
+
+// TestNoopCountsTowardAnsweredRun verifies deliberate silence balances the
+// tally, so a run the agent answered with "to: noop" is never nagged.
+func TestNoopCountsTowardAnsweredRun(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	b.countInbound()
+	b.countInbound()
+	if !b.deliverReply("to: zach@x\n\nanswered one") {
+		// Offline, so this send reports undelivered; count it by hand to model
+		// the online case.
+		b.countDelivery()
+	}
+	if b.deliverReply("to: noop\n\nnothing more to add") {
+		b.countDelivery()
+	}
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a run answered with a reply plus to: noop must not hint")
+	}
+}
+
+// TestSettleClearsRunCounts verifies an aborted run can't carry its tally into
+// the next one and fire a hint for cancelled work.
+func TestSettleClearsRunCounts(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.countInbound()
+	b.countInbound()
+	if _, _, ok := b.unansweredRun(); !ok {
+		t.Fatal("precondition: 2 in / 0 out should hint")
+	}
+	b.settleLocally()
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("settleLocally must clear the run tally")
+	}
+}
+
+// TestHintNotRepeatedOnTheCatchUpRun verifies the run that answers a hint is
+// never hinted about in turn. The agent has just been told to catch up, so
+// whatever it sends IS the catch-up — asking again would have it check its own
+// correction.
+func TestHintNotRepeatedOnTheCatchUpRun(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markHintPending() // as fireUnansweredHint does
+	// The catch-up run: even an unbalanced tally must not hint again.
+	b.countInbound()
+	b.countInbound()
+	b.countInbound()
+	if !b.takeHintPending() {
+		t.Fatal("the run after a hint must be marked as the catch-up run")
+	}
+	// The mark is one-shot: the run after the catch-up is judged normally.
+	if b.takeHintPending() {
+		t.Error("the catch-up mark must clear after one settle")
+	}
+	if _, _, ok := b.unansweredRun(); !ok {
+		t.Error("a later unbalanced run should hint again")
+	}
+}
+
+// TestAbortClearsHintPending verifies an aborted run drops the catch-up mark:
+// no catch-up is coming, so the next real run must be judged on its own tally.
+func TestAbortClearsHintPending(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markHintPending()
+	b.settleLocally()
+	if b.takeHintPending() {
+		t.Error("settleLocally must clear the catch-up mark")
+	}
 }
 
 // streamDelta builds a pi >= 0.84.0 message_update event: an
