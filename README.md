@@ -54,9 +54,12 @@ sequenceDiagram
   agent can read the new question before it writes the answer to the previous
   one, and then never write it. When a run takes in more messages than it sends
   replies, the bridge asks it once per turn to check for messages that still
-  need an answer. The agent replies with those answers, or with `to: noop` if it
-  already covered everything. `to: noop` counts as an answer, so deliberate
-  silence is never flagged.
+  need an answer. The hint asks for `to: <jid|stanza-id>` and prefers the
+  stanza id, which is exactly the case a bare JID cannot disambiguate: an id
+  both routes the reply and marks it as a reply to the message it answers. The
+  agent replies with those answers, or with `to: noop` if it already covered
+  everything. `to: noop` counts as an answer, so deliberate silence is never
+  flagged.
 - Messages you send are acknowledged with a single **read receipt** — a XEP-0333
   chat marker (`displayed`) — when the agent takes them in, if your client requests it.
 - Your chat messages → routed to Pi:
@@ -156,13 +159,16 @@ the message's origin:
 ```
 from: <channel jid>     # the room (group msg) or the owner (DM) — reply here to answer in place
 sender: <person jid>    # room messages only, when the real JID is known — reply here to DM them
+stanza-id: <uuid>       # this message's id — reply here to answer this message specifically
 <message body>
 ```
 
-And **every** agent reply must begin with a `to: <jid>` line naming its destination:
+And **every** agent reply must begin with a `to:` line naming its destination:
 
 - `to: <room jid>` → the group chat (groupchat)
 - `to: <owner or occupant jid>` → that person, 1:1
+- `to: <stanza-id>` → the author of that message, with the reply **stamped** to it
+- `to: noop` → send nothing (deliberate silence)
 
 One reply may contain **several `to:` blocks** — each `to:` line starts a new message, so
 the agent can fan a single turn out to multiple destinations:
@@ -178,6 +184,28 @@ Destinations are **allowlisted**: the owner, joined room(s), and real JIDs curre
 in a room. A reply whose `to:` is missing or points anywhere else is sent to the owner, so
 nothing is silently lost — the agent can't message arbitrary users. In a pure 1:1 account
 (no room) there are no prefixes; replies just go to the owner.
+
+**Answering a specific message (`to: <stanza-id>`).** When several messages arrive before
+any reply, nothing in an outbound reply says which one it answers. So a `to:` line may
+name a **message** instead of a JID, using the `stanza-id:` value from the prompt. pi-msg
+resolves the id to that message's author, sends there, and stamps the outbound stanza with
+a **XEP-0461** `<reply xmlns="urn:xmpp:reply:0" to="<author>" id="<stanza id>"/>` element,
+so the owner's client threads the reply under the message it answers. Rooms are stamped
+too, and only the first chunk of a split reply carries the element. One run can emit
+several replies, each stamped to its own message:
+
+```
+to: 3e2597d4-a470-4cdb-b972-431043bce34f
+On the deploy: done, back in 5.
+to: a8508c81-0e1b-4e48-ae16-61256b837670
+On the creds: staging is stale, I'll rotate them next.
+```
+
+Warning: the id must be complete and known. An unknown or malformed id is a routing
+failure that takes the normal reject path (error room plus a settle-time nudge), not a
+silent fallback — so a wrong id is loud rather than quietly mis-delivered. Two id shapes
+are recognised: the 8-4-4-4-12 hex UUID most clients emit, and the 16 bare hex characters
+pi-msg emits for its own stanzas.
 
 **File transfer.** The agent sends files with the **`send_file`** tool (a structured tool
 call, not in-band text — see [Agent tools](#agent-tools) below): pi-msg uploads the file via

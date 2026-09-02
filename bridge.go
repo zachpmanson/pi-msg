@@ -700,20 +700,23 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	}
 	switch action {
 	case actionCanonical:
-		// Room reactions enabled → use the room JID and stanza ID so auto-reacts
-		// and send_reaction target the room message. Otherwise clear any stale
-		// 1:1 reaction target.
-		reactTo, reactID := "", ""
+		// The stanza id always travels: it is the handle for "to: <stanza-id>"
+		// reply routing (#54), which works whether or not reactions are on.
+		// Room reactions enabled → also use the room JID as the reaction target,
+		// so auto-reacts and send_reaction hit the room message. Every reaction
+		// path needs BOTH a target jid and an id, so an id with no jid reacts to
+		// nothing.
+		reactTo := ""
 		if b.acct.RoomReactions {
-			reactTo, reactID = m.Room, m.ID
+			reactTo = m.Room
 		}
-		b.handleCanonical(body, m.Room, m.RealJID, reactTo, reactID)
+		b.handleCanonical(body, m.Room, m.RealJID, reactTo, m.ID)
 	case actionCommentary:
-		reactTo, reactID := "", ""
+		reactTo := ""
 		if b.acct.RoomReactions {
-			reactTo, reactID = m.Room, m.ID
+			reactTo = m.Room
 		}
-		b.dispatchCommentary(body, m.Nick, m.Room, m.RealJID, reactTo, reactID)
+		b.dispatchCommentary(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID)
 	case actionAmbient:
 		b.bufferAmbient(m.Nick, m.Body)
 	}
@@ -1183,7 +1186,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Instead of a jid you may write \"to: <stanza-id>\" — a message's \"stanza-id:\" value — which sends to that message's author AND marks your text as a reply to it, so the owner can see which message you answered; use it whenever you answer one of several messages. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -1219,8 +1222,10 @@ func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender
 			fmt.Fprintf(&sb, "sender: %s\n", sender)
 		}
 	}
-	// Include the stanza ID and target JID so the agent can pass them to
-	// send_reaction as messageId and from-JID respectively.
+	// Include the stanza ID so the agent can name this message later — as
+	// send_reaction's messageId, or as a "to: <stanza-id>" reply route (#54).
+	// react-to is the reaction target jid, and appears only when reactions are
+	// enabled for this channel.
 	if reactID != "" {
 		fmt.Fprintf(&sb, "stanza-id: %s\n", reactID)
 		if reactTo != "" {
@@ -1635,6 +1640,21 @@ func (b *Bridge) deliverReply(text string) bool {
 		b.rejectReply(leading, "this text came before the first \"to:\" line, so it had no destination")
 	}
 	for _, s := range segs {
+		// A stanza-id route (#54) names the message to answer. Resolve it to
+		// that message's author, then continue through the unchanged
+		// classifyDest path — a room message records "room@muc/nick", which
+		// bareJid collapses to the room, and the reply stamp keeps the occupant
+		// jid so the client can attribute it.
+		var reply *replyTarget
+		if s.replyTo != "" {
+			author := b.xmpp.lookupMessage(s.replyTo)
+			if author == "" {
+				b.rejectReply(s.body, fmt.Sprintf("%q is an unknown stanza id", s.replyTo))
+				continue
+			}
+			s.dest = bareJid(author)
+			reply = &replyTarget{author: author, id: s.replyTo}
+		}
 		// "to: noop" — the agent deliberately has nothing to send. Drop the body
 		// without emitting a stanza, and count it as having replied so the
 		// "done (no reply)" nudge doesn't turn room silence into DM noise.
@@ -1659,13 +1679,13 @@ func (b *Bridge) deliverReply(text string) bool {
 		if s.body != "" {
 			var stanzaID string
 			if kind == destRoom {
-				stanzaID = b.xmpp.SendRoomTo(bareJid(s.dest), s.body)
+				stanzaID = b.xmpp.SendRoomReply(bareJid(s.dest), s.body, reply)
 				// A mistyped mention — or a self-tag — is inert: it addresses
 				// nobody and reports nothing, so the sender believes the
 				// handoff landed.
 				b.warnHandleProblems(bareJid(s.dest), s.body)
 			} else {
-				stanzaID = b.xmpp.SendChatTo(s.dest, s.body)
+				stanzaID = b.xmpp.SendChatReply(s.dest, s.body, reply)
 			}
 			// A message routed successfully — any staged correction no longer
 			// applies (#16: nudge only if the FINAL message was malformed, and
@@ -1862,11 +1882,19 @@ func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
 		return false
 	}
 	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
-	// Once "to: <stanza-id>" routing lands (issue #54), the destination form
-	// below becomes the stanza id, so each outstanding reply can name the
-	// message it answers.
-	b.rpc.Prompt(fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid>\".", inbound, delivered, delivered, inbound), b.steerBehavior())
+	b.rpc.Prompt(unansweredHintText(inbound, delivered), b.steerBehavior())
 	return true
+}
+
+// unansweredHintText builds the hint prompt. Split out from fireUnansweredHint
+// so a test can read the wording without an rpc client.
+//
+// The routing form names the stanza id (#54): this hint fires exactly when
+// several messages are in play, which is the case a bare jid cannot
+// disambiguate. An id both routes the reply and marks it as a reply to the
+// message it answers, so the owner can see which one each reply is for.
+func unansweredHintText(inbound, delivered int) string {
+	return fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid|stanza-id>\" — prefer the \"stanza-id:\" value of the message you are answering, so each reply is marked as a reply to it.", inbound, delivered, delivered, inbound)
 }
 
 // bumpHintNudge consumes one unit of the per-turn hint budget.
@@ -1933,17 +1961,20 @@ func (b *Bridge) bumpRoutingNudge() bool {
 
 func (b *Bridge) resetRoutingNudges() { b.mu.Lock(); b.routingNudges = 0; b.mu.Unlock() }
 
-// replySegment is one routed chunk of an agent reply: a destination jid and the
-// text to send there.
+// replySegment is one routed chunk of an agent reply: a destination and the
+// text to send there. Exactly one of dest and replyTo is set. dest is a jid (or
+// the reserved "noop"). replyTo is the stanza id of the message this segment
+// answers, which deliverReply resolves to a destination through msgHistory.
 type replySegment struct {
-	dest string
-	body string
+	dest    string
+	replyTo string
+	body    string
 }
 
-// splitReplySegments parses an agent reply into "to: <jid>" segments. A line
-// whose first token after "to:" looks like a jid (contains "@") starts a new
-// segment; other lines form the body (that line's remainder plus subsequent
-// lines up to the next "to:"). Text before the first "to:" line is returned as
+// splitReplySegments parses an agent reply into "to: <target>" segments. A line
+// whose first token after "to:" looks like a jid (contains "@"), or like a
+// stanza id, starts a new segment; other lines form the body (that line's
+// remainder plus subsequent lines up to the next "to:"). Text before the first "to:" line is returned as
 // leading (a routing error). This lets one agent output fan out to several
 // destinations.
 func splitReplySegments(text string) (segs []replySegment, leading string) {
@@ -1951,8 +1982,8 @@ func splitReplySegments(text string) (segs []replySegment, leading string) {
 	cur := -1
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if dest, inline, ok := routeLine(line); ok {
-			segs = append(segs, replySegment{dest: dest, body: inline})
+		if dest, replyTo, inline, ok := routeLine(line); ok {
+			segs = append(segs, replySegment{dest: dest, replyTo: replyTo, body: inline})
 			cur = len(segs) - 1
 			continue
 		}
@@ -1972,34 +2003,68 @@ func splitReplySegments(text string) (segs []replySegment, leading string) {
 	return segs, strings.TrimSpace(strings.Join(leadingLines, "\n"))
 }
 
-// routeLine reports whether line is a "to: <jid>" routing directive, returning
-// the jid and any inline body after it. The jid must contain "@" so ordinary
-// prose beginning with "to:" isn't mistaken for a route.
-func routeLine(line string) (dest, inline string, ok bool) {
+// routeLine reports whether line is a "to: <target>" routing directive,
+// returning what it named and any inline body after it. Three target forms are
+// accepted, and exactly one of dest and replyTo comes back set:
+//
+//	to: noop          → dest = "noop" (send nothing)
+//	to: <jid>         → dest = the jid (contains "@")
+//	to: <stanza-id>   → replyTo = the stanza id (a UUID)
+//
+// A jid must contain "@", and a stanza id must match the UUID shape, so
+// ordinary prose beginning with "to:" is not mistaken for a route.
+func routeLine(line string) (dest, replyTo, inline string, ok bool) {
 	t := strings.TrimLeft(line, " \t")
 	if len(t) < len("to:") || !strings.EqualFold(t[:len("to:")], "to:") {
-		return "", "", false
+		return "", "", "", false
 	}
 	after := strings.TrimLeft(t[len("to:"):], " \t")
-	jid := after
+	target := after
 	if i := strings.IndexAny(after, " \t"); i >= 0 {
-		jid, inline = after[:i], strings.TrimSpace(after[i:])
+		target, inline = after[:i], strings.TrimSpace(after[i:])
 	}
 	// "to: noop" is a real destination meaning "send nothing" (#20). It must be
 	// recognized here rather than falling through to the reject path, or an
 	// agent's attempt at silence would be dumped to the error room AND nudged
 	// for a resend — generating the very turn it was trying to avoid.
-	if strings.EqualFold(jid, destNoopName) {
-		return destNoopName, inline, true
+	if strings.EqualFold(target, destNoopName) {
+		return destNoopName, "", inline, true
 	}
-	if !strings.Contains(jid, "@") {
-		return "", "", false
+	// A stanza id names the message to answer, not a channel (#54). deliverReply
+	// resolves it to that message's author and stamps the outbound reply. The
+	// UUID shape is checked before the "@" test: a UUID has no "@", so this form
+	// is purely additive and no routing line that works today changes meaning.
+	if isStanzaID(target) {
+		return "", target, inline, true
 	}
-	return jid, inline, true
+	if !strings.Contains(target, "@") {
+		return "", "", "", false
+	}
+	return target, "", inline, true
 }
 
 // destNoopName is the reserved "discard this segment" routing destination.
 const destNoopName = "noop"
+
+// stanzaIDRe matches the two stanza-id shapes a routing line can name.
+//
+// The first is the strict 8-4-4-4-12 hex UUID that most clients put on a
+// message, and the shape #54 specifies. The second is pi-msg's own format:
+// newStanzaID emits 16 bare hex characters, so an id the bridge generated would
+// never match a UUID pattern.
+//
+// Both alternatives are checked in full, and a partial id matches neither. That
+// is on purpose: the recorded tradeoff on #54 is that a mistyped id costs the
+// message, so a wrong id is loud rather than quietly mis-delivered. Widening
+// the shape does not weaken that — an id of the right shape that names no
+// recorded message still takes the reject path.
+//
+// A client whose ids match neither shape cannot be answered by id. If that
+// turns up in practice, the fix is to widen this pattern, not to guess.
+var stanzaIDRe = regexp.MustCompile(`^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16})$`)
+
+// isStanzaID reports whether s has the shape of a stanza id.
+func isStanzaID(s string) bool { return stanzaIDRe.MatchString(s) }
 
 func (b *Bridge) handleModel(arg string) {
 	if arg == "" {
@@ -2409,12 +2474,20 @@ func streamTypingTarget(buf string, xm *XMPPBridge) (target string, decided bool
 	for i := 0; i < end; i++ {
 		l := lines[i]
 		l = strings.TrimRight(l, "\r")
-		dest, _, ok := routeLine(l)
+		dest, replyTo, _, ok := routeLine(l)
 		if !ok {
 			continue
 		}
 		if strings.EqualFold(dest, destNoopName) {
 			return "", true
+		}
+		// A stanza-id route lights the composer only if the id resolves; an
+		// unknown id is a routing failure, and a failure never types.
+		if replyTo != "" {
+			dest = xm.lookupMessage(replyTo)
+			if dest == "" {
+				return "", true
+			}
 		}
 		if xm.classifyDest(dest) == destUser {
 			return bareJid(dest), true

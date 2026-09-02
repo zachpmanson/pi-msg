@@ -219,9 +219,12 @@ func TestRouteLineNoop(t *testing.T) {
 		{"to: nooperator", "", "", false},            // must be exactly "noop"
 	}
 	for _, c := range cases {
-		dest, inline, ok := routeLine(c.in)
+		dest, replyTo, inline, ok := routeLine(c.in)
 		if ok != c.ok || dest != c.dest || inline != c.inline {
 			t.Errorf("routeLine(%q) = (%q,%q,%v), want (%q,%q,%v)", c.in, dest, inline, ok, c.dest, c.inline, c.ok)
+		}
+		if replyTo != "" {
+			t.Errorf("routeLine(%q) set replyTo = %q, want empty", c.in, replyTo)
 		}
 	}
 }
