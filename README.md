@@ -54,9 +54,12 @@ sequenceDiagram
   agent can read the new question before it writes the answer to the previous
   one, and then never write it. When a run takes in more messages than it sends
   replies, the bridge asks it once per turn to check for messages that still
-  need an answer. The agent replies with those answers, or with `to: noop` if it
-  already covered everything. `to: noop` counts as an answer, so deliberate
-  silence is never flagged.
+  need an answer. The hint asks for `to: <jid|stanza-id>` and prefers the
+  stanza id, which is exactly the case a bare JID cannot disambiguate: an id
+  both routes the reply and marks it as a reply to the message it answers. The
+  agent replies with those answers, or with `to: noop` if it already covered
+  everything. `to: noop` counts as an answer, so deliberate silence is never
+  flagged.
 - Messages you send are acknowledged with a single **read receipt** — a XEP-0333
   chat marker (`displayed`) — when the agent takes them in, if your client requests it.
 - Your chat messages → routed to Pi:

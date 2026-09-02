@@ -207,6 +207,24 @@ func TestStreamTypingTargetStanzaID(t *testing.T) {
 	}
 }
 
+// The unanswered-message hint fires exactly when several messages are in play,
+// which is the case a bare jid cannot disambiguate. It must offer the stanza-id
+// form, and keep "to: noop" as the way to say the replies already covered
+// everything.
+func TestUnansweredHintOffersStanzaID(t *testing.T) {
+	got := unansweredHintText(5, 1)
+	for _, want := range []string{
+		"Received 5 messages but sent 1 replies",
+		`"to: <jid|stanza-id>"`,
+		`"stanza-id:"`,
+		`"to: noop"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("hint is missing %s:\n%s", want, got)
+		}
+	}
+}
+
 // The stanza id is the handle for reply routing, so it must reach the agent in
 // every room turn — not only when XEP-0444 reactions happen to be enabled.
 func TestStanzaIDSurfacedWithoutRoomReactions(t *testing.T) {

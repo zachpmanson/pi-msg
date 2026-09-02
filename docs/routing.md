@@ -131,6 +131,19 @@ Routing failures are handled by rejection + a bounded corrective:
   prompts the agent to resend with a valid `to:` line — bounded to
   `maxRoutingNudges` per user turn.
 
+## Unanswered-message hint
+
+A message that arrives mid-run is injected as a steer, so the agent can read it
+before it writes the answer to the previous one, and then never write that
+answer. When a run takes in two or more messages and sends fewer replies,
+`fireUnansweredHint` asks the agent once per user turn to check for messages
+that still need an answer.
+
+The hint asks for `to: <jid|stanza-id>` and prefers the stanza id. This is
+exactly the case a bare jid cannot disambiguate: several messages are in play,
+and only the id says which one a reply is for. `to: noop` is the explicit way
+for the agent to say its replies already covered everything.
+
 ## On-start seed
 
 At the start of a **fresh** session (startup with no session to resume, or

@@ -1882,11 +1882,19 @@ func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
 		return false
 	}
 	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
-	// Once "to: <stanza-id>" routing lands (issue #54), the destination form
-	// below becomes the stanza id, so each outstanding reply can name the
-	// message it answers.
-	b.rpc.Prompt(fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid>\".", inbound, delivered, delivered, inbound), b.steerBehavior())
+	b.rpc.Prompt(unansweredHintText(inbound, delivered), b.steerBehavior())
 	return true
+}
+
+// unansweredHintText builds the hint prompt. Split out from fireUnansweredHint
+// so a test can read the wording without an rpc client.
+//
+// The routing form names the stanza id (#54): this hint fires exactly when
+// several messages are in play, which is the case a bare jid cannot
+// disambiguate. An id both routes the reply and marks it as a reply to the
+// message it answers, so the owner can see which one each reply is for.
+func unansweredHintText(inbound, delivered int) string {
+	return fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If some things outstanding reply to them now using \"to: <jid|stanza-id>\" — prefer the \"stanza-id:\" value of the message you are answering, so each reply is marked as a reply to it.", inbound, delivered, delivered, inbound)
 }
 
 // bumpHintNudge consumes one unit of the per-turn hint budget.
