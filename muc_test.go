@@ -119,7 +119,7 @@ func TestAmbientCap(t *testing.T) {
 }
 
 func TestComposePrompt(t *testing.T) {
-	b := roomBridge() // owner zach@x.com, room team@muc.x.com
+	b := roomBridge()      // owner zach@x.com, room team@muc.x.com
 	b.routingSeeded = true // this test exercises the non-seeding path
 
 	// Owner DM turn: "from:" is the owner, body follows directly (no sender
@@ -157,19 +157,19 @@ func TestRoutingSeedOnce(t *testing.T) {
 	b := roomBridge() // room-mode account
 	// First prompt seeds the contract (once); room-mode only.
 	got1 := b.composePrompt("go", true, "", "team@muc.x.com", "zach@x.com", "", "")
-	if !strings.Contains(got1, "routing (pi-msg)") {
+	if !strings.Contains(got1, "[pi-msg: routing:") {
 		t.Errorf("first prompt should seed the routing contract: %q", got1)
 	}
 	// Subsequent prompts must NOT re-seed.
 	got2 := b.composePrompt("again", true, "", "team@muc.x.com", "zach@x.com", "", "")
-	if strings.Contains(got2, "routing (pi-msg)") {
+	if strings.Contains(got2, "[pi-msg: routing:") {
 		t.Errorf("second prompt re-seeded the contract: %q", got2)
 	}
 
 	// A non-room (1:1) account never seeds.
 	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
 	got := b1.composePrompt("hi", true, "", "zach@x.com", "", "", "")
-	if strings.Contains(got, "routing (pi-msg)") {
+	if strings.Contains(got, "[pi-msg: routing:") {
 		t.Errorf("1:1 account should not seed the routing contract: %q", got)
 	}
 }
@@ -186,7 +186,7 @@ func TestInitialPromptCompose(t *testing.T) {
 	// fresh session), so the first prompt seeds the routing contract once.
 	b := roomBridge()
 	got := b.composePrompt(task, true, "", b.acct.Owner, "", "", "")
-	if !strings.Contains(got, "routing (pi-msg)") {
+	if !strings.Contains(got, "[pi-msg: routing:") {
 		t.Errorf("fresh room-mode initial prompt should seed the routing contract: %q", got)
 	}
 	if !strings.Contains(got, "from: zach@x.com") {

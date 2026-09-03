@@ -178,6 +178,23 @@ In 1:1 mode the hint asks for no routing line at all — that account parses non
 so the literal text would reach the owner. It asks for the outstanding answers
 and offers `to: noop`, which works in both modes.
 
+## Marking bridge text: `[pi-msg: <topic>: …]`
+
+Every prompt or block the bridge injects is wrapped in one square-bracket pair
+and labelled, so the agent can always tell bridge text from a person's words:
+
+```
+[pi-msg: routing: …]      the session seed, the routing nudge, the mention warning
+[pi-msg: muc: …]          the ambient buffer, the untrusted-commentary label
+[pi-msg: unanswered: …]   the unanswered-message hint
+[pi-msg: recovery: …]     the empty-tail recovery prompt
+[pi-msg: reaction: …]     an inbound XEP-0444 reaction
+[pi-msg: startup: …]      the resume volunteer turn
+```
+
+The stderr log uses `[pi-msg] <level>: <message>`, which is a different thing:
+it never reaches the agent.
+
 ## On-start seed
 
 At the start of a **fresh** session (startup with no session to resume, or
