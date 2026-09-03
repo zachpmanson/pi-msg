@@ -58,6 +58,12 @@ export default function xmppTools(pi: ExtensionAPI) {
 	const PROCESS_STARTED = "processes:started";
 	const PROCESS_ENDED = "processes:ended";
 	const PROCESS_LIST = "processes:request:list";
+	const PROCESS_CHANGED = "processes:changed";
+
+	// Live process statuses, mirroring pi-processes' LIVE_STATUSES: the manager
+	// keeps finished/killed entries in its registry until cleared, so counting
+	// every entry would report dnd for processes that are no longer running.
+	const LIVE_STATUSES = new Set(["running", "terminating", "terminate_timeout"]);
 
 	// queryProcessCount asks the pi-processes manager for its current process
 	// list over the in-process request channel (its reply is synchronous).
@@ -72,7 +78,16 @@ export default function xmppTools(pi: ExtensionAPI) {
 				}
 			};
 			pi.events.emit(PROCESS_LIST, {
-				reply: (processes: unknown) => done(Array.isArray(processes) ? processes.length : 0),
+				reply: (processes: unknown) => {
+					if (!Array.isArray(processes)) {
+						done(0);
+						return;
+					}
+					const live = processes.filter(
+						(p) => p !== null && typeof p === "object" && LIVE_STATUSES.has((p as { status?: string }).status ?? ""),
+					).length;
+					done(live);
+				},
 			});
 			setTimeout(() => done(0), 500);
 		});
@@ -92,6 +107,12 @@ export default function xmppTools(pi: ExtensionAPI) {
 		void refreshProcessCount();
 	});
 	pi.events.on(PROCESS_ENDED, () => {
+		void refreshProcessCount();
+	});
+	// processes:changed fires on clear/rename — anything that alters the list
+	// without a start/end (e.g. the agent clearing finished entries), so the
+	// presence corrects itself instead of staying dnd on a stale count.
+	pi.events.on(PROCESS_CHANGED, () => {
 		void refreshProcessCount();
 	});
 
