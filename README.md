@@ -54,11 +54,14 @@ sequenceDiagram
   agent can read the new question before it writes the answer to the previous
   one, and then never write it. When a run takes in more messages than it sends
   replies, the bridge asks it once per turn to check for messages that still
-  need an answer. The hint asks for `to: <jid|stanza-id>` and prefers the
-  stanza id, which is exactly the case a bare JID cannot disambiguate: an id
-  both routes the reply and marks it as a reply to the message it answers. The
-  agent answers them all in that one turn, with several `to:` lines, or replies
-  `to: noop` if it already covered everything. The run that answers a hint is
+  need an answer. The hint carries the run's chat history — every message in and
+  every reply out, in order, each with its stanza id — because the agent cannot
+  see the XMPP traffic and the bare counts leave it guessing which message it
+  missed. The hint asks for `to: <jid|stanza-id>`: an id both routes the reply
+  and marks it as a reply to the message it answers. The agent answers them all
+  in that one turn, with several `to:` lines, or replies `to: noop` if it already
+  covered everything. Each `to:` segment counts as one answer, so a single reply
+  that fans out to three people is not mistaken for one unanswered message. The run that answers a hint is
   never hinted about in turn. `to: noop` counts as an answer, so deliberate
   silence is never flagged.
 - Messages you send are acknowledged with a single **read receipt** — a XEP-0333
@@ -169,7 +172,8 @@ And **every** agent reply must begin with a `to:` line naming its destination:
 - `to: <room jid>` → the group chat (groupchat)
 - `to: <owner or occupant jid>` → that person, 1:1
 - `to: <stanza-id>` → the author of that message, with the reply **stamped** to it
-- `to: noop` → send nothing (deliberate silence)
+- `to: noop` → send nothing (deliberate silence); the only `to:` form a pure
+  1:1 account parses, and it must be the reply's first line
 
 One reply may contain **several `to:` blocks** — each `to:` line starts a new message, so
 the agent can fan a single turn out to multiple destinations:

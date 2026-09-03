@@ -44,11 +44,16 @@ Rules:
 
 ### Choosing a destination
 
-- **Answer a specific message** — the prompt's `stanza-id:` value (see below).
+The jid forms are the default. Use a stanza id only when a bare jid does not
+say which message a reply answers — several outstanding messages from the same
+room or person.
+
 - **Reply where the message came from** — the prompt's `from:` JID.
 - **DM the person who sent it** — the prompt's `sender:` JID (room messages).
 - **Reach the owner** — `to: <owner-jid>` (per-account `owner` in config).
 - **A joined room** → groupchat; the owner or a known occupant → `1:1` chat.
+- **Answer one message out of several** — the prompt's `stanza-id:` value (see
+  below).
 
 ### Answering one message: `to: <stanza-id>`
 
@@ -105,6 +110,13 @@ XEP-0359. The model knows which message it answers, so it names one.
 - Sends **no stanza** at all.
 - Counts as having replied, so the "done (no reply)" nudge does not turn room
   silence into owner DM noise.
+- Discards any body that follows it.
+- Works in **1:1 mode too** (`leadingNoop`), which parses no other `to:` form.
+  A 1:1 account has no routing contract, but it still needs a way to say
+  "nothing to send": without one, a deliberate silence looks like a reply that
+  went missing, and the empty-tail recovery and the unanswered-message hint both
+  argue with it. Only the **first non-empty line** routes — a `to: noop` further
+  down a 1:1 reply is ordinary text and is sent as written.
 
 ### Addressing other agents in a room
 
@@ -139,10 +151,26 @@ answer. When a run takes in two or more messages and sends fewer replies,
 `fireUnansweredHint` asks the agent once per user turn to check for messages
 that still need an answer.
 
-The hint asks for `to: <jid|stanza-id>` and prefers the stanza id. This is
-exactly the case a bare jid cannot disambiguate: several messages are in play,
-and only the id says which one a reply is for. `to: noop` is the explicit way
-for the agent to say its replies already covered everything.
+`recordDelivery` counts one answer per **delivered segment**, not per assistant
+message. One reply with three `to:` lines is three answers. Counting it as one
+made a run that answered every message look unbalanced, and the hint then fired
+for work that was already done.
+
+The hint prints the run's chat history: every message that came in and every
+reply that went out, in arrival order, each with its stanza id. The agent cannot
+see the XMPP traffic, so the two counts alone ("3 in, 2 out") leave it to
+reconstruct the run from its own context, and it gets that wrong. The history
+turns the check into a comparison. A long body is excerpted to its first few
+words (`hintExcerpt`); a `to: noop` shows as a deliberate silence.
+
+The hint asks for `to: <jid|stanza-id>`. Here a stanza id is the useful form:
+several messages are in play, and only the id says which one a reply is for.
+`to: noop` is the explicit way for the agent to say its replies already covered
+everything.
+
+In 1:1 mode the hint asks for no routing line at all — that account parses none,
+so the literal text would reach the owner. It asks for the outstanding answers
+and offers `to: noop`, which works in both modes.
 
 ## On-start seed
 

@@ -82,7 +82,12 @@ type Bridge struct {
 	// Comparing the two counts at settle catches exactly that.
 	runInbound    int
 	runDeliveries int
-	hintNudges    int // unanswered-message hints sent this user turn (bounded)
+	// runLog records the same traffic as the two counters, in arrival order,
+	// so the unanswered-message hint can show the agent what the run actually
+	// received and sent. The counters alone say "3 in, 2 out" and leave the
+	// agent to guess which message went unanswered.
+	runLog     []runLogEntry
+	hintNudges int // unanswered-message hints sent this user turn (bounded)
 	// hintPending marks the run the agent starts in answer to a hint. That run
 	// must never be hinted about in turn: the agent has just been asked to catch
 	// up, so whatever it sends IS the catch-up. Hinting again would ask it to
@@ -404,7 +409,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// judged normally again.
 		if !recovering && !b.takeHintPending() {
 			if n, m, ok := b.unansweredRun(); ok {
-				recovering = b.fireUnansweredHint(n, m)
+				recovering = b.fireUnansweredHint(n, m, b.runLogSnapshot())
 			}
 		}
 		// The counts belong to the run that just ended, whatever we decided.
@@ -458,7 +463,6 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		if b.deliverReply(text) {
 			b.setReplied(true)
 			b.clearToolSinceDelivery()
-			b.countDelivery()
 		}
 	case "extension_error":
 		b.reply("⚠️ extension error: " + orUnknown(ev.Str("error")))
@@ -619,7 +623,7 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	if m.Direct {
 		// Owner 1:1: origin is the owner; no separate sender. The reaction target
 		// is this message (routed to its full from-JID).
-		b.handleCanonical(m.Body, b.acct.Owner, "", m.From, m.ID)
+		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID)
 		return
 	}
 	b.handleRoom(m)
@@ -718,7 +722,7 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 		if b.acct.RoomReactions {
 			reactTo = m.Room
 		}
-		b.handleCanonical(body, m.Room, m.RealJID, reactTo, m.ID)
+		b.handleCanonical(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID)
 	case actionCommentary:
 		reactTo := ""
 		if b.acct.RoomReactions {
@@ -730,11 +734,29 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	}
 }
 
+// senderName picks the name that identifies a message's sender in the
+// unanswered-message hint's history: the room nick when there is one, else the
+// local part of the sender's jid, else of the jid the message arrived on.
+func senderName(nick, sender, origin string) string {
+	if nick != "" {
+		return nick
+	}
+	if n := localpart(sender); n != "" {
+		return n
+	}
+	if n := localpart(origin); n != "" {
+		return n
+	}
+	return "user"
+}
+
 // handleCanonical handles a trusted (owner / 1:1) message: control commands
 // dispatch directly; anything else becomes a canonical prompt. origin is the
 // jid the message arrived on (owner or room); sender is the individual (room
-// only), both surfaced to the agent for explicit reply routing.
-func (b *Bridge) handleCanonical(text, origin, sender, reactTo, reactID string) {
+// only), both surfaced to the agent for explicit reply routing. nick is the
+// sender's occupant nick in a room, "" in a 1:1 — it only names the sender in
+// the unanswered-message hint's history.
+func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID string) {
 	t := strings.TrimSpace(text)
 	if t == "" {
 		return
@@ -746,7 +768,7 @@ func (b *Bridge) handleCanonical(text, origin, sender, reactTo, reactID string) 
 	// and remember where a reply (or tool-driven file) should go by default.
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
-	b.countInbound()
+	b.countInbound(senderName(nick, sender, origin), reactID, t)
 	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
@@ -761,7 +783,7 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 	}
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
-	b.countInbound()
+	b.countInbound(senderName(nick, sender, origin), reactID, t)
 	b.rpc.Prompt(b.composePrompt(t, false, nick, origin, sender, reactID, reactTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
@@ -1204,7 +1226,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid>\" naming where it goes. Reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Instead of a jid you may write \"to: <stanza-id>\" — a message's \"stanza-id:\" value — which sends to that message's author AND marks your text as a reply to it, so the owner can see which message you answered; use it whenever you answer one of several messages. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when a bare jid does not show which message you answer: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -1634,6 +1656,16 @@ func (b *Bridge) reply(text string) {
 func (b *Bridge) deliverReply(text string) bool {
 	delivered := false
 	if !b.acct.RoomMode() {
+		// A 1:1 account has no routing contract, but "to: noop" still works: it
+		// is the only way the agent can say "I have nothing to send" without the
+		// run looking like a reply that went missing. As in room mode, the body
+		// after it is discarded.
+		if leadingNoop(text) {
+			b.log("notice", "agent chose silence (to: noop)")
+			b.setReplied(true)
+			b.recordDelivery("", "")
+			return true
+		}
 		// Deliberate reactions are the send_reaction tool's job now; a 1:1 reply
 		// is just its text.
 		if strings.TrimSpace(text) != "" {
@@ -1642,6 +1674,7 @@ func (b *Bridge) deliverReply(text string) bool {
 			// send_reaction calls target the agent's own message.
 			if stanzaID != "" {
 				b.setReactTarget(b.acct.Owner, stanzaID)
+				b.recordDelivery(stanzaID, text)
 				delivered = true
 			}
 		}
@@ -1684,6 +1717,7 @@ func (b *Bridge) deliverReply(text string) bool {
 			b.log("notice", "agent chose silence (to: noop)")
 			b.clearPendingNudge()
 			b.setReplied(true)
+			b.recordDelivery("", "")
 			// Deliberate silence IS an answer: it must not look like a run that
 			// died before writing one, or the recovery would argue with it.
 			delivered = true
@@ -1710,6 +1744,7 @@ func (b *Bridge) deliverReply(text string) bool {
 			// "a later message routed fine" discards the staged nudge).
 			if stanzaID != "" {
 				b.clearPendingNudge()
+				b.recordDelivery(stanzaID, s.body)
 				delivered = true
 			}
 			// Update reaction target to the last-segment message so subsequent
@@ -1852,12 +1887,76 @@ func (b *Bridge) resetTailNudges() { b.mu.Lock(); b.tailNudges = 0; b.mu.Unlock(
 // maxHintNudges bounds how many unanswered-message hints we send per user turn.
 const maxHintNudges = 1
 
+// runLogEntry is one line of the current run's chat history: a message that
+// came in, or a reply that went out. The stanza id is the handle the agent
+// needs to answer that exact message ("to: <stanza-id>").
+type runLogEntry struct {
+	who  string // display name: the sender's nick for inbound, our own nick for a reply
+	id   string // stanza id of the message ("" when the send reported none)
+	text string // short excerpt of the body ("" for a deliberate silence)
+	sent bool   // true for the agent's own reply
+}
+
+// line renders the entry for the hint's history block.
+func (e runLogEntry) line() string {
+	id := e.id
+	if id == "" {
+		id = "(no id)"
+	}
+	if e.text == "" {
+		return fmt.Sprintf("%s: %s (deliberate silence, to: noop)", e.who, id)
+	}
+	return fmt.Sprintf("%s: %s %q", e.who, id, e.text)
+}
+
 // countInbound records that a chat message entered the current run. Called for
 // the message that starts a run and for every steer that lands while it runs.
-func (b *Bridge) countInbound() { b.mu.Lock(); b.runInbound++; b.mu.Unlock() }
+// who/id/text describe the message for the hint's history block.
+func (b *Bridge) countInbound(who, id, text string) {
+	b.mu.Lock()
+	b.runInbound++
+	b.runLog = append(b.runLog, runLogEntry{who: who, id: id, text: hintExcerpt(text)})
+	b.mu.Unlock()
+}
 
-// countDelivery records that a reply reached a destination in the current run.
-func (b *Bridge) countDelivery() { b.mu.Lock(); b.runDeliveries++; b.mu.Unlock() }
+// recordDelivery records one answer that reached its destination: a sent
+// stanza, or a "to: noop" (deliberate silence is an answer). It also adds the
+// reply to the run's history, so only deliverReply calls it — nothing else
+// knows the stanza ids.
+//
+// It counts per SEGMENT, not per assistant message. One message can carry
+// several "to:" lines that fan out to several people, and counting that as a
+// single reply made a run that answered every message look unbalanced, which
+// fired the unanswered-message hint for work that was already done.
+func (b *Bridge) recordDelivery(id, text string) {
+	b.mu.Lock()
+	b.runDeliveries++
+	b.runLog = append(b.runLog, runLogEntry{who: b.acct.Nick, id: id, text: hintExcerpt(text), sent: true})
+	b.mu.Unlock()
+}
+
+// runLogSnapshot copies the run's history for the hint.
+func (b *Bridge) runLogSnapshot() []runLogEntry {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]runLogEntry(nil), b.runLog...)
+}
+
+// hintExcerpt shortens a body to its first few words on one line, so the hint's
+// history identifies a message without repeating it in full.
+func hintExcerpt(text string) string {
+	s := strings.Join(strings.Fields(text), " ")
+	const max = 48
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	cut := string(r[:max])
+	if i := strings.LastIndex(cut, " "); i > 0 {
+		cut = cut[:i]
+	}
+	return cut + "…"
+}
 
 // resetRunCounts clears the per-run message/reply tally. Called at settle,
 // AFTER the decision, and on an aborted run.
@@ -1869,6 +1968,7 @@ func (b *Bridge) resetRunCounts() {
 	b.mu.Lock()
 	b.runInbound = 0
 	b.runDeliveries = 0
+	b.runLog = nil
 	b.mu.Unlock()
 }
 
@@ -1895,18 +1995,24 @@ func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
 // The hint is a prompt, not a chat message: it never reaches the owner. The
 // agent answers it with real replies, or with "to: noop" if it already covered
 // everything — so a correctly-handled run costs one cheap turn and no noise.
-func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
+func (b *Bridge) fireUnansweredHint(inbound, delivered int, history []runLogEntry) bool {
 	if !b.bumpHintNudge() {
 		return false
 	}
 	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
-	b.rpc.Prompt(unansweredHintText(inbound, delivered), b.steerBehavior())
+	b.rpc.Prompt(unansweredHintText(inbound, delivered, history, b.acct.RoomMode()), b.steerBehavior())
 	b.markHintPending()
 	return true
 }
 
 // unansweredHintText builds the hint prompt. Split out from fireUnansweredHint
 // so a test can read the wording without an rpc client.
+//
+// The counts alone ("3 in, 2 out") do not tell the agent WHICH message it
+// missed: it cannot see the XMPP traffic, so it has to reconstruct the run from
+// its own context and gets it wrong. The hint therefore prints the run's chat
+// history — every message in and every reply out, in order, each with its
+// stanza id — and the agent matches its replies against it.
 //
 // The routing form names the stanza id (#54): this hint fires exactly when
 // several messages are in play, which is the case a bare jid cannot
@@ -1916,8 +2022,29 @@ func (b *Bridge) fireUnansweredHint(inbound, delivered int) bool {
 // It also names the multi-destination form: the hint asks for every outstanding
 // reply, and several "to:" lines in one reply fan out, so the agent can clear
 // the whole backlog in the single turn the hint buys it.
-func unansweredHintText(inbound, delivered int) string {
-	return fmt.Sprintf("Received %d messages but sent %d replies. If your %d replies addressed all %d messages reply to this with \"to: noop\". If anything is outstanding reply to them now using \"to: <jid|stanza-id>\" — prefer the \"stanza-id:\" value of the message you are answering, so each reply is marked as a reply to it. Several \"to:\" lines in one reply fan out to different destinations, so you can answer every outstanding message in this one turn.", inbound, delivered, delivered, inbound)
+func unansweredHintText(inbound, delivered int, history []runLogEntry, roomMode bool) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "[pi-msg] You received %d messages but sent %d replies. Make sure that your replies addressed all %d received messages.", inbound, delivered, inbound)
+	if len(history) > 0 {
+		sb.WriteString(" Here is this run's chat history in XMPP, in order, with the stanza id of each message:\n\n")
+		for _, e := range history {
+			sb.WriteString(e.line())
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString(" ")
+	}
+	if roomMode {
+		sb.WriteString("If anything is outstanding reply to it now using \"to: <jid|stanza-id>\" — a stanza id from the history above routes the reply to that message's author AND marks it as a reply to that exact message. Several \"to:\" lines in one reply fan out to different destinations, so you can answer every outstanding message in this one turn. ")
+	} else {
+		// A 1:1 account parses no "to: <destination>" line, so asking for one
+		// would put the literal text in front of the owner. Only "to: noop"
+		// works here (leadingNoop).
+		sb.WriteString("If anything is outstanding answer it now — you can answer every outstanding message in this one reply. ")
+	}
+	sb.WriteString("If your replies covered everything the user wanted already, reply with \"to: noop\" and nothing else.")
+	return sb.String()
 }
 
 // markHintPending records that the next run answers a hint.
@@ -1954,9 +2081,10 @@ func (b *Bridge) fireTailRecovery() bool {
 	}
 	b.log("notice", "run ended on a tool call with no reply: asking the agent to write it")
 	// A pure 1:1 account has no routing contract, so don't ask it for a "to:"
-	// line it must not write.
+	// line it must not write. "to: noop" is the exception: it works in both
+	// modes (leadingNoop), and it is how the agent declines to say anything.
 	const base = "Your last run ended after a tool call without writing any reply, so nothing was delivered to the chat. The tool result is above. Write the reply now."
-	prompt := base
+	prompt := fmt.Sprintf("%s If you truly have nothing to say, reply with \"to: noop\" and nothing else.", base)
 	if b.acct.RoomMode() {
 		prompt = fmt.Sprintf("%s Begin it with a \"to: <jid>\" line (e.g. \"to: %s\" for the owner). If you truly have nothing to say, reply with \"to: noop\".", base, b.acct.Owner)
 	}
@@ -2077,6 +2205,20 @@ func routeLine(line string) (dest, replyTo, inline string, ok bool) {
 		return "", "", "", false
 	}
 	return target, "", inline, true
+}
+
+// leadingNoop reports whether text's first non-empty line is a "to: noop"
+// routing line. Used in 1:1 mode, which parses no other routing form: any other
+// text is an ordinary reply and is sent as written.
+func leadingNoop(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		dest, _, _, ok := routeLine(strings.TrimRight(line, "\r"))
+		return ok && strings.EqualFold(dest, destNoopName)
+	}
+	return false
 }
 
 // destNoopName is the reserved "discard this segment" routing destination.
@@ -2897,7 +3039,7 @@ func (b *Bridge) replayInbound() {
 		b.reply(fmt.Sprintf("Back online, catching up on %d messages", len(msgs)))
 		for _, m := range msgs {
 			if m.Direct {
-				b.handleCanonical(m.Body, b.acct.Owner, "", m.From, m.ID)
+				b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID)
 			} else {
 				b.handleRoom(m)
 			}
