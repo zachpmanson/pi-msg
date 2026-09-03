@@ -772,9 +772,9 @@ func TestUnansweredRunCounts(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
 	// The live A–E burst: 5 messages in, 1 reply out.
 	for range 5 {
-		b.countInbound()
+		b.countInbound("zach", "", "hello")
 	}
-	b.countDelivery()
+	b.recordDelivery("id-r", "answered")
 	in, out, ok := b.unansweredRun()
 	if !ok || in != 5 || out != 1 {
 		t.Errorf("A–E burst = (%d,%d,%v), want (5,1,true)", in, out, ok)
@@ -782,8 +782,8 @@ func TestUnansweredRunCounts(t *testing.T) {
 	// Every message answered → silent.
 	b.resetRunCounts()
 	for range 3 {
-		b.countInbound()
-		b.countDelivery()
+		b.countInbound("zach", "", "hello")
+		b.recordDelivery("id-r", "answered")
 	}
 	if _, _, ok := b.unansweredRun(); ok {
 		t.Error("a run that answered every message must not hint")
@@ -791,14 +791,14 @@ func TestUnansweredRunCounts(t *testing.T) {
 	// A single unanswered message is the empty-tail case, not this one: the
 	// "done (no reply)" banner and the tail recovery already cover it.
 	b.resetRunCounts()
-	b.countInbound()
+	b.countInbound("zach", "", "hello")
 	if _, _, ok := b.unansweredRun(); ok {
 		t.Error("a single-message run must not hint")
 	}
 	// Volunteer and reaction-ack runs stay quiet even when unbalanced.
 	b.resetRunCounts()
-	b.countInbound()
-	b.countInbound()
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
 	b.volunteered = true
 	if _, _, ok := b.unansweredRun(); ok {
 		t.Error("a volunteer run must not hint")
@@ -832,18 +832,65 @@ func TestUnansweredHintBounded(t *testing.T) {
 // tally, so a run the agent answered with "to: noop" is never nagged.
 func TestNoopCountsTowardAnsweredRun(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
-	b.countInbound()
-	b.countInbound()
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
 	if !b.deliverReply("to: zach@x\n\nanswered one") {
 		// Offline, so this send reports undelivered; count it by hand to model
 		// the online case.
-		b.countDelivery()
+		b.recordDelivery("id-r", "answered")
 	}
 	if b.deliverReply("to: noop\n\nnothing more to add") {
-		b.countDelivery()
+		b.recordDelivery("id-r", "answered")
 	}
 	if _, _, ok := b.unansweredRun(); ok {
 		t.Error("a run answered with a reply plus to: noop must not hint")
+	}
+}
+
+// TestNoopWorksInOneToOne pins that a pure 1:1 account can decline to speak.
+// It has no routing contract, but "to: noop" is how the agent says "nothing to
+// send" — without it a deliberate silence looks like a reply that went missing,
+// and the bridge argues with it.
+func TestNoopWorksInOneToOne(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	if !b.deliverReply("to: noop\n\nnothing more to add") {
+		t.Error("a 1:1 \"to: noop\" must count as an answer")
+	}
+	if !b.replied() {
+		t.Error("a 1:1 \"to: noop\" must mark the run as replied")
+	}
+	if _, out, _ := b.unansweredRun(); out != 1 {
+		t.Errorf("deliveries = %d, want 1", out)
+	}
+	// Only the FIRST non-empty line routes. Prose that merely mentions the form
+	// is an ordinary reply, and offline it reaches nobody.
+	b.resetRunCounts()
+	if b.deliverReply("Sure.\nto: noop") {
+		t.Error("a \"to: noop\" after the first line must not be a route")
+	}
+	if leadingNoop("to be fair, noop is a word") {
+		t.Error("prose beginning with \"to\" must not be a route")
+	}
+}
+
+// TestFanOutCountsEachSegment pins that one reply answering several messages is
+// counted as several answers. Counting per assistant message made a run that
+// answered everything look unbalanced, and the unanswered-message hint then
+// fired for work that was already done.
+func TestFanOutCountsEachSegment(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	b.countInbound("zach", "id-a", "first question")
+	b.countInbound("zach", "id-b", "second question")
+	// Two segments in ONE message. "to: noop" is used because an offline send
+	// reaches nobody and so is not an answer.
+	if !b.deliverReply("to: noop\n\nanswer to A\nto: noop\n\nanswer to B") {
+		t.Fatal("precondition: a noop segment must deliver")
+	}
+	if _, out, _ := b.unansweredRun(); out != 2 {
+		t.Errorf("deliveries = %d, want 2 (one per \"to:\" segment)", out)
+	}
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a run that answered both messages in one reply must not hint")
 	}
 }
 
@@ -851,8 +898,8 @@ func TestNoopCountsTowardAnsweredRun(t *testing.T) {
 // the next one and fire a hint for cancelled work.
 func TestSettleClearsRunCounts(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
-	b.countInbound()
-	b.countInbound()
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
 	if _, _, ok := b.unansweredRun(); !ok {
 		t.Fatal("precondition: 2 in / 0 out should hint")
 	}
@@ -870,9 +917,9 @@ func TestHintNotRepeatedOnTheCatchUpRun(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
 	b.markHintPending() // as fireUnansweredHint does
 	// The catch-up run: even an unbalanced tally must not hint again.
-	b.countInbound()
-	b.countInbound()
-	b.countInbound()
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
 	if !b.takeHintPending() {
 		t.Fatal("the run after a hint must be marked as the catch-up run")
 	}

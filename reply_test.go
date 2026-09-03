@@ -212,16 +212,70 @@ func TestStreamTypingTargetStanzaID(t *testing.T) {
 // form, and keep "to: noop" as the way to say the replies already covered
 // everything.
 func TestUnansweredHintOffersStanzaID(t *testing.T) {
-	got := unansweredHintText(5, 1)
+	got := unansweredHintText(5, 1, nil, true)
 	for _, want := range []string{
-		"Received 5 messages but sent 1 replies",
+		"You received 5 messages but sent 1 replies",
 		`"to: <jid|stanza-id>"`,
-		`"stanza-id:"`,
 		`"to: noop"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("hint is missing %s:\n%s", want, got)
 		}
+	}
+}
+
+// A pure 1:1 account parses no "to: <destination>" line, so the hint must not
+// ask for one: the literal text would land in front of the owner. "to: noop"
+// works in both modes and stays.
+func TestUnansweredHintOneToOneWording(t *testing.T) {
+	got := unansweredHintText(3, 1, nil, false)
+	if strings.Contains(got, "jid") || strings.Contains(got, "stanza-id>") {
+		t.Errorf("the 1:1 hint must not ask for a routing line:\n%s", got)
+	}
+	if !strings.Contains(got, `"to: noop"`) {
+		t.Errorf("the 1:1 hint must still offer \"to: noop\":\n%s", got)
+	}
+}
+
+// The agent cannot see the XMPP traffic, so counts alone leave it guessing
+// which message it missed. The hint must print the run's history: each message
+// in and each reply out, with the stanza id that answers it.
+func TestUnansweredHintShowsHistory(t *testing.T) {
+	got := unansweredHintText(3, 2, []runLogEntry{
+		{who: "zach", id: "id-a", text: "check the log"},
+		{who: "zach", id: "id-b", text: "also the metrics"},
+		{who: "slippy", id: "id-c", text: "the log looks clean", sent: true},
+		{who: "zach", id: "id-d", text: "and the disk"},
+		{who: "slippy", id: "", text: "", sent: true},
+	}, true)
+	for _, want := range []string{
+		`zach: id-a "check the log"`,
+		`zach: id-b "also the metrics"`,
+		`slippy: id-c "the log looks clean"`,
+		`zach: id-d "and the disk"`,
+		"slippy: (no id) (deliberate silence, to: noop)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("history is missing %s:\n%s", want, got)
+		}
+	}
+	// The lines must stay in arrival order, or the agent cannot pair a reply
+	// with the message it answered.
+	if strings.Index(got, "id-a") > strings.Index(got, "id-d") {
+		t.Errorf("history is out of order:\n%s", got)
+	}
+}
+
+// A long message is excerpted, not repeated in full: the history is an index
+// into the run, and the messages themselves are already in the agent's context.
+func TestHintExcerptShortens(t *testing.T) {
+	long := strings.Repeat("word ", 40)
+	got := hintExcerpt(long)
+	if len([]rune(got)) > 50 || !strings.HasSuffix(got, "…") {
+		t.Errorf("excerpt = %q, want a short string ending in an ellipsis", got)
+	}
+	if got := hintExcerpt("two\nlines"); got != "two lines" {
+		t.Errorf("excerpt = %q, want the newline folded to a space", got)
 	}
 }
 
