@@ -96,6 +96,7 @@ type Bridge struct {
 	idleSince      time.Time // when the agent last became idle; zero while a run is in flight
 	awayAnnounced  bool      // the away transition has been announced this idle period
 	lastAwayStatus string    // the last pithy activity shown while away (skip repeats across periods)
+	bgProcesses    int       // background processes pi has running (relayed by the pi-processes extension)
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -388,7 +389,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setStreaming(false)
 		b.stopTyping()
 		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
-		b.xmpp.SetPresence("", "listening")
+		b.announceSettledPresence()
 		b.lifecycleReact("✅") // done
 		// The routing reminder decision happens here (issue #16): mid-run
 		// malformed commentary drops silently, and the agent is only nudged if
@@ -514,12 +515,13 @@ func (b *Bridge) handleUIRequest(ev Event) {
 // `file:` text conventions (issue #8 spike).
 func (b *Bridge) handleToolRelay(id, payload string) {
 	var cmd struct {
-		Action    string `json:"action"`
-		Emoji     string `json:"emoji"`
-		Path      string `json:"path"`
-		To        string `json:"to"`
-		MessageID string `json:"messageId"`
-		From      string `json:"from"`
+		Action       string `json:"action"`
+		Emoji        string `json:"emoji"`
+		Path         string `json:"path"`
+		To           string `json:"to"`
+		MessageID    string `json:"messageId"`
+		From         string `json:"from"`
+		ProcessCount int    `json:"count"`
 	}
 	if err := json.Unmarshal([]byte(payload), &cmd); err != nil {
 		b.log("warning", "bad tool-relay payload: "+err.Error())
@@ -585,6 +587,12 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 			}
 			b.rpc.RespondUIRelay(id, url)
 		}()
+	case "process_count":
+		// Absolute count of background processes pi has running (relayed by the
+		// pi-processes companion extension). While any run — or any background
+		// process — is in flight, the bot shows dnd instead of available.
+		b.setBgProcesses(cmd.ProcessCount)
+		b.rpc.RespondUIRelay(id, "ok")
 	default:
 		b.log("warning", "unknown tool-relay action: "+cmd.Action)
 		b.rpc.RespondUIRelay(id, "unknown tool-relay action: "+cmd.Action)
@@ -616,7 +624,7 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	b.markActive()
 	b.markIdle()
 	if !b.streaming() && b.xmpp != nil {
-		b.xmpp.SetPresence("", "listening")
+		b.announceSettledPresence()
 	}
 	// An inbound XEP-0444 reaction is an acknowledgment signal, not a
 	// conversation turn: surface it as ambient context for the agent's next
@@ -2735,7 +2743,7 @@ func (b *Bridge) settleLocally() {
 	b.setStreaming(false)
 	b.stopTyping()
 	b.markIdle()
-	b.xmpp.SetPresence("", "listening")
+	b.announceSettledPresence()
 	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
 	// Aborted or replaced run: drop the empty-tail bookkeeping so a recovery
 	// prompt can't fire for work the user already cancelled.
@@ -2795,6 +2803,51 @@ var awayActivities = []string{
 	"performing maintenance on the hourglass",
 	"re-sequencing the days of the week",
 	"mending the nets for dream-catching",
+}
+
+// setBgProcesses records the absolute number of background processes pi has
+// running, relayed by the pi-processes companion extension, and reflects it in
+// presence: while any process runs (and no agent run is in flight) the bot
+// shows dnd "background process running" instead of available, and the idle
+// watcher must not drift it to "away" mid-build. Absolute counts self-heal — a
+// missed started/ended relay is corrected by the next one.
+func (b *Bridge) setBgProcesses(n int) {
+	b.mu.Lock()
+	if n < 0 {
+		n = 0
+	}
+	changed := n != b.bgProcesses
+	b.bgProcesses = n
+	streaming := b.streamingRun
+	b.mu.Unlock()
+	if !changed || b.xmpp == nil {
+		return
+	}
+	if streaming {
+		return // a run in flight already forces dnd with its own activity label
+	}
+	b.announceSettledPresence()
+}
+
+// announceSettledPresence sets the presence of an idle agent: available +
+// "listening", unless a background process is still running, which keeps the
+// bot dnd.
+func (b *Bridge) announceSettledPresence() {
+	if b.xmpp == nil {
+		return
+	}
+	b.mu.Lock()
+	bg := b.bgProcesses
+	b.mu.Unlock()
+	if bg > 0 {
+		noun := "processes"
+		if bg == 1 {
+			noun = "process"
+		}
+		b.xmpp.SetPresence("dnd", fmt.Sprintf("waiting on %d %s", bg, noun))
+	} else {
+		b.xmpp.SetPresence("", "listening")
+	}
 }
 
 // markIdle records that the agent has settled into an idle, available state;
@@ -2878,7 +2931,8 @@ func (b *Bridge) idleTick() {
 	elapsed := time.Since(b.idleSince)
 	// Read streamingRun directly rather than via streaming(), which re-locks
 	// b.mu and would deadlock this goroutine against itself.
-	if !idle || b.streamingRun || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
+	// Background processes keep the bot dnd (never drift to away mid-build).
+	if !idle || b.streamingRun || b.bgProcesses > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
 		b.mu.Unlock()
 		return
 	}

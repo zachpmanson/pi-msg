@@ -1092,3 +1092,140 @@ func TestClearQueueOldPi(t *testing.T) {
 		t.Errorf("clearQueue() against pi < 0.84.4 = %d, want 0", got)
 	}
 }
+
+// bgBridge is a room-mode bridge with a mock XMPP bridge whose SetPresence
+// calls are observable through show/presence.
+func bgBridge() *Bridge {
+	b := roomBridge()
+	b.xmpp = &XMPPBridge{}
+	return b
+}
+
+// TestBgProcessesPresence pins the dnd-while-waiting contract: while pi has
+// background processes running and no agent run is in flight, presence shows
+// dnd with a count label; zero processes settle back to "listening".
+func TestBgProcessesPresence(t *testing.T) {
+	b := bgBridge()
+
+	// No processes: settled presence is available + listening.
+	b.announceSettledPresence()
+	if b.xmpp.show != "" || b.xmpp.presence != "listening" {
+		t.Errorf("settled with 0 processes = show %q status %q, want available \"listening\"", b.xmpp.show, b.xmpp.presence)
+	}
+
+	// A process starts: dnd with the plural label.
+	b.setBgProcesses(2)
+	if b.xmpp.show != "dnd" || b.xmpp.presence != "waiting on 2 processes" {
+		t.Errorf("2 processes = show %q status %q, want dnd \"waiting on 2 processes\"", b.xmpp.show, b.xmpp.presence)
+	}
+
+	// Singular label for exactly one process.
+	b.setBgProcesses(1)
+	if b.xmpp.presence != "waiting on 1 process" {
+		t.Errorf("1 process status = %q, want \"waiting on 1 process\"", b.xmpp.presence)
+	}
+
+	// Settling again (agent run ends) keeps dnd while a process still runs.
+	b.announceSettledPresence()
+	if b.xmpp.show != "dnd" {
+		t.Errorf("settled with 1 process = show %q, want dnd", b.xmpp.show)
+	}
+
+	// Last process ends: back to listening.
+	b.setBgProcesses(0)
+	if b.xmpp.show != "" || b.xmpp.presence != "listening" {
+		t.Errorf("0 processes after being busy = show %q status %q, want listening", b.xmpp.show, b.xmpp.presence)
+	}
+
+	// No-change relay is a no-op (SetPresence skips identical stanzas anyway,
+	// but the count must not be flipped to 0 by a stale relay).
+	b.setBgProcesses(0)
+	if b.xmpp.show != "" || b.xmpp.presence != "listening" {
+		t.Errorf("redundant 0 relay changed presence to %q/%q", b.xmpp.show, b.xmpp.presence)
+	}
+}
+
+// TestBgProcessesDontDriftAway pins the idle-watcher interaction: a bot
+// waiting on background processes must not announce "away" no matter how long
+// it sits idle. awayAnnounced staying false is the observable — the transition
+// was suppressed.
+func TestBgProcessesDontDriftAway(t *testing.T) {
+	b := bgBridge()
+	b.idleSince = time.Now().Add(-idleAwayTimeout - time.Minute)
+	b.bgProcesses = 1
+	b.awayAnnounced = false
+
+	b.idleTick()
+
+	if b.awayAnnounced {
+		t.Error("idleTick announced away while a background process was running")
+	}
+	if b.xmpp.presence == "away" || b.xmpp.show == "away" {
+		t.Errorf("presence drifted to away: %q/%q", b.xmpp.show, b.xmpp.presence)
+	}
+
+	// Once the process finishes and the agent stays idle, away is allowed again.
+	b.bgProcesses = 0
+	b.idleTick()
+	if !b.awayAnnounced {
+		t.Error("idleTick should announce away once processes finished")
+	}
+	if b.xmpp.show != "away" {
+		t.Errorf("presence after idle = show %q, want away", b.xmpp.show)
+	}
+}
+
+// TestSettledPresenceRespectsRunningProcesses: an agent_settled must leave the
+// bot dnd when background processes are still running (the run's own end does
+// not finish the work) — and a process starting must not stamp over a live run.
+func TestSettledPresenceRespectsRunningProcesses(t *testing.T) {
+	b := bgBridge()
+	b.setBgProcesses(1)
+	b.announceSettledPresence()
+	if b.xmpp.show != "dnd" {
+		t.Errorf("agent_settled with 1 process = show %q, want dnd", b.xmpp.show)
+	}
+
+	// A process starting mid-run must not clobber the run's own label.
+	b.streamingRun = true
+	b.xmpp.SetPresence("dnd", "thinking…")
+	b.setBgProcesses(2)
+	if b.xmpp.presence != "thinking…" {
+		t.Errorf("process relay mid-run clobbered run label: %q", b.xmpp.presence)
+	}
+}
+
+// TestToolRelayProcessCount exercises the process_count relay action: the
+// count lands on the bridge and the relay answers "ok".
+func TestToolRelayProcessCount(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+
+	b.handleToolRelay("r-count", `{"action":"process_count","count":3}`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var line string
+	for {
+		if l, err := buf.ReadString('\n'); err == nil {
+			line = l
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.Contains(line, "\"value\": \"ok\"") && !strings.Contains(line, "\"value\":\"ok\"") {
+		t.Errorf("process_count relay response = %q, want ok", line)
+	}
+	b.mu.Lock()
+	got := b.bgProcesses
+	b.mu.Unlock()
+	if got != 3 {
+		t.Errorf("bgProcesses after relay = %d, want 3", got)
+	}
+	if b.xmpp.presence != "waiting on 3 processes" {
+		t.Errorf("presence after relay = %q, want \"waiting on 3 processes\"", b.xmpp.presence)
+	}
+}
