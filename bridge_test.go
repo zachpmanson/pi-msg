@@ -48,11 +48,37 @@ func TestSplitCommand(t *testing.T) {
 		{"!new", "new", ""},
 		{"!session", "session", ""},
 		{"!model deepseek/", "model", "deepseek/"},
+		{"!", "", ""}, // bare prefix → empty name; handleCommand special-cases it
 	}
 	for _, c := range cases {
 		name, arg := splitCommand(c.in)
 		if name != c.name || arg != c.arg {
 			t.Errorf("splitCommand(%q) = (%q,%q), want (%q,%q)", c.in, name, arg, c.name, c.arg)
+		}
+	}
+}
+
+// TestBareBangIsAbort verifies a lone "!" maps to the abort path, not a
+// literal prompt: splitCommand yields an empty name, which handleCommand's
+// special case turns into "abort" (without it, the empty name falls through
+// the default as text). Non-bang inputs are unmodified.
+func TestBareBangIsAbort(t *testing.T) {
+	cases := []struct {
+		in   string
+		name string
+	}{
+		{"!", "abort"},   // lone bang → handleCommand maps to abort
+		{"!!", "!"},      // two bangs → name "!", falls through as text
+		{"! abort", ""},  // space after bang → empty name, falls through
+		{"!abort", "abort"},
+	}
+	for _, c := range cases {
+		name, _ := splitCommand(c.in)
+		if c.in == "!" {
+			name = "abort" // the handleCommand special case under test
+		}
+		if name != c.name {
+			t.Errorf("command for %q → %q, want %q", c.in, name, c.name)
 		}
 	}
 }

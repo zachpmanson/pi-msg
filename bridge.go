@@ -776,6 +776,13 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 // caller forwards it to pi as a prompt.
 func (b *Bridge) handleCommand(t string) bool {
 	name, arg := splitCommand(t)
+	// A lone "!" is shorthand for /abort: with no command name after the
+	// prefix it would otherwise fall through to pi as a degenerate literal
+	// prompt (an empty control command). "!abort", "!new" etc. already work
+	// through splitCommand's prefix alias.
+	if t == "!" {
+		name = "abort"
+	}
 	switch name {
 	case "new":
 		if b.streaming() {

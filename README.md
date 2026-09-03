@@ -76,13 +76,14 @@ sequenceDiagram
 | `/session` | session stats — id, file, message counts, tokens, cost (no LLM turn) |
 | `/name [name]` | show the session display name, or set it |
 | `/think <off\|low\|medium\|high\|…>` | `set_thinking_level` |
-| `/abort` (or `/stop`) | `abort` |
+| `/abort` (or `/stop`, or a lone `!`) | `abort` |
 | `/dump` (or `/dump pretty`) | send the session transcript to the owner — raw JSONL, or `pretty` for indented per-record JSON (no LLM turn) |
 | `/export` | render the current session to HTML via pi's `export_html` RPC and **send it as a file over XMPP** (XEP-0363 HTTP Upload) — **deterministic**, no agent turn; the rendered session lands as an inline, downloadable file |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
 
 Every bridged command also works with a `!` prefix — `/new` and `!new` are
-interchangeable. ("/", "!") only matters for the owner: non-owners' messages
+interchangeable. A lone `!` (no command name after it) is shorthand for
+`/abort`. The prefix only matters for the owner: non-owners' messages
 are always treated as literal text.
 
 ## Configuration
