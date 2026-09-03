@@ -43,8 +43,63 @@ export default function xmppTools(pi: ExtensionAPI) {
 	// Captured on session_start; used by tool handlers to reach pi-msg.
 	let ui: RelayUI | undefined;
 
-	pi.on("session_start", (_event, ctx) => {
+	// --- Background-process presence tracking ---
+	//
+	// The pi-processes extension broadcasts every process lifecycle change on
+	// the shared bus (processes:started / processes:ended, via its
+	// event-bridge hook) and serves synchronous list queries on
+	// processes:request:list. pi-msg shows dnd while a background process
+	// runs, so we relay the manager's current process count over the same
+	// sentinel channel as the tools. Every change triggers a fresh query of
+	// the authoritative manager (never delta arithmetic, so counts can't
+	// drift), and the count is re-seeded on every session_start to cover
+	// processes that predate this extension instance — the registry is
+	// in-memory and dies with the pi process anyway.
+	const PROCESS_STARTED = "processes:started";
+	const PROCESS_ENDED = "processes:ended";
+	const PROCESS_LIST = "processes:request:list";
+
+	// queryProcessCount asks the pi-processes manager for its current process
+	// list over the in-process request channel (its reply is synchronous).
+	// Falls back to 0 if pi-processes isn't loaded or doesn't answer.
+	function queryProcessCount(): Promise<number> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const done = (n: number) => {
+				if (!settled) {
+					settled = true;
+					resolve(n);
+				}
+			};
+			pi.events.emit(PROCESS_LIST, {
+				reply: (processes: unknown) => done(Array.isArray(processes) ? processes.length : 0),
+			});
+			setTimeout(() => done(0), 500);
+		});
+	}
+
+	async function refreshProcessCount() {
+		if (!ui) return;
+		try {
+			const count = await queryProcessCount();
+			await relay("process_count", { count });
+		} catch {
+			// Best-effort: presence is cosmetic; a dropped relay is harmless.
+		}
+	}
+
+	pi.events.on(PROCESS_STARTED, () => {
+		void refreshProcessCount();
+	});
+	pi.events.on(PROCESS_ENDED, () => {
+		void refreshProcessCount();
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
 		ui = ctx.ui as unknown as RelayUI;
+		// Re-seed the background-process count from the manager so presence
+		// reflects processes that predate this extension instance.
+		await refreshProcessCount();
 	});
 
 	// Inject the agent's identity ($PI_MSG_ACCOUNT) at the top of every system
