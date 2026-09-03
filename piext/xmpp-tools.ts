@@ -95,11 +95,20 @@ export default function xmppTools(pi: ExtensionAPI) {
 		void refreshProcessCount();
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", (_event, ctx) => {
 		ui = ctx.ui as unknown as RelayUI;
-		// Re-seed the background-process count from the manager so presence
-		// reflects processes that predate this extension instance.
-		await refreshProcessCount();
+		// Deferred seed of the background-process count. This must NOT happen
+		// synchronously in the hook: pi's RPC mode attaches its stdin reader
+		// only after session_start hooks resolve, so blocking on a dialog
+		// (relay → ui.select) during session_start can never complete — the
+		// response can't be read — and any stdin traffic arriving meanwhile
+		// makes pi exit cleanly (crashloop). Deferring past bootstrap turns
+		// the seed into a normal post-start relay, exactly like the tool
+		// relays. Started/ended listeners below cover live changes; this only
+		// covers processes already tracked before the first relay.
+		setTimeout(() => {
+			void refreshProcessCount();
+		}, 2000);
 	});
 
 	// Inject the agent's identity ($PI_MSG_ACCOUNT) at the top of every system
