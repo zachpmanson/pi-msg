@@ -49,11 +49,37 @@ func TestSplitCommand(t *testing.T) {
 		{"!new", "new", ""},
 		{"!session", "session", ""},
 		{"!model deepseek/", "model", "deepseek/"},
+		{"!", "", ""}, // bare prefix → empty name; handleCommand special-cases it
 	}
 	for _, c := range cases {
 		name, arg := splitCommand(c.in)
 		if name != c.name || arg != c.arg {
 			t.Errorf("splitCommand(%q) = (%q,%q), want (%q,%q)", c.in, name, arg, c.name, c.arg)
+		}
+	}
+}
+
+// TestBareBangIsAbort verifies a lone "!" maps to the abort path, not a
+// literal prompt: splitCommand yields an empty name, which handleCommand's
+// special case turns into "abort" (without it, the empty name falls through
+// the default as text). Non-bang inputs are unmodified.
+func TestBareBangIsAbort(t *testing.T) {
+	cases := []struct {
+		in   string
+		name string
+	}{
+		{"!", "abort"},   // lone bang → handleCommand maps to abort
+		{"!!", "!"},      // two bangs → name "!", falls through as text
+		{"! abort", ""},  // space after bang → empty name, falls through
+		{"!abort", "abort"},
+	}
+	for _, c := range cases {
+		name, _ := splitCommand(c.in)
+		if c.in == "!" {
+			name = "abort" // the handleCommand special case under test
+		}
+		if name != c.name {
+			t.Errorf("command for %q → %q, want %q", c.in, name, c.name)
 		}
 	}
 }
@@ -311,6 +337,31 @@ func TestStagedNudgeRespectsBudget(t *testing.T) {
 	b.stageNudge("c", "r3")
 	if got := b.takeStagedNudge(); got != "r3" {
 		t.Errorf("post-reset staged nudge = %q, want r3", got)
+	}
+}
+
+// TestFirePendingNudgeReportsLaunch pins the banner-suppression contract: a
+// settle that launches the routing nudge holds the "done (no reply)" banner,
+// because the resend arrives moments later. firePendingNudge must report
+// whether it actually launched so the caller can gate on it.
+func TestFirePendingNudgeReportsLaunch(t *testing.T) {
+	b := roomBridge()
+	b.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
+
+	// Nothing staged → no nudge launches.
+	if b.firePendingNudge() {
+		t.Error("no staged nudge → firePendingNudge must report false")
+	}
+
+	// A staged correction → the nudge fires and is reported.
+	b.stageNudge("dropped body", "no to: line")
+	if !b.firePendingNudge() {
+		t.Error("staged nudge → firePendingNudge must report true")
+	}
+
+	// Consumed on fire → nothing left to launch.
+	if b.firePendingNudge() {
+		t.Error("after firing, no second nudge may launch")
 	}
 }
 

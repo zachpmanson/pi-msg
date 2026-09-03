@@ -393,8 +393,11 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// The routing reminder decision happens here (issue #16): mid-run
 		// malformed commentary drops silently, and the agent is only nudged if
 		// the run's FINAL message was malformed (pending nudge set AND nothing
-		// successfully delivered after it). Not before.
-		b.firePendingNudge()
+		// successfully delivered after it). Not before. A launched nudge is
+		// itself a pending reply, so it holds the "done (no reply)" banner: the
+		// resend lands moments later, and showing the banner first would read
+		// as "agent: done, no reply" immediately followed by the resend.
+		nudged := b.firePendingNudge()
 		// A run that ended on a tool call never wrote its answer: the tool
 		// result came back and no assistant text followed it. Ask for the reply
 		// once rather than letting the work vanish. A deliberate silence uses
@@ -417,9 +420,11 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
-		// stay silent after a to:noop without spamming the owner. A recovery
-		// prompt is in flight, so hold the banner: the retry may still answer.
-		if !b.replied() && !b.volunteered && !b.reactionAckRun && !recovering {
+		// stay silent after a to:noop without touching the owner. A recovery
+		// prompt (tail retry or routing nudge) is in flight, so hold the
+		// banner: the retry may still answer, and "done (no reply)" followed
+		// by the resend would read as a contradiction.
+		if !b.replied() && !b.volunteered && !b.reactionAckRun && !recovering && !nudged {
 			b.reply("✅ done (no reply) — your turn")
 		}
 		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
@@ -793,6 +798,13 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 // caller forwards it to pi as a prompt.
 func (b *Bridge) handleCommand(t string) bool {
 	name, arg := splitCommand(t)
+	// A lone "!" is shorthand for /abort: with no command name after the
+	// prefix it would otherwise fall through to pi as a degenerate literal
+	// prompt (an empty control command). "!abort", "!new" etc. already work
+	// through splitCommand's prefix alias.
+	if t == "!" {
+		name = "abort"
+	}
 	switch name {
 	case "new":
 		if b.streaming() {
@@ -1226,7 +1238,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when a bare jid does not show which message you answer: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[routing (pi-msg): every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -2095,12 +2107,13 @@ func (b *Bridge) fireTailRecovery() bool {
 // firePendingNudge sends the staged routing reminder, if the run settled on a
 // malformed final message. Called from agent_settled only; the reminder is a
 // prompt, so it isn't confused for a real user.
-func (b *Bridge) firePendingNudge() {
+func (b *Bridge) firePendingNudge() bool {
 	reason := b.takeStagedNudge()
 	if reason == "" {
-		return
+		return false
 	}
 	b.rpc.Prompt(fmt.Sprintf("Your previous message was NOT delivered to anyone in the chat: %s. Every reply MUST begin with a line \"to: <jid>\" naming the destination (e.g. \"to: %s\" for the owner, or a room/person jid). Resend your message now with a valid \"to:\" line.", reason, b.acct.Owner), b.steerBehavior())
+	return true
 }
 
 // routeDropped sends dropped/unrouteable output to the write-only error room
