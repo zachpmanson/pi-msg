@@ -97,6 +97,7 @@ type Bridge struct {
 	awayAnnounced  bool      // the away transition has been announced this idle period
 	lastAwayStatus string    // the last pithy activity shown while away (skip repeats across periods)
 	bgProcesses    int       // background processes pi has running (relayed by the pi-processes extension)
+	pendingHeartbeats []string // long-running-process alarms queued while a run was in flight
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -390,6 +391,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.stopTyping()
 		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
 		b.announceSettledPresence()
+		b.flushPendingHeartbeats() // deliver any long-running-process alarms queued mid-run
 		b.lifecycleReact("✅") // done
 		// The routing reminder decision happens here (issue #16): mid-run
 		// malformed commentary drops silently, and the agent is only nudged if
@@ -515,13 +517,14 @@ func (b *Bridge) handleUIRequest(ev Event) {
 // `file:` text conventions (issue #8 spike).
 func (b *Bridge) handleToolRelay(id, payload string) {
 	var cmd struct {
-		Action       string `json:"action"`
-		Emoji        string `json:"emoji"`
-		Path         string `json:"path"`
-		To           string `json:"to"`
-		MessageID    string `json:"messageId"`
-		From         string `json:"from"`
-		ProcessCount int    `json:"count"`
+		Action       string             `json:"action"`
+		Emoji        string             `json:"emoji"`
+		Path         string             `json:"path"`
+		To           string             `json:"to"`
+		MessageID    string             `json:"messageId"`
+		From         string             `json:"from"`
+		ProcessCount int                `json:"count"`
+		Processes    []HeartbeatProcess `json:"processes"`
 	}
 	if err := json.Unmarshal([]byte(payload), &cmd); err != nil {
 		b.log("warning", "bad tool-relay payload: "+err.Error())
@@ -593,10 +596,37 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		// process — is in flight, the bot shows dnd instead of available.
 		b.setBgProcesses(cmd.ProcessCount)
 		b.rpc.RespondUIRelay(id, "ok")
+	case "process_heartbeat":
+		// A long-running-process alarm from the companion extension (its
+		// 10-minute heartbeat tick). Wake the agent with it — unless a run is
+		// in flight, in which case queue the report and deliver it when the
+		// agent settles, so the alarm never interrupts an active turn and is
+		// never lost. The relay itself always answers ok: gathering the report
+		// is the extension's job; delivery timing is the bridge's.
+		text := b.formatHeartbeat(cmd.Processes)
+		if b.streaming() {
+			b.mu.Lock()
+			b.pendingHeartbeats = append(b.pendingHeartbeats, text)
+			b.mu.Unlock()
+			b.log("info", fmt.Sprintf("process heartbeat queued (%d process(es), run in flight)", len(cmd.Processes)))
+		} else {
+			b.fireHeartbeat(text)
+		}
+		b.rpc.RespondUIRelay(id, "ok")
 	default:
 		b.log("warning", "unknown tool-relay action: "+cmd.Action)
 		b.rpc.RespondUIRelay(id, "unknown tool-relay action: "+cmd.Action)
 	}
+}
+
+// HeartbeatProcess is one long-running background process reported by the
+// companion extension's heartbeat tick (see xmpp-tools.ts).
+type HeartbeatProcess struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Command     string `json:"command"`
+	ElapsedSecs int    `json:"elapsedSecs"`
+	Tail        string `json:"tail"`
 }
 
 // --- chat command handling ---
@@ -3054,6 +3084,72 @@ func startLabel(v string) string {
 		return "prompt"
 	}
 	return "auto (idle default)"
+}
+
+// formatHeartbeat renders the process-heartbeat alarm for the agent: one line
+// per long-running process with its true elapsed time and a log tail. Single
+// process → the terse Zack-flavored form; several → batched sections so the
+// agent is woken once with everything rather than once per process.
+func (b *Bridge) formatHeartbeat(procs []HeartbeatProcess) string {
+	if len(procs) == 1 {
+		p := procs[0]
+		return fmt.Sprintf(
+			"[pi-msg: process %q has been running for %d %s now. Here's the log tail:\n\n%s\n\nIf this is unexpected, determine what happened and act. If this is expected, reply with \"to: noop\" and nothing else.]",
+			p.Name, p.ElapsedSecs, heartbeatNoun(p.ElapsedSecs), heartbeatTail(p.Tail),
+		)
+	}
+	var sb strings.Builder
+	if len(procs) == 0 {
+		return ""
+	}
+	sb.WriteString("[pi-msg: " + strconv.Itoa(len(procs)) + " background processes have been running for a while. Here they are with log tails:")
+	for _, p := range procs {
+		fmt.Fprintf(&sb, "\n\n• %s — %d %s\n%s", p.Name, p.ElapsedSecs, heartbeatNoun(p.ElapsedSecs), heartbeatTail(p.Tail))
+	}
+	sb.WriteString("\n\nIf any of these is unexpected, determine what happened and act. If they are all expected, reply with \"to: noop\" and nothing else.]")
+	return sb.String()
+}
+
+// heartbeatNoun pluralizes the elapsed-seconds label; heartbeatTail renders the
+// log tail or a placeholder when the process has produced no output yet.
+func heartbeatNoun(n int) string {
+	if n == 1 {
+		return "second"
+	}
+	return "seconds"
+}
+
+func heartbeatTail(tail string) string {
+	if strings.TrimSpace(tail) == "" {
+		return "(no output yet)"
+	}
+	return tail
+}
+
+// fireHeartbeat wakes the (idle) agent with a long-running-process alarm,
+// routing any response to the owner like the other synthetic prompts.
+func (b *Bridge) fireHeartbeat(text string) {
+	if text == "" {
+		return
+	}
+	b.setTurnDest(b.acct.Owner)
+	b.rpc.Prompt(text, b.steerBehavior())
+	b.xmpp.SetPresence("dnd", "thinking…")
+	b.log("info", "process heartbeat injected")
+}
+
+// flushPendingHeartbeats delivers any heartbeats queued while a run was in
+// flight (their delivery was deferred rather than dropped). Called on
+// agent_settled, when the agent is idle again and safe to wake. Flushing one
+// at a time keeps each alarm its own turn; the agent can noop them individually.
+func (b *Bridge) flushPendingHeartbeats() {
+	b.mu.Lock()
+	queued := b.pendingHeartbeats
+	b.pendingHeartbeats = nil
+	b.mu.Unlock()
+	for _, text := range queued {
+		b.fireHeartbeat(text)
+	}
 }
 
 // fireResumeTurn injects a single synthetic prompt so the resumed agent can
