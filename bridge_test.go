@@ -313,6 +313,31 @@ func TestStagedNudgeRespectsBudget(t *testing.T) {
 	}
 }
 
+// TestFirePendingNudgeReportsLaunch pins the banner-suppression contract: a
+// settle that launches the routing nudge holds the "done (no reply)" banner,
+// because the resend arrives moments later. firePendingNudge must report
+// whether it actually launched so the caller can gate on it.
+func TestFirePendingNudgeReportsLaunch(t *testing.T) {
+	b := roomBridge()
+	b.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
+
+	// Nothing staged → no nudge launches.
+	if b.firePendingNudge() {
+		t.Error("no staged nudge → firePendingNudge must report false")
+	}
+
+	// A staged correction → the nudge fires and is reported.
+	b.stageNudge("dropped body", "no to: line")
+	if !b.firePendingNudge() {
+		t.Error("staged nudge → firePendingNudge must report true")
+	}
+
+	// Consumed on fire → nothing left to launch.
+	if b.firePendingNudge() {
+		t.Error("after firing, no second nudge may launch")
+	}
+}
+
 func TestPrettyDump(t *testing.T) {
 	jsonl := strings.Join([]string{
 		`{"type":"session","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/proj"}`,
