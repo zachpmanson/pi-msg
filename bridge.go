@@ -64,6 +64,7 @@ type Bridge struct {
 	turnDest       string        // reply destination for the current turn (owner or room jid)
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
+	heartbeatRun   bool          // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
 	// finalMsgHadText records whether the most recent assistant message of this
 	// run carried deliverable text. A run that ends on a tool call leaves it
 	// false: the answer was never written, so nothing could be delivered.
@@ -391,7 +392,6 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.stopTyping()
 		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
 		b.announceSettledPresence()
-		b.flushPendingHeartbeats() // deliver any long-running-process alarms queued mid-run
 		b.lifecycleReact("✅") // done
 		// The routing reminder decision happens here (issue #16): mid-run
 		// malformed commentary drops silently, and the agent is only nudged if
@@ -423,14 +423,28 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
-		// stay silent after a to:noop without touching the owner. A recovery
-		// prompt (tail retry or routing nudge) is in flight, so hold the
-		// banner: the retry may still answer, and "done (no reply)" followed
-		// by the resend would read as a contradiction.
-		if !b.replied() && !b.volunteered && !b.reactionAckRun && !recovering && !nudged {
+		// stay silent after a to:noop without touching the owner. So is a
+		// heartbeat wake (heartbeatRun): noop is exactly what the alarm asks
+		// for, and the "— your turn" would be a misleading prompt to the
+		// owner. A recovery prompt (tail retry or routing nudge) is in flight,
+		// so hold the banner: the retry may still answer, and "done (no
+		// reply)" followed by the resend would read as a contradiction.
+		if b.bannerNoReply(recovering, nudged) {
 			b.reply("✅ done (no reply) — your turn")
 		}
 		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
+		// A heartbeat wake is likewise one-shot: the flag lives only for the
+		// run it opened, so a later user-initiated run is judged normally. It
+		// is consumed here (like volunteered) rather than cleared at
+		// agent_start — the settle check above must still see it.
+		b.heartbeatRun = false
+		// Deliver any long-running-process alarms queued while the run just
+		// settled was in flight. This must come AFTER the banner decision and
+		// the flag consumption above: a flushed heartbeat sets heartbeatRun
+		// for the run it opens (the next one), and letting it bleed into this
+		// settle's check would suppress a legitimate "done (no reply)" for a
+		// user-initiated run that genuinely went unanswered.
+		b.flushPendingHeartbeats()
 	case "message_update":
 		b.handleStreamDelta(ev)
 	case "tool_execution_start":
@@ -1913,11 +1927,11 @@ func (b *Bridge) clearToolSinceDelivery() {
 //
 // A run that delivered its reply after the tool clears toolSinceDelivery, so it
 // never matches. Nor does a run that simply had nothing to do (no tool). A
-// volunteer or reaction-ack run is allowed to end quietly.
+// volunteer, reaction-ack, or heartbeat run is allowed to end quietly.
 func (b *Bridge) needsEmptyTailRecovery() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.volunteered || b.reactionAckRun {
+	if b.volunteered || b.reactionAckRun || b.heartbeatRun {
 		return false
 	}
 	return b.toolSinceDelivery && !b.finalMsgHadText
@@ -2014,6 +2028,13 @@ func hintExcerpt(text string) string {
 // The counters are reset at settle rather than at agent_start because
 // handleCanonical counts a message before pi reports the run started: resetting
 // at agent_start would zero the very message that opened the run.
+func (b *Bridge) bannerNoReply(recovering, nudged bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !b.repliedThisRun && !b.volunteered && !b.reactionAckRun && !b.heartbeatRun && !recovering && !nudged
+}
+
+// resetRunCounts clears the per-run message/reply tally. Called at settle,
 func (b *Bridge) resetRunCounts() {
 	b.mu.Lock()
 	b.runInbound = 0
@@ -2032,7 +2053,7 @@ func (b *Bridge) resetRunCounts() {
 func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.volunteered || b.reactionAckRun {
+	if b.volunteered || b.reactionAckRun || b.heartbeatRun {
 		return 0, 0, false
 	}
 	return b.runInbound, b.runDeliveries, b.runInbound > 1 && b.runInbound > b.runDeliveries
@@ -3127,11 +3148,15 @@ func heartbeatTail(tail string) string {
 }
 
 // fireHeartbeat wakes the (idle) agent with a long-running-process alarm,
-// routing any response to the owner like the other synthetic prompts.
+// routing any response to the owner like the other synthetic prompts. The run
+// is marked heartbeatRun so its (expected) to:noop outcome is treated like a
+// volunteer or reaction-ack run: no "done (no reply)" banner, no recovery or
+// unanswered-message hints.
 func (b *Bridge) fireHeartbeat(text string) {
 	if text == "" {
 		return
 	}
+	b.heartbeatRun = true
 	b.setTurnDest(b.acct.Owner)
 	b.rpc.Prompt(text, b.steerBehavior())
 	b.xmpp.SetPresence("dnd", "thinking…")

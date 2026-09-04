@@ -1230,6 +1230,88 @@ func TestToolRelayProcessCount(t *testing.T) {
 	}
 }
 
+// TestHeartbeatRunNoBanner pins the fix: a heartbeat wake is one-shot —
+// fireHeartbeat sets heartbeatRun, it survives agent_start (so the settle-time
+// banner decision still sees it), and bannerNoReply returns false for it even
+// when the run produced no reply. A heartbeat-run noop must never surface the
+// misleading "done (no reply) — your turn" to the owner.
+func TestHeartbeatRunNoBanner(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+
+	// A heartbeat alarm wakes the idle agent and marks the run it opens.
+	b.fireHeartbeat(`[pi-msg: process "build" has been running for 600 seconds now…]`)
+	b.mu.Lock()
+	marked := b.heartbeatRun
+	b.mu.Unlock()
+	if !marked {
+		t.Fatal("fireHeartbeat must set heartbeatRun")
+	}
+
+	// agent_start must NOT clear it: the flag has to survive to the settle
+	// decision for the run it opened.
+	b.handleRPCEvent(Event{"type": "agent_start"})
+	b.mu.Lock()
+	marked = b.heartbeatRun
+	b.mu.Unlock()
+	if !marked {
+		t.Fatal("agent_start must not clear heartbeatRun before the run settles")
+	}
+
+	// No reply, no recovery: the banner must be suppressed for a heartbeat run.
+	if b.bannerNoReply(false, false) {
+		t.Error("banner must be suppressed for a heartbeat wake with no reply")
+	}
+
+	// Simulate the settle consuming the flag; a later user-initiated run with
+	// no reply banners normally again.
+	b.handleRPCEvent(Event{"type": "agent_settled"})
+	if !b.bannerNoReply(false, false) {
+		t.Error("after consume, a normal unanswered run must banner again")
+	}
+}
+
+// TestBannerNoReplyGates pins the banner condition directly: it fires only for
+// an unanswered, non-quiet-wake run with no recovery in flight.
+func TestBannerNoReplyGates(t *testing.T) {
+	b := bgBridge()
+
+	// No reply, not a quiet wake, no recovery → banner.
+	if !b.bannerNoReply(false, false) {
+		t.Error("unanswered run should banner")
+	}
+
+	// A delivered reply suppresses it.
+	b.setReplied(true)
+	if b.bannerNoReply(false, false) {
+		t.Error("replied run should not banner")
+	}
+	b.setReplied(false)
+
+	// Quiet wakes suppress it.
+	b.volunteered = true
+	if b.bannerNoReply(false, false) {
+		t.Error("volunteer run should not banner")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if b.bannerNoReply(false, false) {
+		t.Error("reaction-ack run should not banner")
+	}
+	b.reactionAckRun = false
+	b.heartbeatRun = true
+	if b.bannerNoReply(false, false) {
+		t.Error("heartbeat run should not banner")
+	}
+	b.heartbeatRun = false
+
+	// A recovery/nudge in flight holds it.
+	if b.bannerNoReply(true, false) || b.bannerNoReply(false, true) {
+		t.Error("recovery or nudge in flight should hold the banner")
+	}
+}
+
 // TestToolRelayProcessHeartbeatInjectsPrompt: an idle agent receives the
 // long-running-process alarm as an injected prompt carrying the TRUE elapsed
 // seconds and the log tail, presence goes dnd thinking, and the relay answers
