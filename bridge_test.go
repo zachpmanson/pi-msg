@@ -1232,6 +1232,181 @@ func TestToolRelayProcessCount(t *testing.T) {
 		t.Errorf("presence after relay = %q, want \"waiting on 3 processes\"", b.xmpp.presence)
 	}
 }
+func TestHeartbeatRunNoBanner(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+
+	// A heartbeat alarm wakes the idle agent and marks the run it opens.
+	b.fireHeartbeat(`[pi-msg: process "build" has been running for 600 seconds now…]`)
+	b.mu.Lock()
+	marked := b.heartbeatRun
+	b.mu.Unlock()
+	if !marked {
+		t.Fatal("fireHeartbeat must set heartbeatRun")
+	}
+
+	// agent_start must NOT clear it: the flag has to survive to the settle
+	// decision for the run it opened.
+	b.handleRPCEvent(Event{"type": "agent_start"})
+	b.mu.Lock()
+	marked = b.heartbeatRun
+	b.mu.Unlock()
+	if !marked {
+		t.Fatal("agent_start must not clear heartbeatRun before the run settles")
+	}
+
+	// No reply, no recovery: the banner must be suppressed for a heartbeat run.
+	if b.bannerNoReply(false, false) {
+		t.Error("banner must be suppressed for a heartbeat wake with no reply")
+	}
+
+	// Simulate the settle consuming the flag; a later user-initiated run with
+	// no reply banners normally again.
+	b.handleRPCEvent(Event{"type": "agent_settled"})
+	if !b.bannerNoReply(false, false) {
+		t.Error("after consume, a normal unanswered run must banner again")
+	}
+}
+
+// TestBannerNoReplyGates pins the banner condition directly: it fires only for
+// an unanswered, non-quiet-wake run with no recovery in flight.
+func TestBannerNoReplyGates(t *testing.T) {
+	b := bgBridge()
+
+	// No reply, not a quiet wake, no recovery → banner.
+	if !b.bannerNoReply(false, false) {
+		t.Error("unanswered run should banner")
+	}
+
+	// A delivered reply suppresses it.
+	b.setReplied(true)
+	if b.bannerNoReply(false, false) {
+		t.Error("replied run should not banner")
+	}
+	b.setReplied(false)
+
+	// Quiet wakes suppress it.
+	b.volunteered = true
+	if b.bannerNoReply(false, false) {
+		t.Error("volunteer run should not banner")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if b.bannerNoReply(false, false) {
+		t.Error("reaction-ack run should not banner")
+	}
+	b.reactionAckRun = false
+	b.heartbeatRun = true
+	if b.bannerNoReply(false, false) {
+		t.Error("heartbeat run should not banner")
+	}
+	b.heartbeatRun = false
+
+	// A recovery/nudge in flight holds it.
+	if b.bannerNoReply(true, false) || b.bannerNoReply(false, true) {
+		t.Error("recovery or nudge in flight should hold the banner")
+	}
+}
+
+// TestToolRelayProcessHeartbeatInjectsPrompt: an idle agent receives the
+// long-running-process alarm as an injected prompt carrying the TRUE elapsed
+// seconds and the log tail, presence goes dnd thinking, and the relay answers
+// ok so the extension's blocking select resolves.
+func TestToolRelayProcessHeartbeatInjectsPrompt(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+
+	b.handleToolRelay("r-hb", `{"action":"process_heartbeat","processes":[{"id":"p1","name":"gradle","command":"./gradlew assembleRelease","elapsedSecs":606,"tail":"BUILD SUCCESSFUL in 3m 12s\n"}]}`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "\"value\": \"ok\"") && !strings.Contains(buf.String(), "\"value\":\"ok\"") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Both the prompt and the relay ok land in the same stdin buffer (prompt
+	// first — fireHeartbeat runs before RespondUIRelay), so assert on the whole
+	// buffer rather than consuming a single line.
+	out := buf.String()
+	if !strings.Contains(out, "\"type\":\"prompt\"") {
+		t.Errorf("heartbeat did not prompt pi (buf=%q)", out)
+	}
+	if !strings.Contains(out, "process \\\"gradle\\\" has been running for 606 seconds now") {
+		t.Errorf("heartbeat prompt missing true elapsed time (buf=%q)", out)
+	}
+	if !strings.Contains(out, "BUILD SUCCESSFUL in 3m 12s") {
+		t.Errorf("heartbeat prompt missing log tail (buf=%q)", out)
+	}
+	if b.xmpp.show != "dnd" || b.xmpp.presence != "thinking…" {
+		t.Errorf("heartbeat presence = %q/%q, want dnd thinking", b.xmpp.show, b.xmpp.presence)
+	}
+}
+
+// TestToolRelayProcessHeartbeatQueuedWhileStreaming: a heartbeat arriving while
+// a run is in flight must NOT interrupt (no prompt), the relay still answers
+// ok, and the alarm is delivered on agent_settled via flushPendingHeartbeats.
+func TestToolRelayProcessHeartbeatQueuedWhileStreaming(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.setStreaming(true) // a run is in flight
+
+	b.handleToolRelay("r-hb2", `{"action":"process_heartbeat","processes":[{"id":"p1","name":"install","command":"pnpm install","elapsedSecs":721,"tail":""}]}`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "\"value\": \"ok\"") && !strings.Contains(buf.String(), "\"value\":\"ok\"") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Nothing may have been prompted while the run was in flight.
+	out := buf.String()
+	if strings.Contains(out, "\"type\": \"prompt\"") {
+		t.Error("heartbeat prompted pi mid-run; must be deferred")
+	}
+
+	// The run settles: the queue flushes into a prompt.
+	b.setStreaming(false)
+	b.flushPendingHeartbeats()
+	out = buf.String()
+	if !strings.Contains(out, "process \\\"install\\\" has been running for 721 seconds now") {
+		t.Errorf("queued heartbeat not flushed after settle (buf=%q)", out)
+	}
+	if !strings.Contains(out, "(no output yet)") {
+		t.Errorf("empty-tail heartbeat should say so (buf=%q)", out)
+	}
+}
+
+// TestFormatHeartbeat pins the multi-process batch form: several overdue
+// processes become ONE alarm with a section per process, so the agent is
+// woken once rather than once per process.
+func TestFormatHeartbeat(t *testing.T) {
+	b := bgBridge()
+	got := b.formatHeartbeat([]HeartbeatProcess{
+		{Name: "build", ElapsedSecs: 600, Tail: "one"},
+		{Name: "test", ElapsedSecs: 1, Tail: ""},
+	})
+	if !strings.Contains(got, "2 background processes have been running") {
+		t.Errorf("batch headline missing (got=%q)", got)
+	}
+	if !strings.Contains(got, "build — 600 seconds") || !strings.Contains(got, "test — 1 second") {
+		t.Errorf("per-process lines missing/plural wrong (got=%q)", got)
+	}
+	if !strings.Contains(got, "no output yet") {
+		t.Errorf("empty-tail placeholder missing (got=%q)", got)
+	}
+
+	// Empty input renders no alarm at all (callers guard on len>0 anyway).
+	if empty := b.formatHeartbeat(nil); empty != "" {
+		t.Errorf("formatHeartbeat(nil) = %q, want empty", empty)
+	}
+}
 func TestIsCreditError(t *testing.T) {
 	cases := []struct {
 		in   string

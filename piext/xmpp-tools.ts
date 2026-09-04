@@ -116,6 +116,124 @@ export default function xmppTools(pi: ExtensionAPI) {
 		void refreshProcessCount();
 	});
 
+	// --- Long-running-process heartbeats ---
+	//
+	// While background processes run, pi-msg keeps the agent's presence dnd so
+	// it doesn't drift away — but a process that runs for hours is invisible
+	// once the agent has settled. Every HEARTBEAT_INTERVAL_MS this extension
+	// asks pi-msg to wake the idle agent with a status line + log tail for each
+	// live process that has been running for at least one full interval
+	// (elapsed computed from the manager's startTime, so the reported seconds
+	// are always the true value). The bridge decides when delivery is safe
+	// (never mid-run) and does the actual prompt injection; this side only
+	// gathers and relays.
+	const PROCESS_COMBINED_OUTPUT = "processes:request:combined_output";
+	const HEARTBEAT_INTERVAL_MS = Number(process.env.PI_MSG_PROCESS_HEARTBEAT_MS ?? 600_000);
+	const HEARTBEAT_TAIL_LINES = 40;
+
+	// queryProcesses asks the pi-processes manager for the full process list
+	// (same channel as queryProcessCount, but returns the entries).
+	function queryProcesses(): Promise<Array<Record<string, unknown>>> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const done = (list: Array<Record<string, unknown>>) => {
+				if (!settled) {
+					settled = true;
+					resolve(list);
+				}
+			};
+			pi.events.emit(PROCESS_LIST, {
+				reply: (processes: unknown) => {
+					if (!Array.isArray(processes)) {
+						done([]);
+					return;
+				}
+				done(processes.filter((p) => p !== null && typeof p === "object") as Array<Record<string, unknown>>);
+			},
+			});
+			setTimeout(() => done([]), 500);
+		});
+	}
+
+	// fetchProcessTail pulls the tail of a process's combined output via the
+	// manager's synchronous query channel. Returns "" when there is no output.
+	function fetchProcessTail(id: string): Promise<string> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const done = (text: string) => {
+				if (!settled) {
+					settled = true;
+					resolve(text);
+				}
+			};
+			pi.events.emit(PROCESS_COMBINED_OUTPUT, {
+				id,
+				tailLines: HEARTBEAT_TAIL_LINES,
+				reply: (lines: unknown) => {
+					if (!Array.isArray(lines)) {
+						done("");
+						return;
+					}
+					done(
+						lines
+							.map((l) =>
+								l !== null && typeof l === "object" && typeof (l as { text?: unknown }).text === "string"
+									? (l as { text: string }).text
+									: "",
+							)
+							.filter((t) => t.length > 0)
+							.join("\n"),
+					);
+				},
+			});
+			setTimeout(() => done(""), 500);
+		});
+	}
+
+	// heartbeatTick is the interval alarm: for every live process that has been
+	// running for at least one full interval, attach its name, true elapsed
+	// time and a log tail, and relay a single process_heartbeat — so the bridge
+	// wakes the (idle) agent once with everything at once, not once per process.
+	async function heartbeatTick() {
+		if (!ui) return;
+		try {
+			const processes = await queryProcesses();
+			const now = Date.now();
+			const overdue: Array<Record<string, unknown>> = [];
+			for (const p of processes) {
+				const status = String(p.status ?? "");
+				if (!LIVE_STATUSES.has(status)) continue;
+				const startTime = p.startTime;
+				const elapsedMs = typeof startTime === "number" ? now - startTime : 0;
+				if (elapsedMs < HEARTBEAT_INTERVAL_MS) continue;
+				const id = String(p.id ?? "");
+				if (!id) continue;
+				overdue.push({
+					id,
+					name: String(p.name ?? id),
+					command: String(p.command ?? ""),
+					elapsedSecs: Math.round(elapsedMs / 1000),
+					tail: await fetchProcessTail(id),
+				});
+			}
+			if (overdue.length === 0) return;
+			await relay("process_heartbeat", { processes: overdue });
+		} catch {
+			// Best-effort: a dropped heartbeat is just a missed status check.
+		}
+	}
+
+	// The heartbeat interval. Registered at session_start: setInterval is
+	// non-blocking, so it is safe under the rule that no relay/dialog may run
+	// synchronously in that hook.
+	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	function startHeartbeat() {
+		if (heartbeatTimer) return;
+		heartbeatTimer = setInterval(() => {
+			void heartbeatTick();
+		}, HEARTBEAT_INTERVAL_MS);
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		ui = ctx.ui as unknown as RelayUI;
 		// Deferred seed of the background-process count. This must NOT happen
@@ -130,6 +248,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 		setTimeout(() => {
 			void refreshProcessCount();
 		}, 2000);
+		startHeartbeat();
 	});
 
 	// Inject the agent's identity ($PI_MSG_ACCOUNT) at the top of every system

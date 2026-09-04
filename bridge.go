@@ -73,6 +73,7 @@ type Bridge struct {
 	turnDest       string        // reply destination for the current turn (owner or room jid)
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
+	heartbeatRun   bool          // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
 	// finalMsgHadText records whether the most recent assistant message of this
 	// run carried deliverable text. A run that ends on a tool call leaves it
 	// false: the answer was never written, so nothing could be delivered.
@@ -106,6 +107,7 @@ type Bridge struct {
 	awayAnnounced  bool      // the away transition has been announced this idle period
 	lastAwayStatus string    // the last pithy activity shown while away (skip repeats across periods)
 	bgProcesses    int       // background processes pi has running (relayed by the pi-processes extension)
+	pendingHeartbeats []string // long-running-process alarms queued while a run was in flight
 
 	// Periodic low-credit watcher state (see maybeCheckCredits).
 	lastCreditProbe time.Time // when the balance endpoint was last hit
@@ -434,14 +436,28 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
-		// stay silent after a to:noop without touching the owner. A recovery
-		// prompt (tail retry or routing nudge) is in flight, so hold the
-		// banner: the retry may still answer, and "done (no reply)" followed
-		// by the resend would read as a contradiction.
-		if !b.replied() && !b.volunteered && !b.reactionAckRun && !recovering && !nudged {
+		// stay silent after a to:noop without touching the owner. So is a
+		// heartbeat wake (heartbeatRun): noop is exactly what the alarm asks
+		// for, and the "— your turn" would be a misleading prompt to the
+		// owner. A recovery prompt (tail retry or routing nudge) is in flight,
+		// so hold the banner: the retry may still answer, and "done (no
+		// reply)" followed by the resend would read as a contradiction.
+		if b.bannerNoReply(recovering, nudged) {
 			b.reply("✅ done (no reply) — your turn")
 		}
 		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
+		// A heartbeat wake is likewise one-shot: the flag lives only for the
+		// run it opened, so a later user-initiated run is judged normally. It
+		// is consumed here (like volunteered) rather than cleared at
+		// agent_start — the settle check above must still see it.
+		b.heartbeatRun = false
+		// Deliver any long-running-process alarms queued while the run just
+		// settled was in flight. This must come AFTER the banner decision and
+		// the flag consumption above: a flushed heartbeat sets heartbeatRun
+		// for the run it opens (the next one), and letting it bleed into this
+		// settle's check would suppress a legitimate "done (no reply)" for a
+		// user-initiated run that genuinely went unanswered.
+		b.flushPendingHeartbeats()
 	case "message_update":
 		b.handleStreamDelta(ev)
 	case "tool_execution_start":
@@ -539,13 +555,14 @@ func (b *Bridge) handleUIRequest(ev Event) {
 // `file:` text conventions (issue #8 spike).
 func (b *Bridge) handleToolRelay(id, payload string) {
 	var cmd struct {
-		Action       string `json:"action"`
-		Emoji        string `json:"emoji"`
-		Path         string `json:"path"`
-		To           string `json:"to"`
-		MessageID    string `json:"messageId"`
-		From         string `json:"from"`
-		ProcessCount int    `json:"count"`
+		Action       string             `json:"action"`
+		Emoji        string             `json:"emoji"`
+		Path         string             `json:"path"`
+		To           string             `json:"to"`
+		MessageID    string             `json:"messageId"`
+		From         string             `json:"from"`
+		ProcessCount int                `json:"count"`
+		Processes    []HeartbeatProcess `json:"processes"`
 	}
 	if err := json.Unmarshal([]byte(payload), &cmd); err != nil {
 		b.log("warning", "bad tool-relay payload: "+err.Error())
@@ -617,10 +634,37 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		// process — is in flight, the bot shows dnd instead of available.
 		b.setBgProcesses(cmd.ProcessCount)
 		b.rpc.RespondUIRelay(id, "ok")
+	case "process_heartbeat":
+		// A long-running-process alarm from the companion extension (its
+		// 10-minute heartbeat tick). Wake the agent with it — unless a run is
+		// in flight, in which case queue the report and deliver it when the
+		// agent settles, so the alarm never interrupts an active turn and is
+		// never lost. The relay itself always answers ok: gathering the report
+		// is the extension's job; delivery timing is the bridge's.
+		text := b.formatHeartbeat(cmd.Processes)
+		if b.streaming() {
+			b.mu.Lock()
+			b.pendingHeartbeats = append(b.pendingHeartbeats, text)
+			b.mu.Unlock()
+			b.log("info", fmt.Sprintf("process heartbeat queued (%d process(es), run in flight)", len(cmd.Processes)))
+		} else {
+			b.fireHeartbeat(text)
+		}
+		b.rpc.RespondUIRelay(id, "ok")
 	default:
 		b.log("warning", "unknown tool-relay action: "+cmd.Action)
 		b.rpc.RespondUIRelay(id, "unknown tool-relay action: "+cmd.Action)
 	}
+}
+
+// HeartbeatProcess is one long-running background process reported by the
+// companion extension's heartbeat tick (see xmpp-tools.ts).
+type HeartbeatProcess struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Command     string `json:"command"`
+	ElapsedSecs int    `json:"elapsedSecs"`
+	Tail        string `json:"tail"`
 }
 
 // --- chat command handling ---
@@ -1907,11 +1951,11 @@ func (b *Bridge) clearToolSinceDelivery() {
 //
 // A run that delivered its reply after the tool clears toolSinceDelivery, so it
 // never matches. Nor does a run that simply had nothing to do (no tool). A
-// volunteer or reaction-ack run is allowed to end quietly.
+// volunteer, reaction-ack, or heartbeat run is allowed to end quietly.
 func (b *Bridge) needsEmptyTailRecovery() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.volunteered || b.reactionAckRun {
+	if b.volunteered || b.reactionAckRun || b.heartbeatRun {
 		return false
 	}
 	return b.toolSinceDelivery && !b.finalMsgHadText
@@ -2008,6 +2052,13 @@ func hintExcerpt(text string) string {
 // The counters are reset at settle rather than at agent_start because
 // handleCanonical counts a message before pi reports the run started: resetting
 // at agent_start would zero the very message that opened the run.
+func (b *Bridge) bannerNoReply(recovering, nudged bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !b.repliedThisRun && !b.volunteered && !b.reactionAckRun && !b.heartbeatRun && !recovering && !nudged
+}
+
+// resetRunCounts clears the per-run message/reply tally. Called at settle,
 func (b *Bridge) resetRunCounts() {
 	b.mu.Lock()
 	b.runInbound = 0
@@ -2026,7 +2077,7 @@ func (b *Bridge) resetRunCounts() {
 func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.volunteered || b.reactionAckRun {
+	if b.volunteered || b.reactionAckRun || b.heartbeatRun {
 		return 0, 0, false
 	}
 	return b.runInbound, b.runDeliveries, b.runInbound > 1 && b.runInbound > b.runDeliveries
@@ -3173,6 +3224,76 @@ func startLabel(v string) string {
 		return "prompt"
 	}
 	return "auto (idle default)"
+}
+
+// formatHeartbeat renders the process-heartbeat alarm for the agent: one line
+// per long-running process with its true elapsed time and a log tail. Single
+// process → the terse Zack-flavored form; several → batched sections so the
+// agent is woken once with everything rather than once per process.
+func (b *Bridge) formatHeartbeat(procs []HeartbeatProcess) string {
+	if len(procs) == 1 {
+		p := procs[0]
+		return fmt.Sprintf(
+			"[pi-msg: process %q has been running for %d %s now. Here's the log tail:\n\n%s\n\nIf this is unexpected, determine what happened and act. If this is expected, reply with \"to: noop\" and nothing else.]",
+			p.Name, p.ElapsedSecs, heartbeatNoun(p.ElapsedSecs), heartbeatTail(p.Tail),
+		)
+	}
+	var sb strings.Builder
+	if len(procs) == 0 {
+		return ""
+	}
+	sb.WriteString("[pi-msg: " + strconv.Itoa(len(procs)) + " background processes have been running for a while. Here they are with log tails:")
+	for _, p := range procs {
+		fmt.Fprintf(&sb, "\n\n• %s — %d %s\n%s", p.Name, p.ElapsedSecs, heartbeatNoun(p.ElapsedSecs), heartbeatTail(p.Tail))
+	}
+	sb.WriteString("\n\nIf any of these is unexpected, determine what happened and act. If they are all expected, reply with \"to: noop\" and nothing else.]")
+	return sb.String()
+}
+
+// heartbeatNoun pluralizes the elapsed-seconds label; heartbeatTail renders the
+// log tail or a placeholder when the process has produced no output yet.
+func heartbeatNoun(n int) string {
+	if n == 1 {
+		return "second"
+	}
+	return "seconds"
+}
+
+func heartbeatTail(tail string) string {
+	if strings.TrimSpace(tail) == "" {
+		return "(no output yet)"
+	}
+	return tail
+}
+
+// fireHeartbeat wakes the (idle) agent with a long-running-process alarm,
+// routing any response to the owner like the other synthetic prompts. The run
+// is marked heartbeatRun so its (expected) to:noop outcome is treated like a
+// volunteer or reaction-ack run: no "done (no reply)" banner, no recovery or
+// unanswered-message hints.
+func (b *Bridge) fireHeartbeat(text string) {
+	if text == "" {
+		return
+	}
+	b.heartbeatRun = true
+	b.setTurnDest(b.acct.Owner)
+	b.rpc.Prompt(text, b.steerBehavior())
+	b.xmpp.SetPresence("dnd", "thinking…")
+	b.log("info", "process heartbeat injected")
+}
+
+// flushPendingHeartbeats delivers any heartbeats queued while a run was in
+// flight (their delivery was deferred rather than dropped). Called on
+// agent_settled, when the agent is idle again and safe to wake. Flushing one
+// at a time keeps each alarm its own turn; the agent can noop them individually.
+func (b *Bridge) flushPendingHeartbeats() {
+	b.mu.Lock()
+	queued := b.pendingHeartbeats
+	b.pendingHeartbeats = nil
+	b.mu.Unlock()
+	for _, text := range queued {
+		b.fireHeartbeat(text)
+	}
 }
 
 // fireResumeTurn injects a single synthetic prompt so the resumed agent can
