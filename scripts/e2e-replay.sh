@@ -19,9 +19,10 @@
 # limitation is pinned without a red suite.
 #
 # Requires:
-#   - A throwaway bridge persona (created by beltino, patched to owner=e2e-test
-#     and room=testing@muc). See the plan on issue #18.
-#   - The `msg` CLI built in ~/projects/msg (uses the e2e-test account).
+#   - A throwaway droid bridge (b1-1..b1-4 via scripts/droid-up.sh from the
+#     beltino repo), owner patched to the driver and room=testing@muc.
+#   - The `msg` CLI built in ~/projects/msg (uses a droid as driver; driods
+#     self-puppet via msg --as b1-N).
 #   - `persona-ctl` on PATH to stop/start the bridge (needs sudo/beltino perms).
 #   - A clean bridge session (no queued turn backlog) for a reliable baseline.
 #
@@ -37,7 +38,7 @@ set -euo pipefail
 # ---- config (env overridable) ----
 HOST="${HOST:-chat.zachmanson.com}"
 BRIDGE="${BRIDGE:?set BRIDGE to the throwaway bridge persona JID localpart}"
-DRIVER="${DRIVER:-e2e-test}"
+DRIVER="${DRIVER:-b1-1}"
 ROOM="${ROOM:-testing@muc.chat.zachmanson.com}"
 BRIDGE_JID="${BRIDGE_JID:-${BRIDGE}@${HOST}}"
 DRIVER_JID="${DRIVER_JID:-${DRIVER}@${HOST}}"
