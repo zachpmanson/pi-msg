@@ -21,6 +21,15 @@ import (
 // it (~30s), so the typing indicator stays lit while the agent works.
 const typingRefresh = 20 * time.Second
 
+// creditCheckInterval is how often the proactive low-credit watcher probes the
+// OpenRouter balance (see maybeCheckCredits).
+const creditCheckInterval = time.Hour
+
+// creditReWarnDelay is the minimum gap between low-credit DMs to the owner
+// while the balance stays below the floor, so a dry spell nags without
+// spamming.
+const creditReWarnDelay = 6 * time.Hour
+
 // Bridge wires an XMPP connection to a `pi --mode rpc` child: owner chat
 // becomes pi commands, and pi's events become chat replies / presence /
 // typing.
@@ -99,6 +108,10 @@ type Bridge struct {
 	lastAwayStatus string    // the last pithy activity shown while away (skip repeats across periods)
 	bgProcesses    int       // background processes pi has running (relayed by the pi-processes extension)
 	pendingHeartbeats []string // long-running-process alarms queued while a run was in flight
+
+	// Periodic low-credit watcher state (see maybeCheckCredits).
+	lastCreditProbe time.Time // when the balance endpoint was last hit
+	lastCreditWarn  time.Time // when the owner was last DMed about low credit
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -469,6 +482,17 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		msg := ev.Obj("message")
 		if msg == nil || msg.Str("role") != "assistant" {
 			return
+		}
+		// A run that died on OpenRouter credits (HTTP 402) has no text to
+		// deliver — without this hook the owner got the generic "done (no
+		// reply)" nudge and no hint WHY. DM them the failure instead (see
+		// creditFailAlert), and clear the in-run recovery bookkeeping so
+		// settle can't fire a tail-retry / unanswered-hint prompt (which
+		// would just 402 again).
+		if msg.Str("stopReason") == "error" {
+			if b.creditFailAlert(msg.Str("errorMessage")) {
+				return // consumed: owner alerted, run marked replied
+			}
 		}
 		// Record whether THIS message carried text before delivering it: at
 		// settle, only the last message's answer matters, and a run whose final
@@ -2505,7 +2529,100 @@ func (b *Bridge) reportCreditIfWatched() {
 	if remaining >= b.acct.MinCreditUsd {
 		return
 	}
-	b.reply(fmt.Sprintf("⚠️ OpenRouter credit: $%.2f remaining — below your $%.2f floor, reload soon", remaining, b.acct.MinCreditUsd))
+	b.reply(lowCreditText(remaining, b.acct.MinCreditUsd))
+}
+
+// maybeCheckCredits is the proactive low-credit watcher, called from idleTick.
+// Every creditCheckInterval it probes the OpenRouter balance and DMs the owner
+// when it sits below the creditWatch floor. This closes the gap that bit Zach:
+// reportCreditIfWatched only fires on /new, so a balance that dropped below the
+// floor mid-session was never reported — until a 402 killed a run outright.
+// Re-warns at most once per creditReWarnDelay while still below the floor.
+func (b *Bridge) maybeCheckCredits() {
+	if b.acct.MinCreditUsd <= 0 {
+		return
+	}
+	key := openRouterKey()
+	if key == "" {
+		return
+	}
+	b.mu.Lock()
+	if time.Since(b.lastCreditProbe) < creditCheckInterval {
+		b.mu.Unlock()
+		return
+	}
+	b.lastCreditProbe = time.Now()
+	b.mu.Unlock()
+
+	total, used, err := openRouterCredits(key)
+	if err != nil {
+		b.log("warning", "periodic credit check failed: "+err.Error())
+		return
+	}
+	remaining := total - used
+	if remaining >= b.acct.MinCreditUsd {
+		return
+	}
+	b.mu.Lock()
+	rearm := time.Since(b.lastCreditWarn) >= creditReWarnDelay
+	if rearm {
+		b.lastCreditWarn = time.Now()
+	}
+	b.mu.Unlock()
+	if !rearm {
+		return
+	}
+	b.reply(lowCreditText(remaining, b.acct.MinCreditUsd))
+}
+
+// lowCreditText renders the below-floor credit alert shared by the /new report
+// and the periodic watcher.
+func lowCreditText(remaining, floor float64) string {
+	return fmt.Sprintf("⚠️ OpenRouter credit: $%.2f remaining — below your $%.2f floor, reload soon", remaining, floor)
+}
+
+// isCreditError reports whether a model-run error is an OpenRouter
+// out-of-credits failure (HTTP 402). pi relays the provider error verbatim in
+// the errored assistant message's errorMessage, so the 402 body text —
+// "requires more credits", "can only afford N tokens", "insufficient" — is
+// what we match.
+func isCreditError(errMsg string) bool {
+	s := strings.ToLower(errMsg)
+	return strings.Contains(s, "402") ||
+		strings.Contains(s, "more credits") ||
+		strings.Contains(s, "out of credits") ||
+		strings.Contains(s, "insufficient")
+}
+
+// creditFailAlert handles a model run that died to an OpenRouter credit
+// failure. Without this hook the run ends with no message and the owner gets
+// the generic "done (no reply)" nudge — exactly what Zach saw when a 402 hit
+// mid-work. The alert DMs the owner directly, marks the run as replied so the
+// no-reply nudge is suppressed, and returns true. Non-credit errors return
+// false and keep the existing behavior.
+func (b *Bridge) creditFailAlert(errMsg string) bool {
+	if !isCreditError(errMsg) {
+		return false
+	}
+	b.log("warning", "model run failed on OpenRouter credits: "+errMsg)
+	b.reply("⚠️ Out of OpenRouter credits — the run couldn't proceed. Top up at https://openrouter.ai/settings/credits (" + shortError(errMsg) + ")")
+	// Mark replied so the "done (no reply)" nudge is suppressed, and clear the
+	// in-run bookkeeping so settle can't fire a tail-retry or unanswered-hint
+	// prompt — a recovery prompt would just hit the same 402 again.
+	b.setReplied(true)
+	b.resetTailTracking()
+	b.markHintPending()
+	return true
+}
+
+// shortError trims a provider error string to one readable line.
+func shortError(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= 160 {
+		return s
+	}
+	return string(r[:157]) + "…"
 }
 
 // openRouterKey returns pi's configured OpenRouter API key from the auth file
@@ -2977,6 +3094,8 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 // once per idle period, once the agent has been idle past idleAwayTimeout.
 // Split out from idleWatcher so it's callable directly from tests.
 func (b *Bridge) idleTick() {
+	b.maybeCheckCredits()
+
 	b.mu.Lock()
 	idle := !b.idleSince.IsZero()
 	elapsed := time.Since(b.idleSince)
