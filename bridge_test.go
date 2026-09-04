@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -68,9 +71,9 @@ func TestBareBangIsAbort(t *testing.T) {
 		in   string
 		name string
 	}{
-		{"!", "abort"},   // lone bang → handleCommand maps to abort
-		{"!!", "!"},      // two bangs → name "!", falls through as text
-		{"! abort", ""},  // space after bang → empty name, falls through
+		{"!", "abort"},  // lone bang → handleCommand maps to abort
+		{"!!", "!"},     // two bangs → name "!", falls through as text
+		{"! abort", ""}, // space after bang → empty name, falls through
 		{"!abort", "abort"},
 	}
 	for _, c := range cases {
@@ -1227,5 +1230,171 @@ func TestToolRelayProcessCount(t *testing.T) {
 	}
 	if b.xmpp.presence != "waiting on 3 processes" {
 		t.Errorf("presence after relay = %q, want \"waiting on 3 processes\"", b.xmpp.presence)
+	}
+}
+func TestIsCreditError(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		// The real OpenRouter 402 body Zach pasted.
+		{`402: {"message":"This request requires more credits, or fewer max_tokens. You requested up to 384000 tokens, but can only afford 99218."}`, true},
+		{"This request requires more credits, or fewer max_tokens.", true},
+		{"402 insufficient balance", true},
+		{"you are out of credits", true},
+		{"Request timed out.", false},
+		{"529 overloaded_error: Overloaded", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isCreditError(c.in); got != c.want {
+			t.Errorf("isCreditError(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestLowCreditText(t *testing.T) {
+	if got := lowCreditText(3.5, 5); got != "⚠️ OpenRouter credit: $3.50 remaining — below your $5.00 floor, reload soon" {
+		t.Errorf("lowCreditText = %q", got)
+	}
+}
+
+func TestShortError(t *testing.T) {
+	if got := shortError("  a\n\nb  "); got != "a b" {
+		t.Errorf("shortError collapsed = %q, want 'a b'", got)
+	}
+	long := strings.Repeat("x", 300)
+	if got := shortError(long); len([]rune(got)) != 158 { // 157 + ellipsis
+		t.Errorf("shortError(long) len = %d, want 158", len([]rune(got)))
+	}
+}
+
+// A message_end carrying an errored assistant message with the OpenRouter 402
+// body must DM the owner (marked replied) instead of falling through to the
+// "done (no reply)" nudge.
+func TestCreditFailAlertOnMessageEnd(t *testing.T) {
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	b.acct.MinCreditUsd = 2
+	b.setReplied(false)
+
+	ev := Event{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":         "assistant",
+			"content":      []any{},
+			"stopReason":   "error",
+			"errorMessage": `402: {"message":"This request requires more credits, or fewer max_tokens."}`,
+		},
+	}
+	b.handleRPCEvent(ev)
+	if !b.replied() {
+		t.Error("credit-failed run should be marked replied so the no-reply nudge is suppressed")
+	}
+}
+
+// Non-credit run failures (timeout, overloaded) keep the existing behavior:
+// not marked replied, so the agent_settled nudge still applies.
+func TestNonCreditErrorUnchanged(t *testing.T) {
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	b.setReplied(false)
+
+	ev := Event{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":         "assistant",
+			"content":      []any{},
+			"stopReason":   "error",
+			"errorMessage": "Request timed out.",
+		},
+	}
+	b.handleRPCEvent(ev)
+	if b.replied() {
+		t.Error("non-credit error must not mark the run replied; the no-reply nudge should still apply")
+	}
+}
+
+// maybeCheckCredits probes at most once per creditCheckInterval, DMs the owner
+// when the balance is below the floor, and re-warns at most once per
+// creditReWarnDelay while still below.
+func TestMaybeCheckCredits(t *testing.T) {
+	// Point openRouterKey at a temp auth file.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"openrouter":{"key":"sk-or-test"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PI_CODING_AGENT_DIR", dir)
+
+	// Stub the credits endpoint, counting hits. remaining is mutable so the
+	// same server can answer both below- and above-floor states.
+	var (
+		hitsMu    sync.Mutex
+		hits      int
+		remaining = 2.0 // below the $5 floor
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitsMu.Lock()
+		hits++
+		hitsMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, fmt.Sprintf(`{"data":{"total_credits":10,"total_usage":%v}}`, 10-remaining))
+	}))
+	defer srv.Close()
+	orig := creditEndpoint
+	creditEndpoint = srv.URL
+	defer func() { creditEndpoint = orig }()
+
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	b.acct.MinCreditUsd = 5
+
+	b.maybeCheckCredits()
+	if b.lastCreditWarn.IsZero() {
+		t.Fatal("below-floor balance should warn the owner on the first probe")
+	}
+	warn1 := b.lastCreditWarn
+
+	// Immediate re-call: interval gate suppresses another probe/warn.
+	b.maybeCheckCredits()
+	if !b.lastCreditWarn.Equal(warn1) {
+		t.Error("re-warn fired inside creditCheckInterval")
+	}
+	b.mu.Lock()
+	hitsNow := hits
+	b.mu.Unlock()
+	if hitsNow != 1 {
+		t.Errorf("endpoint hit %d times in one interval, want 1", hitsNow)
+	}
+
+	// Above the floor: a fresh probe must not warn.
+	remaining = 8                   // $8 remaining > $5 floor
+	b.lastCreditProbe = time.Time{} // force a fresh probe
+	b.lastCreditWarn = time.Time{}
+	b.maybeCheckCredits()
+	if !b.lastCreditWarn.IsZero() {
+		t.Error("above-floor balance must not warn")
+	}
+}
+
+// Accounts without a creditWatch floor must never probe the endpoint at all.
+func TestMaybeCheckCreditsNoFloor(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"openrouter":{"key":"sk-or-test"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PI_CODING_AGENT_DIR", dir)
+
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer srv.Close()
+	orig := creditEndpoint
+	creditEndpoint = srv.URL
+	defer func() { creditEndpoint = orig }()
+
+	b := roomBridge() // MinCreditUsd = 0
+	b.maybeCheckCredits()
+	if hits != 0 {
+		t.Errorf("endpoint hit %d times with no floor configured, want 0", hits)
 	}
 }
