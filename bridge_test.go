@@ -216,6 +216,8 @@ func TestClassifyDest(t *testing.T) {
 // indicator is withheld while the reply is still streaming / has not yet
 // written a routing line, and once a completed "to:" line appears it points at
 // that line's 1:1 recipient — or stays dark for a room, noop, or blocked target.
+// delivers reports whether that line will emit a stanza (the presence-label
+// upgrade from "muttering…" to "replying…").
 func TestStreamTypingTarget(t *testing.T) {
 	x := NewXMPPBridge(
 		ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"},
@@ -223,32 +225,35 @@ func TestStreamTypingTarget(t *testing.T) {
 	)
 	x.occupants["team@muc.x"] = map[string]string{"alice": "alice@x"}
 	cases := []struct {
-		buf     string
-		target  string
-		decided bool
+		buf      string
+		target   string
+		decided  bool
+		delivers bool
 	}{
 		// Not yet a complete routing line → keep waiting.
-		{"", "", false},
-		{"to:", "", false},
-		{"to: zach", "", false},
-		{"to: zach@x", "", false},
-		// Owner 1:1 → indicator on the owner.
-		{"to: zach@x\n", "zach@x", true},
-		{"to: zach@x/phone\n", "zach@x", true},
-		// Known occupant → indicator on the occupant.
-		{"to: alice@x\n", "alice@x", true},
+		{"", "", false, false},
+		{"to:", "", false, false},
+		{"to: zach", "", false, false},
+		{"to: zach@x", "", false, false},
+		// Owner 1:1 → indicator on the owner, delivers.
+		{"to: zach@x\n", "zach@x", true, true},
+		{"to: zach@x/phone\n", "zach@x", true, true},
+		// Known occupant → indicator on the occupant, delivers.
+		{"to: alice@x\n", "alice@x", true, true},
 		// A leading non-routing line is skipped; the routing still resolves.
-		{"sure\nto: zach@x\n", "zach@x", true},
-		// Room, noop, and unknown targets never light the owner's bubble.
-		{"to: team@muc.x\n", "", true},
-		{"to: noop\n", "", true},
-		{"to: stranger@x\n", "", true},
+		{"sure\nto: zach@x\n", "zach@x", true, true},
+		// Room deliveries never light the owner's bubble but DO deliver.
+		{"to: team@muc.x\n", "", true, true},
+		// Noop and unknown targets send nothing and never light the bubble.
+		{"to: noop\n", "", true, false},
+		{"to: stranger@x\n", "", true, false},
+		{"to: zach@x\ncommentary only", "zach@x", true, true},
 	}
 	for _, c := range cases {
-		got, decided := streamTypingTarget(c.buf, x)
-		if got != c.target || decided != c.decided {
-			t.Errorf("streamTypingTarget(%q) = (%q,%v), want (%q,%v)",
-				c.buf, got, decided, c.target, c.decided)
+		got, decided, delivers := streamTypingTarget(c.buf, x)
+		if got != c.target || decided != c.decided || delivers != c.delivers {
+			t.Errorf("streamTypingTarget(%q) = (%q,%v,%v), want (%q,%v,%v)",
+				c.buf, got, decided, delivers, c.target, c.decided, c.delivers)
 		}
 	}
 }
@@ -1048,6 +1053,11 @@ func TestStreamDeltaContractRoomMode(t *testing.T) {
 	if b.typingTo != "" {
 		t.Errorf("room-mode text_start typing target = %q, want empty (route unknown)", b.typingTo)
 	}
+	// Until a routing line proves a real reply, the stream reads as
+	// inter-tool commentary: label it muttering, not replying.
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("room-mode text_start presence = %q, want muttering…", b.xmpp.presence)
+	}
 
 	// The routing line arrives split across deltas, as it does on the wire.
 	for _, d := range []string{"to: ", "zach", "@x\n", "hi"} {
@@ -1056,10 +1066,41 @@ func TestStreamDeltaContractRoomMode(t *testing.T) {
 	if b.typingTo != "zach@x" {
 		t.Errorf("room-mode typing target = %q, want zach@x", b.typingTo)
 	}
+	// The routing line resolves to a real delivery: the label upgrades to
+	// replying, matching the lit composer.
+	if b.xmpp.presence != "replying…" {
+		t.Errorf("room-mode routed presence = %q, want replying…", b.xmpp.presence)
+	}
 
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
 	if b.typingTo != "" {
 		t.Errorf("room-mode text_end typing target = %q, want empty", b.typingTo)
+	}
+}
+
+// TestStreamDeltaCommentaryStaysMuttering pins that a stream carrying no
+// routing line — inter-tool commentary that will never be delivered — keeps
+// the "muttering…" label for the whole stream, and that a "to: noop" route
+// (deliberate silence, nothing sent) does not upgrade it either.
+func TestStreamDeltaCommentaryStaysMuttering(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}})
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "thinking_start"}))
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
+	for _, d := range []string{"let me ", "check the ", "file\n", "done"} {
+		b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": d}))
+	}
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("commentary stream presence = %q, want muttering…", b.xmpp.presence)
+	}
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
+
+	// A deliberate-silence route resolves but delivers nothing: still muttering.
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": "to: noop\n"}))
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("noop stream presence = %q, want muttering…", b.xmpp.presence)
 	}
 }
 
