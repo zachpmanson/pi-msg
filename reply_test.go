@@ -191,19 +191,21 @@ func TestStreamTypingTargetStanzaID(t *testing.T) {
 	x.recordMessage(roomMsg, "team@muc.x/alice")
 
 	// A 1:1 message resolves to the owner, so the composer lights up.
-	target, decided := streamTypingTarget("to: "+ownerMsg+"\n", x)
-	if !decided || target != "zach@x" {
-		t.Errorf("owner id = (%q,%v), want (\"zach@x\",true)", target, decided)
+	target, decided, delivers := streamTypingTarget("to: "+ownerMsg+"\n", x)
+	if !decided || target != "zach@x" || !delivers {
+		t.Errorf("owner id = (%q,%v,%v), want (\"zach@x\",true,true)", target, decided, delivers)
 	}
-	// A room message is not a 1:1 chat, so the composer stays dark.
-	target, decided = streamTypingTarget("to: "+roomMsg+"\n", x)
-	if !decided || target != "" {
-		t.Errorf("room id = (%q,%v), want (\"\",true)", target, decided)
+	// A room message is not a 1:1 chat, so the composer stays dark — but it
+	// still delivers, so the label upgrades to replying.
+	target, decided, delivers = streamTypingTarget("to: "+roomMsg+"\n", x)
+	if !decided || target != "" || !delivers {
+		t.Errorf("room id = (%q,%v,%v), want (\"\",true,true)", target, decided, delivers)
 	}
-	// An unknown id is a routing failure, and a failure never types.
-	target, decided = streamTypingTarget("to: ffffffff-ffff-ffff-ffff-ffffffffffff\n", x)
-	if !decided || target != "" {
-		t.Errorf("unknown id = (%q,%v), want (\"\",true)", target, decided)
+	// An unknown id is a routing failure, and a failure never types or
+	// delivers.
+	target, decided, delivers = streamTypingTarget("to: ffffffff-ffff-ffff-ffff-ffffffffffff\n", x)
+	if !decided || target != "" || delivers {
+		t.Errorf("unknown id = (%q,%v,%v), want (\"\",true,false)", target, decided, delivers)
 	}
 }
 

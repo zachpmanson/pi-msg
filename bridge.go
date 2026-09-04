@@ -387,7 +387,7 @@ func (b *Bridge) shutdown(reason string) {
 // mean "busy" (see docs): the typing indicator = "a message is arriving right
 // now" (lit only while assistant text streams); presence <show> = availability
 // (dnd while a run is in flight, available when idle); presence <status> = the
-// current activity label (thinking / running a tool / replying / retrying).
+// current activity label (thinking / running a tool / muttering / replying / retrying).
 func (b *Bridge) handleRPCEvent(ev Event) {
 	switch ev.Type() {
 	case "agent_start":
@@ -2697,7 +2697,19 @@ func (b *Bridge) handleStreamDelta(ev Event) {
 	case "thinking_start":
 		b.xmpp.SetPresence("dnd", "thinking…")
 	case "text_start":
-		b.xmpp.SetPresence("dnd", "replying…")
+		// Presence label: a room-mode stream is most often inter-tool
+		// commentary that never gains a "to:" line and is never delivered,
+		// so it starts as "muttering…" and only upgrades to "replying…"
+		// once a routing line proves a real reply (see streamTypingDelta).
+		// The typing indicator is the "message actually about to be routed"
+		// signal (issue #44), so a muttering label cannot be mistaken for a
+		// pending reply. A pure 1:1 account has no routing contract — every
+		// streamed word IS the reply, so it stays "replying…".
+		if b.acct.RoomMode() {
+			b.xmpp.SetPresence("dnd", "muttering…")
+		} else {
+			b.xmpp.SetPresence("dnd", "replying…")
+		}
 		// In a room-mode account the reply's destination is only known once
 		// its "to: <jid>" routing line streams in, so typing is withheld
 		// until then rather than lit speculatively on the owner (issue #44).
@@ -2812,26 +2824,35 @@ func (b *Bridge) streamTypingDelta(delta string) {
 		return
 	}
 	b.typingStream += delta
-	target, decided := streamTypingTarget(b.typingStream, b.xmpp)
+	target, decided, delivers := streamTypingTarget(b.typingStream, b.xmpp)
 	if !decided {
 		return
 	}
 	b.typingRoutingDone = true
 	if target == "" {
 		b.stopTyping()
-		return
+	} else {
+		b.startTypingTo(target)
 	}
-	b.startTypingTo(target)
+	// A completed routing line that will actually emit a stanza upgrades the
+	// label from "muttering…" to "replying…"; a line that sends nothing
+	// (noop, an unknown stanza id, a blocked target) keeps the composer dark
+	// and the label honest as muttering.
+	if delivers {
+		b.xmpp.SetPresence("dnd", "replying…")
+	}
 }
 
 // streamTypingTarget inspects the partial streamed text for a completed routing
-// line and maps it to a typing recipient. It returns (target, true) once a
-// routing line resolves — target "" means the composer must stay dark — or
-// ("", false) while the text is still streaming and no complete line exists.
-// Only a destination that classifies as a 1:1 chat (the owner or a plain
-// occupant) earns an indicator; a room, "noop", or blocked target never lights
-// the owner's bubble.
-func streamTypingTarget(buf string, xm *XMPPBridge) (target string, decided bool) {
+// line and maps it to a typing recipient. It returns (target, decided,
+// delivers): decided is true once a routing line resolves, target is the 1:1
+// recipient whose composer should light ("" means the composer must stay dark),
+// and delivers reports whether that line will actually emit a stanza (a 1:1 or
+// room reply) as opposed to sending nothing — a noop, an unknown stanza id, or
+// a blocked target never delivers, exactly as their composer stays dark. The
+// delivers flag is what upgrades the presence label from "muttering…" to
+// "replying…" (see streamTypingDelta).
+func streamTypingTarget(buf string, xm *XMPPBridge) (target string, decided bool, delivers bool) {
 	hasEnd := strings.HasSuffix(buf, "\n")
 	lines := strings.Split(buf, "\n")
 	end := len(lines)
@@ -2846,22 +2867,27 @@ func streamTypingTarget(buf string, xm *XMPPBridge) (target string, decided bool
 			continue
 		}
 		if strings.EqualFold(dest, destNoopName) {
-			return "", true
+			return "", true, false
 		}
 		// A stanza-id route lights the composer only if the id resolves; an
-		// unknown id is a routing failure, and a failure never types.
+		// unknown id is a routing failure, and a failure never types or
+		// delivers.
 		if replyTo != "" {
 			dest = xm.lookupMessage(replyTo)
 			if dest == "" {
-				return "", true
+				return "", true, false
 			}
 		}
-		if xm.classifyDest(dest) == destUser {
-			return bareJid(dest), true
+		switch xm.classifyDest(dest) {
+		case destUser:
+			return bareJid(dest), true, true
+		case destRoom:
+			return "", true, true // a room reply delivers, but never lights a 1:1 composer
+		default: // blocked or otherwise not an allowed chat
+			return "", true, false
 		}
-		return "", true // room, blocked, or otherwise not a 1:1 chat
 	}
-	return "", false
+	return "", false, false
 }
 
 // stopTyping is unconditional so a running indicator can always be cleared
