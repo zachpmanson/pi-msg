@@ -103,33 +103,94 @@ export default function xmppTools(pi: ExtensionAPI) {
 		}
 	}
 
-	pi.events.on(PROCESS_STARTED, () => {
+	pi.events.on(PROCESS_STARTED, (info: unknown) => {
 		void refreshProcessCount();
+		// Arm the per-process heartbeat schedule anchored to this process's
+		// start time (the payload is the full ProcessInfo incl. startTime).
+		const id = String((info as { id?: unknown })?.id ?? "");
+		const startTime = (info as { startTime?: unknown })?.startTime;
+		if (id && typeof startTime === "number") {
+			cancelHeartbeat(id); // safety: never double-schedule an id
+			heartbeatSched.set(id, { startTime, boundary: 1 });
+			scheduleNextBoundary(id);
+		}
 	});
-	pi.events.on(PROCESS_ENDED, () => {
+	pi.events.on(PROCESS_ENDED, (info: unknown) => {
 		void refreshProcessCount();
+		// A process that ended must not fire a stale heartbeat, and its
+		// pending report (if any) is dropped with it.
+		const id = String((info as { id?: unknown })?.id ?? "");
+		if (id) cancelHeartbeat(id);
 	});
 	// processes:changed fires on clear/rename — anything that alters the list
 	// without a start/end (e.g. the agent clearing finished entries), so the
-	// presence corrects itself instead of staying dnd on a stale count.
-	pi.events.on(PROCESS_CHANGED, () => {
+	// presence corrects itself instead of staying dnd on a stale count. When
+	// the manager clears the whole registry (reason "cleared") we drop every
+	// pending schedule; on started/ended it just mirrors the events above and
+	// does nothing heartbeat-specific.
+	pi.events.on(PROCESS_CHANGED, (payload: unknown) => {
 		void refreshProcessCount();
+		if ((payload as { reason?: unknown })?.reason === "cleared") {
+			for (const id of [...heartbeatSched.keys()]) cancelHeartbeat(id);
+			heartbeatDue.clear();
+		}
 	});
 
 	// --- Long-running-process heartbeats ---
 	//
 	// While background processes run, pi-msg keeps the agent's presence dnd so
 	// it doesn't drift away — but a process that runs for hours is invisible
-	// once the agent has settled. Every HEARTBEAT_INTERVAL_MS this extension
-	// asks pi-msg to wake the idle agent with a status line + log tail for each
-	// live process that has been running for at least one full interval
-	// (elapsed computed from the manager's startTime, so the reported seconds
-	// are always the true value). The bridge decides when delivery is safe
-	// (never mid-run) and does the actual prompt injection; this side only
-	// gathers and relays.
+	// once the agent has settled. Rather than a wall-clock poll (which misses a
+	// 12-min run, as discovered 2026-09-04), each process's heartbeat is
+	// *scheduled*: on processes:started we arm a timer at the 10-minute
+	// boundary after start, and re-arm on each fire (10m, 20m, 30m, …). Each
+	// timer just marks the process "due"; a short coalescing flusher drains
+	// everything that is due-and-live into a single relayed heartbeat, so N
+	// simultaneous boundaries collapse into one wakeup. The bridge decides
+	// when delivery is safe (never mid-run) and does the prompt injection;
+	// this side only gathers and relays.
 	const PROCESS_COMBINED_OUTPUT = "processes:request:combined_output";
 	const HEARTBEAT_INTERVAL_MS = Number(process.env.PI_MSG_PROCESS_HEARTBEAT_MS ?? 600_000);
+	const HEARTBEAT_FLUSH_MS = Number(process.env.PI_MSG_PROCESS_HEARTBEAT_FLUSH_MS ?? 2_000);
 	const HEARTBEAT_TAIL_LINES = 40;
+
+	// Per-process scheduled boundary timers, keyed by process id. `boundary`
+	// is the next 10-minute boundary index to fire (1 = 10m after start); it
+	// increments each time a boundary comes due so the cadence compounds for
+	// the life of the process.
+	interface HeartbeatSched {
+		startTime: number;
+		boundary: number;
+		timer?: ReturnType<typeof setTimeout>;
+	}
+	const heartbeatSched = new Map<string, HeartbeatSched>();
+	// Process ids whose next boundary has come due and are awaiting the next
+	// flush. Set membership is how the flusher knows what to relay.
+	const heartbeatDue = new Set<string>();
+
+	// scheduleNextBoundary arms (or re-arms) the timer for a process's next
+	// 10-minute boundary, relative to its start time. On fire it marks the
+	// process due and schedules the following boundary.
+	function scheduleNextBoundary(id: string) {
+		const s = heartbeatSched.get(id);
+		if (!s) return;
+		const nextAt = s.startTime + s.boundary * HEARTBEAT_INTERVAL_MS;
+		const delay = Math.max(0, nextAt - Date.now());
+		s.timer = setTimeout(() => {
+			heartbeatDue.add(id);
+			s.boundary += 1;
+			scheduleNextBoundary(id); // arm the next boundary
+		}, delay);
+	}
+
+	// cancelHeartbeat stops a process's schedule and drops any pending report.
+	// Safe to call for an id with no schedule.
+	function cancelHeartbeat(id: string) {
+		const s = heartbeatSched.get(id);
+		if (s?.timer) clearTimeout(s.timer);
+		heartbeatSched.delete(id);
+		heartbeatDue.delete(id);
+	}
 
 	// queryProcesses asks the pi-processes manager for the full process list
 	// (same channel as queryProcessCount, but returns the entries).
@@ -190,25 +251,32 @@ export default function xmppTools(pi: ExtensionAPI) {
 		});
 	}
 
-	// heartbeatTick is the interval alarm: for every live process that has been
-	// running for at least one full interval, attach its name, true elapsed
-	// time and a log tail, and relay a single process_heartbeat — so the bridge
-	// wakes the (idle) agent once with everything at once, not once per process.
-	async function heartbeatTick() {
+	// flushHeartbeats is the coalescing drain: it relays a single
+	// process_heartbeat for every process that has come due since the last
+	// flush and is still live. Due-but-ended processes are dropped (their
+	// cancel on ended already removed them, so this is a belt-and-braces
+	// liveness check against the authoritative manager).
+	async function flushHeartbeats() {
 		if (!ui) return;
+		if (heartbeatDue.size === 0) return;
 		try {
 			const processes = await queryProcesses();
 			const now = Date.now();
-			const overdue: Array<Record<string, unknown>> = [];
+			const byId = new Map<string, Record<string, unknown>>();
 			for (const p of processes) {
-				const status = String(p.status ?? "");
-				if (!LIVE_STATUSES.has(status)) continue;
+				if (LIVE_STATUSES.has(String(p.status ?? ""))) {
+					const id = String(p.id ?? "");
+					if (id) byId.set(id, p);
+				}
+			}
+			const reports: Array<Record<string, unknown>> = [];
+			for (const id of heartbeatDue) {
+				heartbeatDue.delete(id); // drain: each due mark is relayed at most once
+				const p = byId.get(id);
+				if (!p) continue;
 				const startTime = p.startTime;
 				const elapsedMs = typeof startTime === "number" ? now - startTime : 0;
-				if (elapsedMs < HEARTBEAT_INTERVAL_MS) continue;
-				const id = String(p.id ?? "");
-				if (!id) continue;
-				overdue.push({
+				reports.push({
 					id,
 					name: String(p.name ?? id),
 					command: String(p.command ?? ""),
@@ -216,22 +284,22 @@ export default function xmppTools(pi: ExtensionAPI) {
 					tail: await fetchProcessTail(id),
 				});
 			}
-			if (overdue.length === 0) return;
-			await relay("process_heartbeat", { processes: overdue });
+			if (reports.length === 0) return;
+			await relay("process_heartbeat", { processes: reports });
 		} catch {
 			// Best-effort: a dropped heartbeat is just a missed status check.
 		}
 	}
 
-	// The heartbeat interval. Registered at session_start: setInterval is
-	// non-blocking, so it is safe under the rule that no relay/dialog may run
-	// synchronously in that hook.
-	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-	function startHeartbeat() {
-		if (heartbeatTimer) return;
-		heartbeatTimer = setInterval(() => {
-			void heartbeatTick();
-		}, HEARTBEAT_INTERVAL_MS);
+	// The coalescing flusher interval. Registered at session_start: setInterval
+	// is non-blocking, so it is safe under the rule that no relay/dialog may
+	// run synchronously in that hook.
+	let flushTimer: ReturnType<typeof setInterval> | undefined;
+	function startFlusher() {
+		if (flushTimer) return;
+		flushTimer = setInterval(() => {
+			void flushHeartbeats();
+		}, HEARTBEAT_FLUSH_MS);
 	}
 
 	pi.on("session_start", (_event, ctx) => {
@@ -248,7 +316,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 		setTimeout(() => {
 			void refreshProcessCount();
 		}, 2000);
-		startHeartbeat();
+		startFlusher();
 	});
 
 	// Inject the agent's identity ($PI_MSG_ACCOUNT) at the top of every system
