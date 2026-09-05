@@ -279,6 +279,18 @@ nix run   github:zachpmanson/pi-msg    # run the bridge
 nix build github:zachpmanson/pi-msg    # build the package (bin: pi-msg)
 ```
 
+The flake additionally ships **`.#pi`** — the pi CLI itself, packaged from its npm
+tarball (prebuilt `dist/`, nothing to compile), so a deployment can put pi in the
+Nix store instead of `npm install -g`. That makes pi bumps atomic: a switch swaps
+store paths (old and new coexist until GC), instead of re-extracting into a live
+`~/.npm-global` and racing the pi-msg service restarts (2026-09-04: every bridge
+crashed with `ENOENT …/theme/dark.json`).
+
+`.#pi`'s `passthru.piAgentVersion` mirrors the main package's — read it from the
+Nix side rather than maintaining a second pin. Bumping pi follows the 4 steps in
+the flake comment on `piAgentVersion` (new tarball → vendored `pi-0.84.4.tgz` →
+integrity-patch `npm-shrinkwrap.json` → refresh `npmDepsHash`).
+
 Dev shell (Go + gopls) via `nix develop`, or automatically with
 [direnv](https://direnv.net/) — the repo ships a `.envrc` (`use flake`); run
 `direnv allow` once.
