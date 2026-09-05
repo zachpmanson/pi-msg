@@ -575,3 +575,39 @@ func TestPresenceChildrenMarshal(t *testing.T) {
 		}
 	}
 }
+
+// TestDispatchRoomOwnEchoCaseInsensitive verifies the MUC own-echo filter drops
+// messages from our own nick even when the server echoes a differently-cased
+// resource (XMPP nick matching is case-folded; a case-sensitive compare was
+// the #29 loop precondition). Other occupants' messages must still forward.
+func TestDispatchRoomOwnEchoCaseInsensitive(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{Nick: "pi", Rooms: []string{"team@muc.x.com"}}, nil, nil)
+	b.selfNick = map[string]string{"team@muc.x.com": "pi"}
+	var got []InboundMessage
+	b.onMsg = func(m InboundMessage) { got = append(got, m) }
+
+	for _, from := range []string{
+		"team@muc.x.com/pi",    // own nick, exact case (server-confirmed)
+		"team@muc.x.com/Pi",    // differently-cased resource — must still drop
+		"team@muc.x.com/PI",    // all-caps variant
+		"team@muc.x.com/peppy", // another occupant forwards
+	} {
+		b.dispatchRoom(incomingMsg{typ: "groupchat", from: from, body: "pi: hello"})
+	}
+	if len(got) != 1 || got[0].Nick != "peppy" {
+		t.Fatalf("dispatchRoom forwarded %d messages (want only peppy): %+v", len(got), got)
+	}
+}
+
+// TestDispatchRoomOwnEchoFallsBackToAccountNick covers the pre-110 window where
+// the server-confirmed nick is unknown and ownNick falls back to the configured
+// account nick.
+func TestDispatchRoomOwnEchoFallsBackToAccountNick(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{Nick: "pi", Rooms: []string{"team@muc.x.com"}}, nil, nil) // selfNick unset
+	var got []InboundMessage
+	b.onMsg = func(m InboundMessage) { got = append(got, m) }
+	b.dispatchRoom(incomingMsg{typ: "groupchat", from: "team@muc.x.com/Pi", body: "anything"})
+	if len(got) != 0 {
+		t.Fatalf("own-echo from fallback nick forwarded: %+v", got)
+	}
+}
