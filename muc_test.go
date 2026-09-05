@@ -492,3 +492,29 @@ func TestHandleIssuesBroadcastAndEnumeration(t *testing.T) {
 		t.Errorf("unknown=%v self=%q, want [zbeltino] and no self-tag", unknown, self)
 	}
 }
+
+// TestHandleRoomDropsOwnEcho is defence in depth (#29): even if the transport
+// echo filter in dispatchRoom misses, a room message whose sender nick matches
+// our own must be dropped at dispatch — not re-enter classify (where a
+// self-addressed body would dispatch as commentary and prompt ourselves).
+func TestHandleRoomDropsOwnEcho(t *testing.T) {
+	b := roomBridge()
+	b.xmpp = &XMPPBridge{acct: ResolvedAccount{Nick: "pi"}, selfNick: map[string]string{"team@muc.x.com": "pi"}}
+
+	// Own-echo with a body that would otherwise be ambient: must not buffer.
+	b.handleRoom(InboundMessage{Body: "just chatting", Nick: "PI", Room: "team@muc.x.com"})
+	if got := b.drainAmbient(); got != "" {
+		t.Fatalf("own-echo buffered as ambient: %q", got)
+	}
+	// Own-echo addressed to our own trigger: must not dispatch as commentary
+	// (without the guard this hits dispatchCommentary and prompts ourselves).
+	b.handleRoom(InboundMessage{Body: "pi: status?", Nick: "pI", Room: "team@muc.x.com"})
+	if got := b.drainAmbient(); got != "" {
+		t.Fatalf("own-echo leaked to dispatch: %q", got)
+	}
+	// Non-own nick still flows: ambient chatter buffers as usual.
+	b.handleRoom(InboundMessage{Body: "just chatting", Nick: "peppy", Room: "team@muc.x.com"})
+	if got := b.drainAmbient(); !strings.Contains(got, "peppy: just chatting") {
+		t.Fatalf("other occupant's ambient message not buffered: %q", got)
+	}
+}

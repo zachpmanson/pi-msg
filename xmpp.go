@@ -1020,7 +1020,11 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	if nick == "" {
 		return // room-level stanza (e.g. subject with no occupant)
 	}
-	if nick == b.ownNick(room) {
+	// Own-echo guard — case-insensitive (#29): XMPP nick matching is case-folded
+	// in principle, so a server echoing a differently-cased resource must not
+	// defeat the filter (a miss lets our own message re-enter classify and
+	// prompt ourselves).
+	if strings.EqualFold(nick, b.ownNick(room)) {
 		return // our own echo
 	}
 	if m.delay {

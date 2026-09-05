@@ -775,6 +775,15 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string) {
 // trigger; a non-owner addressing the bot by name → untrusted-commentary
 // trigger; anything else → buffered ambient (no turn).
 func (b *Bridge) handleRoom(m InboundMessage) {
+	// Defence in depth (#29): the transport echo filter in dispatchRoom should
+	// already have dropped our own echo (case-insensitively). If one still
+	// arrives here, the transport guard missed — drop it rather than let it
+	// re-enter classify and prompt ourselves. Firing this guard logs loudly
+	// because it means the transport-level filter is broken.
+	if m.Nick != "" && b.xmpp != nil && strings.EqualFold(m.Nick, b.xmpp.ownNick(m.Room)) {
+		b.log("warning", fmt.Sprintf("own-echo reached dispatch despite transport guard (nick %q in %s); dropping", m.Nick, m.Room))
+		return
+	}
 	action, body := b.classify(m)
 	// Cascade bound (#23): an owner message resets the budget; agent-to-agent
 	// turns spend it. When exhausted, the trigger degrades to ambient so the
