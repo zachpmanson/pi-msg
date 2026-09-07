@@ -900,8 +900,11 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.reportResult(err, res, "🆕 new session ready", "/new")
 		if err == nil {
 			// /new also reports OpenRouter credit when a creditWatch floor is
-			// configured (see reportCreditIfWatched).
-			b.reportCreditIfWatched()
+			// configured (see reportCreditIfWatched). It's diagnostic only —
+			// fetch it off the event loop so a slow credits endpoint can't
+			// stall /new's cleanup (session file refresh, routing re-seed) or
+			// block queued inbound messages behind the handler.
+			go b.reportCreditIfWatched()
 			// /new swaps to a brand-new session, but pi does NOT emit a
 			// session_start event over the RPC stream (it's a lifecycle hook the
 			// extension sees via pi.on(), not an event the bridge receives — the
