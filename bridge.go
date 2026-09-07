@@ -883,12 +883,15 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 // caller forwards it to pi as a prompt.
 func (b *Bridge) handleCommand(t string) bool {
 	name, arg := splitCommand(t)
-	// A lone "!" is shorthand for /abort: with no command name after the
-	// prefix it would otherwise fall through to pi as a degenerate literal
-	// prompt (an empty control command). "!abort", "!new" etc. already work
-	// through splitCommand's prefix alias.
+	// A lone "!" is the quick interrupt — deliberately NOT /abort. With no
+	// command name after the prefix it would otherwise fall through to pi as a
+	// degenerate literal prompt (an empty control command); instead it only
+	// stops whatever is currently running (a command or thinking) and leaves
+	// pi's queued messages intact, so the next one evaluates the moment the
+	// aborted run stops. "!abort", "!new" etc. still work through
+	// splitCommand's prefix alias, and keep their /-equivalent behaviour.
 	if t == "!" {
-		name = "abort"
+		name = "interrupt"
 	}
 	switch name {
 	case "new":
@@ -946,6 +949,15 @@ func (b *Bridge) handleCommand(t string) bool {
 			msg += fmt.Sprintf(" (%d queued messages dropped)", dropped)
 		}
 		b.reply(msg)
+	case "interrupt":
+		// Bare "!": stop the current command/thinking WITHOUT flushing the
+		// queue. Only the abort RPC is sent — clear_queue is what drops
+		// queued steers/follow-ups, and only /abort asks for that, so pi
+		// evaluates the next queued message as soon as the abort lands.
+		b.rpc.Abort()
+		b.settleLocally()
+		b.lifecycleReact("⏹") // interrupted
+		b.reply("⏹ interrupted — continuing with the next queued message")
 	case "quit", "exit":
 		b.shutdown("requested over chat")
 	case "dump":
