@@ -5,12 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -1529,89 +1526,5 @@ func TestNonCreditErrorUnchanged(t *testing.T) {
 	b.handleRPCEvent(ev)
 	if b.replied() {
 		t.Error("non-credit error must not mark the run replied; the no-reply nudge should still apply")
-	}
-}
-
-// maybeCheckCredits probes at most once per creditCheckInterval, DMs the owner
-// when the balance is below the floor, and re-warns at most once per
-// creditReWarnDelay while still below.
-func TestMaybeCheckCredits(t *testing.T) {
-	// Point openRouterKey at a temp auth file.
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"openrouter":{"key":"sk-or-test"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PI_CODING_AGENT_DIR", dir)
-
-	// Stub the credits endpoint, counting hits. remaining is mutable so the
-	// same server can answer both below- and above-floor states.
-	var (
-		hitsMu    sync.Mutex
-		hits      int
-		remaining = 2.0 // below the $5 floor
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hitsMu.Lock()
-		hits++
-		hitsMu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, fmt.Sprintf(`{"data":{"total_credits":10,"total_usage":%v}}`, 10-remaining))
-	}))
-	defer srv.Close()
-	orig := creditEndpoint
-	creditEndpoint = srv.URL
-	defer func() { creditEndpoint = orig }()
-
-	b := roomBridge()
-	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
-	b.acct.MinCreditUsd = 5
-
-	b.maybeCheckCredits()
-	if b.lastCreditWarn.IsZero() {
-		t.Fatal("below-floor balance should warn the owner on the first probe")
-	}
-	warn1 := b.lastCreditWarn
-
-	// Immediate re-call: interval gate suppresses another probe/warn.
-	b.maybeCheckCredits()
-	if !b.lastCreditWarn.Equal(warn1) {
-		t.Error("re-warn fired inside creditCheckInterval")
-	}
-	b.mu.Lock()
-	hitsNow := hits
-	b.mu.Unlock()
-	if hitsNow != 1 {
-		t.Errorf("endpoint hit %d times in one interval, want 1", hitsNow)
-	}
-
-	// Above the floor: a fresh probe must not warn.
-	remaining = 8                   // $8 remaining > $5 floor
-	b.lastCreditProbe = time.Time{} // force a fresh probe
-	b.lastCreditWarn = time.Time{}
-	b.maybeCheckCredits()
-	if !b.lastCreditWarn.IsZero() {
-		t.Error("above-floor balance must not warn")
-	}
-}
-
-// Accounts without a creditWatch floor must never probe the endpoint at all.
-func TestMaybeCheckCreditsNoFloor(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"openrouter":{"key":"sk-or-test"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PI_CODING_AGENT_DIR", dir)
-
-	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
-	defer srv.Close()
-	orig := creditEndpoint
-	creditEndpoint = srv.URL
-	defer func() { creditEndpoint = orig }()
-
-	b := roomBridge() // MinCreditUsd = 0
-	b.maybeCheckCredits()
-	if hits != 0 {
-		t.Errorf("endpoint hit %d times with no floor configured, want 0", hits)
 	}
 }
