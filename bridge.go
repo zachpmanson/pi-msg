@@ -21,15 +21,6 @@ import (
 // it (~30s), so the typing indicator stays lit while the agent works.
 const typingRefresh = 20 * time.Second
 
-// creditCheckInterval is how often the proactive low-credit watcher probes the
-// OpenRouter balance (see maybeCheckCredits).
-const creditCheckInterval = time.Hour
-
-// creditReWarnDelay is the minimum gap between low-credit DMs to the owner
-// while the balance stays below the floor, so a dry spell nags without
-// spamming.
-const creditReWarnDelay = 6 * time.Hour
-
 // Bridge wires an XMPP connection to a `pi --mode rpc` child: owner chat
 // becomes pi commands, and pi's events become chat replies / presence /
 // typing.
@@ -102,16 +93,12 @@ type Bridge struct {
 	// must never be hinted about in turn: the agent has just been asked to catch
 	// up, so whatever it sends IS the catch-up. Hinting again would ask it to
 	// check its own correction, and could do so for as long as the budget lasts.
-	hintPending    bool
-	idleSince      time.Time // when the agent last became idle; zero while a run is in flight
-	awayAnnounced  bool      // the away transition has been announced this idle period
-	lastAwayStatus string    // the last pithy activity shown while away (skip repeats across periods)
-	bgProcesses    int       // background processes pi has running (relayed by the pi-processes extension)
-	pendingHeartbeats []string // long-running-process alarms queued while a run was in flight
-
-	// Periodic low-credit watcher state (see maybeCheckCredits).
-	lastCreditProbe time.Time // when the balance endpoint was last hit
-	lastCreditWarn  time.Time // when the owner was last DMed about low credit
+	hintPending       bool
+	idleSince         time.Time // when the agent last became idle; zero while a run is in flight
+	awayAnnounced     bool      // the away transition has been announced this idle period
+	lastAwayStatus    string    // the last pithy activity shown while away (skip repeats across periods)
+	bgProcesses       int       // background processes pi has running (relayed by the pi-processes extension)
+	pendingHeartbeats []string  // long-running-process alarms queued while a run was in flight
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
@@ -2556,51 +2543,7 @@ func (b *Bridge) reportCreditIfWatched() {
 	b.reply(lowCreditText(remaining, b.acct.MinCreditUsd))
 }
 
-// maybeCheckCredits is the proactive low-credit watcher, called from idleTick.
-// Every creditCheckInterval it probes the OpenRouter balance and DMs the owner
-// when it sits below the creditWatch floor. This closes the gap that bit Zach:
-// reportCreditIfWatched only fires on /new, so a balance that dropped below the
-// floor mid-session was never reported — until a 402 killed a run outright.
-// Re-warns at most once per creditReWarnDelay while still below the floor.
-func (b *Bridge) maybeCheckCredits() {
-	if b.acct.MinCreditUsd <= 0 {
-		return
-	}
-	key := openRouterKey()
-	if key == "" {
-		return
-	}
-	b.mu.Lock()
-	if time.Since(b.lastCreditProbe) < creditCheckInterval {
-		b.mu.Unlock()
-		return
-	}
-	b.lastCreditProbe = time.Now()
-	b.mu.Unlock()
-
-	total, used, err := openRouterCredits(key)
-	if err != nil {
-		b.log("warning", "periodic credit check failed: "+err.Error())
-		return
-	}
-	remaining := total - used
-	if remaining >= b.acct.MinCreditUsd {
-		return
-	}
-	b.mu.Lock()
-	rearm := time.Since(b.lastCreditWarn) >= creditReWarnDelay
-	if rearm {
-		b.lastCreditWarn = time.Now()
-	}
-	b.mu.Unlock()
-	if !rearm {
-		return
-	}
-	b.reply(lowCreditText(remaining, b.acct.MinCreditUsd))
-}
-
-// lowCreditText renders the below-floor credit alert shared by the /new report
-// and the periodic watcher.
+// lowCreditText renders the below-floor credit alert used by the /new report.
 func lowCreditText(remaining, floor float64) string {
 	return fmt.Sprintf("⚠️ OpenRouter credit: $%.2f remaining — below your $%.2f floor, reload soon", remaining, floor)
 }
@@ -3144,8 +3087,6 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 // once per idle period, once the agent has been idle past idleAwayTimeout.
 // Split out from idleWatcher so it's callable directly from tests.
 func (b *Bridge) idleTick() {
-	b.maybeCheckCredits()
-
 	b.mu.Lock()
 	idle := !b.idleSince.IsZero()
 	elapsed := time.Since(b.idleSince)
