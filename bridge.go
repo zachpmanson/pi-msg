@@ -73,6 +73,16 @@ type Bridge struct {
 	// delivery. With finalMsgHadText it separates a run that stopped mid-work
 	// from one that deliberately said nothing (to: noop).
 	toolSinceDelivery bool
+	// runError records the provider/transport error that ended the most recent
+	// assistant message of this run (pi's stopReason "error"). Reported once at
+	// settle when the run delivered nothing, so a dead provider shows up as an
+	// error rather than the generic "done (no reply)" banner — see
+	// providerFailAlert. Cleared at the start of every run.
+	runError string
+	// runErrorTruncated records that the errored message carried partial text
+	// that was delivered before the stream died, so the alert can say the
+	// message above may be cut short instead of claiming nothing arrived.
+	runErrorTruncated bool
 	tailNudges        int // empty-tail recovery prompts sent this user turn (bounded)
 	// runInbound counts the chat messages that entered the current run: the one
 	// that started it plus every steer that landed while it was in flight.
@@ -383,6 +393,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setHandleWarned(false)
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
 		b.resetTailTracking() // fresh run: no message seen, no tool since delivery
+		b.clearRunError()     // fresh run: no provider failure recorded yet
 		b.reactionAckRun = false
 		b.markActive() // a run is in flight — not idle
 		b.xmpp.SetPresence("dnd", "thinking…")
@@ -401,25 +412,37 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// resend lands moments later, and showing the banner first would read
 		// as "agent: done, no reply" immediately followed by the resend.
 		nudged := b.firePendingNudge()
-		// A run that ended on a tool call never wrote its answer: the tool
-		// result came back and no assistant text followed it. Ask for the reply
-		// once rather than letting the work vanish. A deliberate silence uses
-		// "to: noop", which delivers and so never reaches here.
-		recovering := b.needsEmptyTailRecovery() && b.fireTailRecovery()
-		// Several messages entered this run but fewer replies left it. Pi
-		// injects a steer the moment a tool yields, so the model can read the
-		// next question before answering the last — and then never answer it.
-		// Ask it to check, with an explicit way to say it already did.
-		// A run that answered a hint is never hinted about itself, however its
-		// tally looks. takeHintPending consumes the mark, so the run after it is
-		// judged normally again.
-		if !recovering && !b.takeHintPending() {
-			if n, m, ok := b.unansweredRun(); ok {
-				recovering = b.fireUnansweredHint(n, m, b.runLogSnapshot())
+		// A run killed by a provider/transport error wrote no reply, and asking
+		// it again would just die the same way — so both recovery nudges are
+		// skipped and the failure itself is reported in their place (below).
+		providerDead := b.runErrored()
+		recovering := false
+		if !providerDead {
+			// A run that ended on a tool call never wrote its answer: the tool
+			// result came back and no assistant text followed it. Ask for the reply
+			// once rather than letting the work vanish. A deliberate silence uses
+			// "to: noop", which delivers and so never reaches here.
+			recovering = b.needsEmptyTailRecovery() && b.fireTailRecovery()
+			// Several messages entered this run but fewer replies left it. Pi
+			// injects a steer the moment a tool yields, so the model can read the
+			// next question before answering the last — and then never answer it.
+			// Ask it to check, with an explicit way to say it already did.
+			// A run that answered a hint is never hinted about itself, however its
+			// tally looks. takeHintPending consumes the mark, so the run after it is
+			// judged normally again.
+			if !recovering && !b.takeHintPending() {
+				if n, m, ok := b.unansweredRun(); ok {
+					recovering = b.fireUnansweredHint(n, m, b.runLogSnapshot())
+				}
 			}
 		}
 		// The counts belong to the run that just ended, whatever we decided.
 		b.resetRunCounts()
+		// A run that died on a provider or transport error never wrote its reply:
+		// report the failure to the owner instead of letting the generic "done
+		// (no reply)" banner imply the agent simply had nothing to say. This
+		// marks the run replied, so the banner below stays quiet when it fires.
+		b.providerFailAlert()
 		// The reply text + typing/presence already signal "done". Only nudge if
 		// the run produced no message, so silence isn't mistaken for a hang.
 		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
@@ -470,16 +493,22 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		if msg == nil || msg.Str("role") != "assistant" {
 			return
 		}
-		// A run that died on OpenRouter credits (HTTP 402) has no text to
-		// deliver — without this hook the owner got the generic "done (no
-		// reply)" nudge and no hint WHY. DM them the failure instead (see
-		// creditFailAlert), and clear the in-run recovery bookkeeping so
-		// settle can't fire a tail-retry / unanswered-hint prompt (which
-		// would just 402 again).
-		if msg.Str("stopReason") == "error" {
+		errored := msg.Str("stopReason") == "error"
+		if errored {
+			// A run that died on OpenRouter credits (HTTP 402) has no text to
+			// deliver — without this hook the owner got the generic "done (no
+			// reply)" nudge and no hint WHY. DM them the failure instead (see
+			// creditFailAlert), and clear the in-run recovery bookkeeping so
+			// settle can't fire a tail-retry / unanswered-hint prompt (which
+			// would just 402 again).
 			if b.creditFailAlert(msg.Str("errorMessage")) {
 				return // consumed: owner alerted, run marked replied
 			}
+			// Every other provider/transport error is only RECORDED here and
+			// reported at settle: pi's own auto-retry can still rescue a
+			// retryable error, so alerting on the raw event would cry wolf
+			// about runs that recover (see providerFailAlert).
+			b.setRunError(msg.Str("errorMessage"))
 		}
 		// Record whether THIS message carried text before delivering it: at
 		// settle, only the last message's answer matters, and a run whose final
@@ -488,6 +517,11 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setFinalMsgHadText(text != "")
 		if text == "" {
 			return
+		}
+		if errored {
+			// Text was written before the stream died: it still gets delivered
+			// below, but the thought never finished, so flag it truncated.
+			b.markRunErrorTruncated()
 		}
 		// "replied" must mean "reached a destination", not "text existed".
 		// A malformed reply goes to the error room, which the owner never
@@ -2592,6 +2626,44 @@ func shortError(s string) string {
 	return string(r[:157]) + "…"
 }
 
+// providerFailAlert reports a run that ended on a provider or transport error
+// (pi's stopReason "error") instead of a reply. Pi records such a death as an
+// assistant message with no text, so without this hook the owner got only the
+// generic "done (no reply)" banner — which reads as "the agent had nothing to
+// say" — while the real cause ("Upstream error from Together: … h2 protocol
+// error: error reading a body from connection") stayed buried in the session
+// transcript, invisible to everyone watching the chat.
+//
+// Called at settle rather than at message_end, because pi's own auto-retry can
+// still rescue a retryable failure: alerting on the raw event would cry wolf
+// about runs that recover. Returns true when it accounts for the error —
+// either because it alerted the owner, or because a complete reply already went
+// out and the trailing error adds nothing.
+func (b *Bridge) providerFailAlert() bool {
+	b.mu.Lock()
+	errMsg, truncated := b.runError, b.runErrorTruncated
+	b.mu.Unlock()
+	if errMsg == "" {
+		return false
+	}
+	defer b.clearRunError()
+	if b.replied() && !truncated {
+		// The run already delivered a complete reply; a trailing error on an
+		// empty message is bookkeeping, not something the owner needs to hear.
+		return true
+	}
+	b.log("warning", "model run ended on a provider error: "+errMsg)
+	if truncated {
+		b.reply("⚠️ Upstream error cut the run short — the message above may be incomplete. (" + shortError(errMsg) + ")")
+	} else {
+		b.reply("⚠️ Upstream error — the run produced no reply. Send your message again to retry. (" + shortError(errMsg) + ")")
+	}
+	// The alert is this run's output: suppress the "done (no reply)" banner so
+	// the owner sees the cause rather than a contradiction.
+	b.setReplied(true)
+	return true
+}
+
 // openRouterKey returns pi's configured OpenRouter API key from the auth file
 // (<config-dir>/auth.json, where config-dir is $PI_CODING_AGENT_DIR or
 // ~/.pi/agent). Empty when absent.
@@ -3181,6 +3253,40 @@ func (b *Bridge) setStreaming(v bool) { b.mu.Lock(); b.streamingRun = v; b.mu.Un
 func (b *Bridge) streaming() bool     { b.mu.Lock(); defer b.mu.Unlock(); return b.streamingRun }
 func (b *Bridge) setReplied(v bool)   { b.mu.Lock(); b.repliedThisRun = v; b.mu.Unlock() }
 func (b *Bridge) replied() bool       { b.mu.Lock(); defer b.mu.Unlock(); return b.repliedThisRun }
+
+// setRunError records the provider/transport error that ended the latest
+// assistant message of this run (pi's stopReason "error" + errorMessage).
+func (b *Bridge) setRunError(msg string) {
+	b.mu.Lock()
+	b.runError = msg
+	b.mu.Unlock()
+}
+
+// runErrored reports whether a provider error has been recorded for this run.
+func (b *Bridge) runErrored() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.runError != ""
+}
+
+// clearRunError drops the recorded provider error at the start of a new run.
+func (b *Bridge) clearRunError() {
+	b.mu.Lock()
+	b.runError = ""
+	b.runErrorTruncated = false
+	b.mu.Unlock()
+}
+
+// markRunErrorTruncated records that the errored message carried text which was
+// (or is about to be) delivered before the stream died. No-op without a run
+// error, so it can never flag an ordinary message as cut short.
+func (b *Bridge) markRunErrorTruncated() {
+	b.mu.Lock()
+	if b.runError != "" {
+		b.runErrorTruncated = true
+	}
+	b.mu.Unlock()
+}
 
 // steerBehavior returns "steer" when a run is already in flight, else "".
 func (b *Bridge) steerBehavior() string {

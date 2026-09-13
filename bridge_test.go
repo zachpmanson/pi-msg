@@ -696,6 +696,73 @@ func TestOpenRouterCreditsParse(t *testing.T) {
 	}
 }
 
+// TestProviderFailAlertReportsUpstreamError pins the fix for the live failure
+// where a Together HTTP/2 stream drop ("h2 protocol error: error reading a body
+// from connection") killed a run, pi-msg delivered nothing, and the owner got
+// only "✅ done (no reply) — your turn" — which reads as the agent having
+// nothing to say. The error must reach the owner instead.
+func TestProviderFailAlertReportsUpstreamError(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	if b.providerFailAlert() {
+		t.Error("no recorded error — must not alert")
+	}
+	b.setRunError("Upstream error from Together: Stream error: h2 protocol error: error reading a body from connection")
+	if !b.runErrored() {
+		t.Fatal("precondition: error should be recorded")
+	}
+	if !b.providerFailAlert() {
+		t.Error("a recorded provider error must be consumed by the alert")
+	}
+	if !b.replied() {
+		t.Error("the alert is the run's output — replied must be set so the banner is suppressed")
+	}
+	if b.bannerNoReply(false, false) {
+		t.Error("the 'done (no reply)' banner must not fire over a provider alert")
+	}
+	if b.runErrored() {
+		t.Error("the error must be cleared once reported")
+	}
+	if b.providerFailAlert() {
+		t.Error("a reported error must not alert twice")
+	}
+}
+
+// TestProviderFailAlertRespectsCompleteReply verifies a trailing error on an
+// empty message never overrides a reply that already went out, while a truncated
+// delivery (text written, then the stream died) is still flagged.
+func TestProviderFailAlertRespectsCompleteReply(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.setReplied(true)
+	b.setRunError("Upstream error from Together: connection dropped")
+	if !b.providerFailAlert() {
+		t.Error("a trailing error is still consumed")
+	}
+
+	// Truncated: text was delivered, but the run died mid-message.
+	b2 := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b2.setReplied(true)
+	b2.setRunError("Upstream error from Together: connection dropped")
+	b2.markRunErrorTruncated()
+	b2.providerFailAlert()
+}
+
+// TestMarkRunErrorTruncatedNeedsError verifies the truncation flag can only be
+// set while a provider error is recorded: an ordinary message must never be
+// labelled cut short.
+func TestMarkRunErrorTruncatedNeedsError(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markRunErrorTruncated()
+	if b.runErrored() {
+		t.Error("truncation alone must not invent a provider error")
+	}
+	b.setRunError("boom")
+	b.markRunErrorTruncated()
+	b.clearRunError()
+	if b.runErrored() || b.providerFailAlert() {
+		t.Error("clearRunError must drop both the error and the truncation flag")
+	}
+}
+
 // newTestBridge builds an offline bridge: sends return "" (not online), which
 // is exactly the "nothing reached a destination" case deliverReply must report.
 func newTestBridge(acct ResolvedAccount) *Bridge {
