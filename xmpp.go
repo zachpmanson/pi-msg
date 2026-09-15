@@ -286,6 +286,11 @@ type InboundMessage struct {
 	Room      string // source room bare JID (room mode); "" for 1:1
 	ID        string // stanza id (used as the XEP-0444 reaction target)
 	From      string // full from-JID, so a reaction routes back to that resource
+	// Stamp is the message's own timestamp (XEP-0203 delay, or the archive
+	// stamp for a MAM backfill). Zero for a live message, which has no stamp of
+	// its own. Used to order the restart-replay buffer, where delay-pushed and
+	// MAM-fetched copies of the same period can interleave.
+	Stamp time.Time
 
 	// Reactions is a non-nil emoji set when this is an inbound XEP-0444 reaction
 	// (no body). ReactionID is the stanza id of the message being reacted to.
@@ -345,6 +350,12 @@ type XMPPBridge struct {
 	// oldest is evicted when full.
 	msgHistory map[string]msgHistoryEntry
 
+	// mamPending holds the in-flight XEP-0313 backfill collectors, keyed by MAM
+	// query id. The read loop appends archived messages; FetchMAM drains them
+	// once the terminating IQ result arrives.
+	mamMu      sync.Mutex
+	mamPending map[string]*mamCollector
+
 	// Restart-gap replay state. replayStart is the swap-window start (when the
 	// account went offline); replayArmed is set once at startup when a window
 	// marker exists; on the first successful connect the window is "lit" and
@@ -377,6 +388,7 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		occupants:   make(map[string]map[string]string),
 		selfNick:    make(map[string]string),
 		msgHistory:  make(map[string]msgHistoryEntry),
+		mamPending:  make(map[string]*mamCollector),
 	}
 	b.loadAvatar()
 	return b
@@ -575,11 +587,21 @@ func (b *XMPPBridge) inSwapWindow(stamp time.Time) bool {
 	return !stamp.Add(replaySlack).Before(start)
 }
 
-// bufferReplay appends a swap-window message to the restart replay buffer,
-// preserving delivery order.
+// bufferReplay appends a swap-window (or MAM-backfilled) message to the
+// restart replay buffer. Duplicate stanza ids are dropped: the same message can
+// arrive twice — once as a server-pushed delayed stanza and once from the MAM
+// archive — and replaying it twice would double-count it in the catch-up
+// banner and re-surface it to the agent.
 func (b *XMPPBridge) bufferReplay(m InboundMessage) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if m.ID != "" {
+		for _, e := range b.replayBuf {
+			if e.ID == m.ID {
+				return
+			}
+		}
+	}
 	b.replayBuf = append(b.replayBuf, m)
 }
 
@@ -605,6 +627,20 @@ func (b *XMPPBridge) DrainReplay(ctx context.Context) []InboundMessage {
 	b.replayBuf = nil
 	b.replayActive = false
 	b.mu.Unlock()
+	// Delay-pushed stanzas and MAM-fetched ones can interleave in arrival order;
+	// order by each message's own stamp so the catch-up reads chronologically.
+	// Live-buffered entries (zero stamp) keep their relative order at the end.
+	sort.SliceStable(buf, func(i, j int) bool {
+		a, c := buf[i].Stamp, buf[j].Stamp
+		switch {
+		case a.IsZero():
+			return false
+		case c.IsZero():
+			return true
+		default:
+			return a.Before(c)
+		}
+	})
 	return buf
 }
 
@@ -832,6 +868,12 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 			id:   attr(start.Attr, "id"),
 			body: childText(toks, "body"),
 		}
+		// A XEP-0313 archived-message result is backfill, never live input:
+		// consume it into the in-flight collector and never let it dispatch.
+		if res, ok := element(toks, mamNS, "result"); ok {
+			b.collectMAMResult(toks, res)
+			return nil
+		}
 		if re, ok := element(toks, reactionsNS, "reactions"); ok {
 			m.reactionFor = attr(re.Attr, "id")
 			m.reactions = reactionEmojis(toks)
@@ -989,7 +1031,7 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
 			b.bufferReplay(InboundMessage{
 				Body: m.body, RealJID: b.ownerBare, FromOwner: true,
-				Direct: true, ID: m.id, From: m.from,
+				Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp,
 			})
 		}
 		return
@@ -1040,6 +1082,7 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 				Room:      room,
 				ID:        m.id,
 				From:      m.from,
+				Stamp:     m.delayStamp,
 			})
 		}
 		return

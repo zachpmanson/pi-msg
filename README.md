@@ -131,9 +131,34 @@ Per-account fields:
 | `reactions` | no | `false` | XEP-0444 emoji reactions on 1:1 owner messages: lifecycle → 👀 picked up / ✅ done / ⛔ aborted, and enables the agent-driven `send_reaction` tool (see [Agent tools](#agent-tools)) |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
 | `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic "done (no reply)". e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
+| `mam` | no | `false` | XEP-0313 archive backfill on startup — see [Archive backfill](#archive-backfill-mam) |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
 `PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
+
+## Archive backfill (MAM)
+
+Set `"mam": true` to recover messages the server never pushed to the bridge, by
+querying the account's own XEP-0313 archive (and each joined room's archive) at
+startup. This complements the always-on **restart replay**: the server's
+best-effort offline delivery only covers 1:1 messages it happened to store, and
+MUC backlog is suppressed entirely at join (`<history maxstanzas="0">`), so
+without MAM anything sent to a room while the bridge was down is simply lost.
+
+- **Window** — bounded by a per-account marker (`<config-dir>/<account>.mamseen`)
+  written after each successful backfill, widened to the restart swap window when
+  that is older. On the very first launch with `mam` enabled no archive is
+  walked; the marker just starts the clock.
+- **Delivery** — fetched messages go into the same replay buffer as delayed
+  stanzas and are handed to the resumed session in one chronological block
+  (`Back online, catching up on N messages`). Duplicates (a message that was
+  both delay-pushed and archived) are dropped by XEP-0359 stanza id.
+- **Degradation** — a server without an archive (`mod_mam` off) logs a warning
+  and the delay-stanza path runs unchanged; startup never fails.
+- **Page cap** — 200 messages per scope; a longer window is truncated with a
+  warning (RSM paging is tracked in [zpm/pi-msg#84](https://github.com/zachpmanson/pi-msg/issues/84)).
+- **Skipped for on-demand spawns** (`--prompt`), matching the replay path: a
+  stateless doer starts with only its task, not stale chat.
 
 ## Group chat (MUC)
 

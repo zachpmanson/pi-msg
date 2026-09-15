@@ -408,3 +408,48 @@ func TestResolveAccountCreditWatchDisabled(t *testing.T) {
 		t.Fatalf("MinCreditUsd = %v, want 0", got.MinCreditUsd)
 	}
 }
+
+func TestMAMMarkers(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PI_MSG_CONFIG", filepath.Join(dir, "config.json"))
+	ts := time.Date(2026, 9, 15, 3, 4, 5, 0, time.UTC)
+
+	if _, ok := readMAMSeen("slippy"); ok {
+		t.Fatal("no marker written, but readMAMSeen reported one")
+	}
+
+	markMAMSeen(nil, "slippy", ts)
+	got, ok := readMAMSeen("slippy")
+	if !ok || !got.Equal(ts) {
+		t.Fatalf("readMAMSeen = (%v,%v), want %v", got, ok, ts)
+	}
+	// Persistent: a read must not consume the marker.
+	if again, ok := readMAMSeen("slippy"); !ok || !again.Equal(ts) {
+		t.Fatalf("marker not persistent: (%v,%v)", again, ok)
+	}
+	// Accounts are namespaced.
+	if _, ok := readMAMSeen("peppy"); ok {
+		t.Error("marker leaked across accounts")
+	}
+}
+
+func TestResolveAccountMAM(t *testing.T) {
+	cfg := &Config{Accounts: map[string]Account{
+		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", MAM: true},
+		"plain":   {JID: "pi2@chat.example.com", Password: "pw", Owner: "zach@chat.example.com"},
+	}}
+	on, err := resolveAccount(cfg, "default")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !on.MAM {
+		t.Error("MAM not carried through resolveAccount")
+	}
+	off, err := resolveAccount(cfg, "plain")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if off.MAM {
+		t.Error("MAM should default off")
+	}
+}
