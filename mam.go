@@ -94,17 +94,7 @@ func (b *XMPPBridge) FetchMAM(ctx context.Context, room, with string, since time
 		b.mamMu.Unlock()
 	}()
 
-	payload := mamQueryPayload{QueryID: qid}
-	payload.X.Type = "submit"
-	payload.X.Field = []mamFormField{{Var: "FORM_TYPE", Value: mamNS}}
-	if with != "" {
-		payload.X.Field = append(payload.X.Field, mamFormField{Var: "with", Value: with})
-	}
-	if max > 0 {
-		payload.Set = &struct {
-			Max int `xml:"max"`
-		}{Max: max}
-	}
+	payload := newMAMQueryPayload(qid, with, since, max)
 
 	iq := stanza.IQ{ID: qid, Type: stanza.SetIQ}
 	if room != "" {
@@ -147,6 +137,28 @@ func (b *XMPPBridge) FetchMAM(ctx context.Context, room, with string, since time
 	col.out = nil
 	b.mamMu.Unlock()
 	return out, complete, nil
+}
+
+// newMAMQueryPayload builds the XEP-0313 query. The time bound is a data-form
+// `start` field, NOT RSM: without it the query returns the account's whole
+// archive (newest page first), so a backfill would replay ancient history
+// instead of the offline window. RSM's <set> only caps the page size.
+func newMAMQueryPayload(qid, with string, since time.Time, max int) mamQueryPayload {
+	p := mamQueryPayload{QueryID: qid}
+	p.X.Type = "submit"
+	p.X.Field = []mamFormField{{Var: "FORM_TYPE", Value: mamNS}}
+	if !since.IsZero() {
+		p.X.Field = append(p.X.Field, mamFormField{Var: "start", Value: since.UTC().Format(time.RFC3339)})
+	}
+	if with != "" {
+		p.X.Field = append(p.X.Field, mamFormField{Var: "with", Value: with})
+	}
+	if max > 0 {
+		p.Set = &struct {
+			Max int `xml:"max"`
+		}{Max: max}
+	}
+	return p
 }
 
 // collectMAMResult consumes a XEP-0313 archived-message <result> from the read
