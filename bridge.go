@@ -249,22 +249,22 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// stale chat from a previous incarnation.
 	if b.initialPrompt == "" {
 		start, ok := replayWindowStart(b.acct.Name)
-		// XEP-0313 backfill (issue #84): widen the recovery window back to the
-		// last successful backfill so messages the server never pushed (MUC
-		// backlog in particular) are recovered too. The MAM marker is read, not
-		// consumed, so a crash mid-backfill simply re-queries the same range —
-		// duplicates are dropped by stanza id in bufferReplay.
+		// XEP-0313 backfill (issue #84): recover messages the server never pushed
+		// (MUC backlog in particular) across exactly the downtime window. The
+		// lower bound is the restart window start, but never EARLIER than a
+		// completed backfill — using the earlier one re-delivers messages the
+		// running bridge already handled live, and a replayed `!new` resets the
+		// session. Duplicates within one drain are dropped by stanza id in
+		// bufferReplay.
 		if b.acct.MAM {
 			b.mamArmed = true
-			if since, ok2 := readMAMSeen(b.acct.Name); ok2 {
+			seen, seenOK := readMAMSeen(b.acct.Name)
+			if since, ok2 := mamSinceFor(start, ok, seen, seenOK); ok2 {
 				b.mamSince = since
-				if !ok || since.Before(start) {
-					start, ok = since, true
-				}
-			} else if !ok {
-				// First launch with MAM enabled: don't walk the whole archive.
-				// Arm the drain path (the replay buffer needs a consumer) and
-				// seed the marker after this connect.
+			}
+			if !ok {
+				// First launch: arm the drain path (the replay buffer needs a
+				// consumer) but don't walk the archive; seed the marker instead.
 				start, ok = time.Now(), true
 			}
 		}
