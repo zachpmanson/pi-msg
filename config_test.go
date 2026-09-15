@@ -434,22 +434,47 @@ func TestMAMMarkers(t *testing.T) {
 }
 
 func TestResolveAccountMAM(t *testing.T) {
-	cfg := &Config{Accounts: map[string]Account{
-		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", MAM: true},
-		"plain":   {JID: "pi2@chat.example.com", Password: "pw", Owner: "zach@chat.example.com"},
+	on := &Config{Accounts: map[string]Account{
+		"default":     {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com"},
+		"explicitOn":  {JID: "pi1@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", MAM: boolPtr(true)},
+		"explicitOff": {JID: "pi2@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", MAM: boolPtr(false)},
 	}}
-	on, err := resolveAccount(cfg, "default")
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"default", true}, // absent means enabled
+		{"explicitOn", true},
+		{"explicitOff", false},
+	}
+	for _, tc := range tests {
+		got, err := resolveAccount(on, tc.name)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", tc.name, err)
+		}
+		if got.MAM != tc.want {
+			t.Errorf("account %s: MAM = %v, want %v", tc.name, got.MAM, tc.want)
+		}
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+// An explicit false must survive through JSON too (the config is the only place
+// the opt-out is expressed).
+func TestMAMConfigRoundTrip(t *testing.T) {
+	path := writeConfig(t, Config{Accounts: map[string]Account{
+		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", MAM: boolPtr(false)},
+	}})
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got, err := resolveAccount(cfg, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if !on.MAM {
-		t.Error("MAM not carried through resolveAccount")
-	}
-	off, err := resolveAccount(cfg, "plain")
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if off.MAM {
-		t.Error("MAM should default off")
+	if got.MAM {
+		t.Error("explicit mam:false did not survive load+resolve")
 	}
 }

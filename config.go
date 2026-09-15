@@ -104,13 +104,14 @@ type Account struct {
 	// pi provider is OpenRouter (i.e. an openrouter api key is found in pi's
 	// auth file).
 	CreditWatch *CreditWatch `json:"creditWatch,omitempty"`
-	// MAM, when true, backfills messages from the server's XEP-0313 message
-	// archive on startup (pi-msg issue #84): anything missed while the bridge
-	// was offline is fetched and handed to the resumed session alongside the
-	// restart-swap replay. Requires the server to have an archive (ejabberd
-	// mod_mam); without one the bridge logs and falls back to the existing
-	// delay-stanza replay. Off by default.
-	MAM bool `json:"mam,omitempty"`
+	// MAM controls XEP-0313 archive backfill on startup (pi-msg issue #84):
+	// anything missed while the bridge was offline is fetched from the server's
+	// archive and handed to the resumed session alongside the restart-swap
+	// replay. **On by default** — a nil value means enabled; set `"mam": false`
+	// to opt out. Requires the server to have an archive (ejabberd mod_mam);
+	// without one the bridge logs a warning and falls back to the existing
+	// delay-stanza replay, so enabling it can't break a server that lacks MAM.
+	MAM *bool `json:"mam,omitempty"`
 }
 
 // CreditWatch configures the on-\/new OpenRouter credit report.
@@ -560,7 +561,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		Avatar:        strings.TrimSpace(acct.Avatar),
 		ErrorRoom:     strings.TrimSpace(acct.ErrorRoom),
 		MinCreditUsd:  maxCreditUsd(acct.CreditWatch),
-		MAM:           acct.MAM,
+		MAM:           acct.MAM == nil || *acct.MAM,
 	}, nil
 }
 
