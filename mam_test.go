@@ -117,15 +117,12 @@ func TestCollectMAMResultUnknownAndEmpty(t *testing.T) {
 	}
 }
 
-// The MAM query payload must carry the query id, the FILTER form, the `with`
-// filter and the RSM page cap.
+// The MAM query payload must carry the query id, the FILTER form, the `start`
+// time bound, the `with` filter and the RSM page cap. A missing `start` makes
+// the server return the whole archive instead of the offline window.
 func TestMAMQueryPayloadMarshal(t *testing.T) {
-	p := mamQueryPayload{QueryID: "qid-1"}
-	p.X.Type = "submit"
-	p.X.Field = []mamFormField{{Var: "FORM_TYPE", Value: mamNS}, {Var: "with", Value: "zach@chat.zachmanson.com"}}
-	p.Set = &struct {
-		Max int `xml:"max"`
-	}{Max: mamPageMax}
+	since := time.Date(2026, 9, 15, 8, 15, 58, 0, time.UTC)
+	p := newMAMQueryPayload("qid-1", "zach@chat.zachmanson.com", since, mamPageMax)
 
 	raw, err := xml.Marshal(p)
 	if err != nil {
@@ -136,6 +133,7 @@ func TestMAMQueryPayloadMarshal(t *testing.T) {
 		`<query xmlns="urn:xmpp:mam:2" queryid="qid-1">`,
 		`<x xmlns="jabber:x:data" type="submit">`,
 		`<field var="FORM_TYPE"><value>urn:xmpp:mam:2</value></field>`,
+		`<field var="start"><value>2026-09-15T08:15:58Z</value></field>`,
 		`<field var="with"><value>zach@chat.zachmanson.com</value></field>`,
 		`<set xmlns="http://jabber.org/protocol/rsm"><max>200</max></set>`,
 	} {
@@ -143,6 +141,28 @@ func TestMAMQueryPayloadMarshal(t *testing.T) {
 			t.Errorf("marshalled payload missing %q:\n%s", want, got)
 		}
 	}
+
+	// A room query omits `with` (the room archive is addressed by JID) but still
+	// carries the time bound.
+	room := string(mustMarshal(t, newMAMQueryPayload("qid-2", "", since, 0)))
+	if strings.Contains(room, `var="with"`) {
+		t.Errorf("room payload should not carry a with filter:\n%s", room)
+	}
+	if !strings.Contains(room, `<field var="start">`) {
+		t.Errorf("room payload missing start bound:\n%s", room)
+	}
+	if strings.Contains(room, `protocol/rsm`) {
+		t.Errorf("max=0 should omit RSM:\n%s", room)
+	}
+}
+
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, err := xml.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return raw
 }
 
 // Duplicate stanza ids must not enter the replay buffer twice: the same message

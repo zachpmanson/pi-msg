@@ -51,6 +51,14 @@ func TestLiveMAMQuery(t *testing.T) {
 	go func() { _ = session.Serve(xmpp.HandlerFunc(b.handle)) }()
 
 	since := time.Now().Add(-7 * 24 * time.Hour)
+	if w := os.Getenv("PI_MSG_LIVE_WINDOW"); w != "" {
+		d, err := time.ParseDuration(w)
+		if err != nil {
+			t.Fatalf("PI_MSG_LIVE_WINDOW: %v", err)
+		}
+		since = time.Now().Add(-d)
+	}
+	t.Logf("querying since %s", since.UTC().Format(time.RFC3339))
 	// Personal archive: no `with` filter, so every message b2-1 has seen comes back.
 	msgs, complete, err := b.FetchMAM(ctx, "", "", since, 20)
 	if err != nil {
