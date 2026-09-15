@@ -40,11 +40,13 @@ type Bridge struct {
 	// write a one-shot directive ("proactive" → fire a volunteer turn on resume,
 	// "idle" → stay silent, "prompt" → deliver an initial task prompt to a
 	// fresh on-demand spawn); the bridge reads and consumes it at startup.
-	resumed           bool   // a saved, usable session was resumed this launch
-	startDir          string // directive consumed at startup: "proactive", "idle", "prompt", or ""
-	volunteered       bool   // whether the proactive volunteer turn has been fired
-	volunteerPending  bool   // proactive volunteer turn deferred until replay completes
-	replayWindowArmed bool   // a restart replay window was armed at startup
+	resumed           bool      // a saved, usable session was resumed this launch
+	startDir          string    // directive consumed at startup: "proactive", "idle", "prompt", or ""
+	volunteered       bool      // whether the proactive volunteer turn has been fired
+	volunteerPending  bool      // proactive volunteer turn deferred until replay completes
+	replayWindowArmed bool      // a restart replay window was armed at startup
+	mamArmed          bool      // XEP-0313 backfill is due on this launch (issue #84)
+	mamSince          time.Time // archive lower bound for the MAM query; zero = seed the marker only
 
 	// initialPrompt is the invocation-time initial prompt (--prompt/--command
 	// CLI flag, or a "prompt" start-directive payload): the task an on-demand
@@ -246,7 +248,27 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// on-demand spawns: a fresh doer starts with only its task, not a replay of
 	// stale chat from a previous incarnation.
 	if b.initialPrompt == "" {
-		if start, ok := replayWindowStart(b.acct.Name); ok {
+		start, ok := replayWindowStart(b.acct.Name)
+		// XEP-0313 backfill (issue #84): widen the recovery window back to the
+		// last successful backfill so messages the server never pushed (MUC
+		// backlog in particular) are recovered too. The MAM marker is read, not
+		// consumed, so a crash mid-backfill simply re-queries the same range —
+		// duplicates are dropped by stanza id in bufferReplay.
+		if b.acct.MAM {
+			b.mamArmed = true
+			if since, ok2 := readMAMSeen(b.acct.Name); ok2 {
+				b.mamSince = since
+				if !ok || since.Before(start) {
+					start, ok = since, true
+				}
+			} else if !ok {
+				// First launch with MAM enabled: don't walk the whole archive.
+				// Arm the drain path (the replay buffer needs a consumer) and
+				// seed the marker after this connect.
+				start, ok = time.Now(), true
+			}
+		}
+		if ok {
 			if b.xmpp.SetReplayWindow(start) {
 				b.replayWindowArmed = true
 				b.log("info", "replay window armed from "+start.UTC().Format(time.RFC3339))
@@ -3320,18 +3342,73 @@ func (b *Bridge) fireInitialPrompt() {
 // off the drain so buffered swap-window messages are handed to the resumed
 // session once the grace period elapses.
 func (b *Bridge) onXMPPConnected() {
-	if !b.replayWindowArmed {
+	replay := b.replayWindowArmed
+	mam := b.mamArmed
+	if !replay && !mam {
 		return
 	}
+	// Clear both synchronously: onConnected fires on every (re)connect, and a
+	// fast reconnect must not start a second drain/backfill race.
 	b.replayWindowArmed = false
-	go b.replayInbound()
+	b.mamArmed = false
+	go b.replayInbound(mam)
+}
+
+// mamBackfill fetches archived messages from the server's XEP-0313 archive for
+// the owner 1:1 and each joined room, and buffers them for the resumed session
+// (issue #84). Best-effort: a server without an archive (no mod_mam) logs a
+// warning and the existing delay-stanza replay still runs unaffected.
+func (b *Bridge) mamBackfill() {
+	if b.mamSince.IsZero() {
+		// First launch with MAM enabled: nothing to recover, just start the clock.
+		markMAMSeen(b.log, b.acct.Name, time.Now())
+		return
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, mamTimeout)
+	defer cancel()
+	scopes := []struct {
+		room  string
+		with  string
+		label string
+	}{{room: "", with: b.acct.Owner, label: "owner 1:1"}}
+	for _, room := range b.acct.Rooms {
+		scopes = append(scopes, struct {
+			room  string
+			with  string
+			label string
+		}{room: room, label: room})
+	}
+	total := 0
+	for _, sc := range scopes {
+		msgs, complete, err := b.xmpp.FetchMAM(ctx, sc.room, sc.with, b.mamSince, mamPageMax)
+		if err != nil {
+			b.log("warning", fmt.Sprintf("mam backfill (%s) failed: %v", sc.label, err))
+			continue
+		}
+		if !complete {
+			b.log("warning", fmt.Sprintf("mam backfill (%s) truncated at %d message(s); older history in the window is not recovered", sc.label, len(msgs)))
+		}
+		for _, m := range msgs {
+			b.xmpp.bufferReplay(m)
+		}
+		total += len(msgs)
+	}
+	b.log("info", fmt.Sprintf("mam backfill: %d message(s) since %s", total, b.mamSince.UTC().Format(time.RFC3339)))
+	markMAMSeen(b.log, b.acct.Name, time.Now())
+	b.mamSince = time.Time{}
 }
 
 // replayInbound blocks until the replay windows closes, then hands any buffered
 // swap-window messages to the resumed session (banner first), followed by a
 // deferred proactive volunteer turn. Runs on its own goroutine; the drain
 // itself is bounded by the grace period and ctx.
-func (b *Bridge) replayInbound() {
+func (b *Bridge) replayInbound(mam bool) {
+	// Fetch archive backlog before draining: the drain hands everything to the
+	// resumed session in one chronological block, so MAM results must be in the
+	// buffer by then (issue #84).
+	if mam {
+		b.mamBackfill()
+	}
 	msgs := b.xmpp.DrainReplay(b.ctx)
 	if len(msgs) > 0 && b.ctx.Err() == nil {
 		b.reply(fmt.Sprintf("Back online, catching up on %d messages", len(msgs)))

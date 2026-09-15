@@ -408,3 +408,73 @@ func TestResolveAccountCreditWatchDisabled(t *testing.T) {
 		t.Fatalf("MinCreditUsd = %v, want 0", got.MinCreditUsd)
 	}
 }
+
+func TestMAMMarkers(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PI_MSG_CONFIG", filepath.Join(dir, "config.json"))
+	ts := time.Date(2026, 9, 15, 3, 4, 5, 0, time.UTC)
+
+	if _, ok := readMAMSeen("slippy"); ok {
+		t.Fatal("no marker written, but readMAMSeen reported one")
+	}
+
+	markMAMSeen(nil, "slippy", ts)
+	got, ok := readMAMSeen("slippy")
+	if !ok || !got.Equal(ts) {
+		t.Fatalf("readMAMSeen = (%v,%v), want %v", got, ok, ts)
+	}
+	// Persistent: a read must not consume the marker.
+	if again, ok := readMAMSeen("slippy"); !ok || !again.Equal(ts) {
+		t.Fatalf("marker not persistent: (%v,%v)", again, ok)
+	}
+	// Accounts are namespaced.
+	if _, ok := readMAMSeen("peppy"); ok {
+		t.Error("marker leaked across accounts")
+	}
+}
+
+func TestResolveAccountMAM(t *testing.T) {
+	on := &Config{Accounts: map[string]Account{
+		"default":     {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com"},
+		"explicitOn":  {JID: "pi1@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", MAM: boolPtr(true)},
+		"explicitOff": {JID: "pi2@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", MAM: boolPtr(false)},
+	}}
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"default", true}, // absent means enabled
+		{"explicitOn", true},
+		{"explicitOff", false},
+	}
+	for _, tc := range tests {
+		got, err := resolveAccount(on, tc.name)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", tc.name, err)
+		}
+		if got.MAM != tc.want {
+			t.Errorf("account %s: MAM = %v, want %v", tc.name, got.MAM, tc.want)
+		}
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+// An explicit false must survive through JSON too (the config is the only place
+// the opt-out is expressed).
+func TestMAMConfigRoundTrip(t *testing.T) {
+	path := writeConfig(t, Config{Accounts: map[string]Account{
+		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", MAM: boolPtr(false)},
+	}})
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got, err := resolveAccount(cfg, "")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got.MAM {
+		t.Error("explicit mam:false did not survive load+resolve")
+	}
+}

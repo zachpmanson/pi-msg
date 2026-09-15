@@ -104,6 +104,14 @@ type Account struct {
 	// pi provider is OpenRouter (i.e. an openrouter api key is found in pi's
 	// auth file).
 	CreditWatch *CreditWatch `json:"creditWatch,omitempty"`
+	// MAM controls XEP-0313 archive backfill on startup (pi-msg issue #84):
+	// anything missed while the bridge was offline is fetched from the server's
+	// archive and handed to the resumed session alongside the restart-swap
+	// replay. **On by default** — a nil value means enabled; set `"mam": false`
+	// to opt out. Requires the server to have an archive (ejabberd mod_mam);
+	// without one the bridge logs a warning and falls back to the existing
+	// delay-stanza replay, so enabling it can't break a server that lacks MAM.
+	MAM *bool `json:"mam,omitempty"`
 }
 
 // CreditWatch configures the on-\/new OpenRouter credit report.
@@ -143,6 +151,7 @@ type ResolvedAccount struct {
 	Avatar        string
 	ErrorRoom     string
 	MinCreditUsd  float64
+	MAM           bool
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
@@ -366,6 +375,32 @@ func readSwapStart(acct string) string {
 	return v
 }
 
+// mamMarkerPath returns the per-account XEP-0313 marker: the archive timestamp
+// of the most recent successful backfill. Stored alongside the config as
+// <config-dir>/<account>.mamseen.
+func mamMarkerPath(acct string) string {
+	return windowMarkerPath(acct, "mamseen")
+}
+
+// readMAMSeen reads the persistent MAM backfill marker without consuming it.
+func readMAMSeen(acct string) (time.Time, bool) {
+	raw, err := os.ReadFile(mamMarkerPath(acct))
+	if err != nil {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// markMAMSeen records the archive timestamp of the most recent successful MAM
+// backfill so the next launch queries only from there.
+func markMAMSeen(log func(level, msg string), acct string, t time.Time) {
+	writeWindowMarker(log, acct, "mamseen", t)
+}
+
 // readLastOut reads the persistent last-outbound floor without consuming it.
 func readLastOut(acct string) string {
 	raw, err := os.ReadFile(windowMarkerPath(acct, "lastout"))
@@ -526,6 +561,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		Avatar:        strings.TrimSpace(acct.Avatar),
 		ErrorRoom:     strings.TrimSpace(acct.ErrorRoom),
 		MinCreditUsd:  maxCreditUsd(acct.CreditWatch),
+		MAM:           acct.MAM == nil || *acct.MAM,
 	}, nil
 }
 
