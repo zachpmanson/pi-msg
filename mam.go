@@ -161,6 +161,22 @@ func newMAMQueryPayload(qid, with string, since time.Time, max int) mamQueryPayl
 	return p
 }
 
+// mamSinceFor resolves the archive lower bound for a backfill: the later of the
+// restart window start and the last completed backfill marker. Taking the
+// earlier one is a bug — it re-delivers messages the running bridge already
+// handled live (observed: a replayed `!new` resetting the session). Returns
+// ok=false when there is no downtime window at all (first launch), meaning no
+// backfill should run.
+func mamSinceFor(windowStart time.Time, windowOK bool, seen time.Time, seenOK bool) (time.Time, bool) {
+	if !windowOK {
+		return time.Time{}, false
+	}
+	if seenOK && seen.After(windowStart) {
+		return seen, true
+	}
+	return windowStart, true
+}
+
 // collectMAMResult consumes a XEP-0313 archived-message <result> from the read
 // loop, appending it to the matching in-flight collector. Unknown query ids are
 // dropped: a MAM result must never fall through to live dispatch, or an old

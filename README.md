@@ -146,10 +146,11 @@ offline delivery only covers 1:1 messages it happened to store, and MUC backlog
 is suppressed entirely at join (`<history maxstanzas="0">`), so without MAM
 anything sent to a room while the bridge was down is simply lost.
 
-- **Window** — bounded by a per-account marker (`<config-dir>/<account>.mamseen`)
-  written after each successful backfill, widened to the restart swap window when
-  that is older. On the very first launch no archive is walked; the marker just
-  starts the clock.
+- **Window** — the downtime: the graceful-stop marker (`swapstart`), falling
+  back to the last outbound, and never earlier than the last completed backfill
+  (`<config-dir>/<account>.mamseen`) — so a restart cannot re-deliver messages
+  the running bridge already handled live. On the very first launch no archive
+  is walked; the marker just starts the clock.
 - **Delivery** — fetched messages go into the same replay buffer as delayed
   stanzas and are handed to the resumed session in one chronological block
   (`Back online, catching up on N messages`). Duplicates (a message that was

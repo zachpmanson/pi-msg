@@ -202,3 +202,33 @@ func TestReplayDrainOrdersByStamp(t *testing.T) {
 		}
 	}
 }
+
+// The backfill lower bound must be the LATER of the downtime window and the
+// last completed backfill. Using the earlier one re-delivers messages already
+// handled live (a replayed `!new` reset peppy's session in testing).
+func TestMAMSinceFor(t *testing.T) {
+	window := time.Date(2026, 9, 15, 8, 29, 6, 0, time.UTC) // graceful-stop marker
+	marker := time.Date(2026, 9, 15, 8, 27, 52, 0, time.UTC)
+
+	// Marker behind the window (the common case): use the window.
+	got, ok := mamSinceFor(window, true, marker, true)
+	if !ok || !got.Equal(window) {
+		t.Errorf("window newer: got (%v,%v), want %v", got, ok, window)
+	}
+	// Marker ahead of the window (stale last-outbound after a crash): use the
+	// marker, so the already-backfilled range is not fetched twice.
+	ahead := window.Add(10 * time.Minute)
+	got, ok = mamSinceFor(window, true, ahead, true)
+	if !ok || !got.Equal(ahead) {
+		t.Errorf("marker newer: got (%v,%v), want %v", got, ok, ahead)
+	}
+	// No window: no backfill, even with a marker.
+	if _, ok := mamSinceFor(time.Time{}, false, marker, true); ok {
+		t.Error("no window should mean no backfill")
+	}
+	// No marker: use the window.
+	got, ok = mamSinceFor(window, true, time.Time{}, false)
+	if !ok || !got.Equal(window) {
+		t.Errorf("no marker: got (%v,%v), want %v", got, ok, window)
+	}
+}
