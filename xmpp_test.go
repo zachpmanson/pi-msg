@@ -611,3 +611,142 @@ func TestDispatchRoomOwnEchoFallsBackToAccountNick(t *testing.T) {
 		t.Fatalf("own-echo from fallback nick forwarded: %+v", got)
 	}
 }
+
+// testLogBridge returns a bridge whose log lines are captured, so tests can
+// assert on what the user would have seen in journalctl.
+func testLogBridge() (*XMPPBridge, *[]string) {
+	logged := &[]string{}
+	b := &XMPPBridge{}
+	b.logf = func(level, msg string) { *logged = append(*logged, level+": "+msg) }
+	return b, logged
+}
+
+// countLogs counts captured log lines containing substr.
+func countLogs(logged []string, substr string) int {
+	n := 0
+	for _, l := range logged {
+		if strings.Contains(l, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// withShortCloseTimeout shrinks sessionCloseTimeout for the duration of a test.
+func withShortCloseTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := sessionCloseTimeout
+	sessionCloseTimeout = d
+	t.Cleanup(func() { sessionCloseTimeout = prev })
+}
+
+// TestHardCloseSeversConnEvenWhenGracefulReturns covers issue #90. The graceful
+// session.Close() is XMPP-level bookkeeping: it can return promptly while
+// session.Serve() is still reading happily (the write half was the broken one),
+// which leaves serve() running, Run() never re-dialling, and every later write
+// timing out on a socket nobody will replace. Closing the transport is what
+// unblocks that read.
+func TestHardCloseSeversConnEvenWhenGracefulReturns(t *testing.T) {
+	withShortCloseTimeout(t, 50*time.Millisecond)
+	b, logged := testLogBridge()
+
+	client, server := net.Pipe()
+	defer server.Close()
+
+	// This is Serve(): a read already blocked when the close lands.
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := client.Read(buf)
+		readErr <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// The incident shape: the graceful close returns immediately.
+	hardClose(b, client, func() {})
+
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Errorf("pending read returned nil after hardClose; the transport was left open")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("hardClose left a pending read blocked; Serve() would never return")
+	}
+	if _, err := client.Write([]byte("x")); err == nil {
+		t.Errorf("write succeeded after hardClose; the transport was not closed")
+	}
+	if got := countLogs(*logged, "did not return in time"); got != 0 {
+		t.Errorf("a graceful close that returned cleanly was reported as stuck: %v", *logged)
+	}
+}
+
+// TestHardCloseBoundsABlockedGracefulClose verifies both waits are bounded and
+// that the blocked close is reported rather than hanging the caller (the old
+// implementation waited on it forever after forcing the connection).
+func TestHardCloseBoundsABlockedGracefulClose(t *testing.T) {
+	withShortCloseTimeout(t, 50*time.Millisecond)
+	b, logged := testLogBridge()
+
+	client, server := net.Pipe()
+	defer server.Close()
+
+	release := make(chan struct{})
+	defer close(release)
+
+	start := time.Now()
+	hardClose(b, client, func() { <-release })
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("hardClose blocked for %s on a stuck graceful close", elapsed)
+	}
+	if _, err := client.Write([]byte("x")); err == nil {
+		t.Errorf("write succeeded after hardClose; the transport was not closed")
+	}
+	if got := countLogs(*logged, "did not return in time"); got != 1 {
+		t.Errorf("blocked graceful close not reported once: %v", *logged)
+	}
+	if got := countLogs(*logged, "still blocked after the connection was closed"); got != 1 {
+		t.Errorf("unbounded post-close wait not reported: %v", *logged)
+	}
+}
+
+// TestKeepaliveWedgeForcesReconnectOnEveryFailure covers the other half of
+// issue #90: a failed ping used to be a single recovery attempt followed by the
+// keepalive goroutine returning, so a close that silently achieved nothing left
+// the bridge unmonitored and mute. Every failing tick must force a close, with
+// the log throttled to one line per wedge plus an occasional "still failing".
+func TestKeepaliveWedgeForcesReconnectOnEveryFailure(t *testing.T) {
+	b, logged := testLogBridge()
+	var w keepaliveWedge
+	closes := 0
+	fail := func(now time.Time) {
+		t.Helper()
+		w.failure(b, now, fmt.Errorf("write tcp 10.0.0.107:46232->141.168.129.5:5222: i/o timeout"), func() { closes++ })
+	}
+
+	base := time.Now()
+	fail(base)
+	fail(base.Add(30 * time.Second))
+	fail(base.Add(60 * time.Second))
+	if closes != 3 {
+		t.Errorf("forceClose called %d times across 3 failing ticks, want 3", closes)
+	}
+	if got := countLogs(*logged, "keepalive ping failed"); got != 1 {
+		t.Errorf("first failure logged %d times, want 1: %v", got, *logged)
+	}
+
+	fail(base.Add(keepaliveNagInterval + time.Minute))
+	if closes != 4 {
+		t.Errorf("forceClose called %d times after a nag tick, want 4", closes)
+	}
+	if got := countLogs(*logged, "still failing after"); got != 1 {
+		t.Errorf("long wedge not reported once: %v", *logged)
+	}
+
+	// A successful ping ends the wedge; the next failure warns afresh.
+	w.recovered()
+	fail(base.Add(2 * keepaliveNagInterval))
+	if got := countLogs(*logged, "keepalive ping failed"); got != 2 {
+		t.Errorf("first failure of a new wedge logged %d times, want 2 total: %v", got, *logged)
+	}
+}

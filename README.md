@@ -92,6 +92,26 @@ flush — whatever you queued behind the running message is still evaluated
 next. The prefix only matters for the owner: non-owners' messages
 are always treated as literal text.
 
+### Connection robustness
+
+A wedged connection must surface as an error the bridge can act on, not as
+silence. Two failure modes are handled explicitly:
+
+- **A peer that stops acknowledging our data** (it keeps sending us stanzas, so
+  the socket looks alive and reads keep working). The dialer sets
+  `TCP_USER_TIMEOUT` (45 s on Linux), so a write fails with `ETIMEDOUT` in under
+  a minute instead of waiting out the kernel's retransmission budget — which is
+  minutes, and long enough for the bridge to look online-but-mute. A short TCP
+  keepalive (30 s idle, 3 probes) declares a black-holed path dead in both
+  directions within about a minute.
+- **A close that does not actually reconnect.** The keepalive (XEP-0199)
+  detects a dead connection and forces a close, which now *always* severs the
+  transport — `session.Close()` alone is XMPP-level bookkeeping and can return
+  while the read loop is still running. Severing the transport is what makes
+  the read loop unwind so `Run()` re-dials, and each further failing keepalive
+  tick forces another close until the connection is replaced, rather than the
+  recovery being a single attempt.
+
 ## Configuration
 
 Create `~/.config/pi-msg/config.json` (override the path with `PI_MSG_CONFIG`), then

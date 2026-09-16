@@ -654,6 +654,20 @@ func (b *XMPPBridge) markOutbound() {
 // pingTimeout bounds each keepalive ping's round trip.
 const pingTimeout = 15 * time.Second
 
+// TCP keepalive cadence for the bridge's connection. Go enables keepalive on
+// dialed TCP sockets, but with a period measured in minutes; a black-holed
+// path should be declared dead in about a minute so the read loop unwinds and
+// Run() re-dials on its own (issue #90).
+const (
+	tcpKeepAliveIdle     = 30 * time.Second
+	tcpKeepAliveInterval = 10 * time.Second
+	tcpKeepAliveCount    = 3
+)
+
+// keepaliveNagInterval throttles the "still failing" log while a connection is
+// wedged: the first failure is logged immediately, then at most this often.
+const keepaliveNagInterval = 5 * time.Minute
+
 // keepalive periodically pings the server (XEP-0199) to detect a
 // silently-dropped connection, and in room mode self-pings each joined room
 // (XEP-0410) to detect a silent eviction. A failed server ping tears the
@@ -671,6 +685,7 @@ func (b *XMPPBridge) keepalive(ctx context.Context, session *xmpp.Session) {
 	}
 	ticker := time.NewTicker(b.acct.PingInterval)
 	defer ticker.Stop()
+	var wedged keepaliveWedge
 	for {
 		select {
 		case <-ctx.Done():
@@ -678,17 +693,15 @@ func (b *XMPPBridge) keepalive(ctx context.Context, session *xmpp.Session) {
 		case <-ticker.C:
 		}
 		if err := b.pingOnce(ctx, session, server); err != nil {
-			b.log("warning", "keepalive ping failed; forcing reconnect: "+err.Error())
-			// Closing unblocks session.Serve, so serve() returns and Run
-			// reconnects. serve()'s deferred Close makes the double-close a
-			// harmless no-op. A dead connection (the same condition that
-			// just timed out the ping) can make the graceful stream-close
-			// write block on the kernel's own TCP retransmission timeout
-			// (minutes), so bound it and fall back to yanking the raw
-			// connection's deadline to force it closed.
-			closeSession(b, session)
-			return
+			// Keep ticking after a failed ping (issue #90): a recovery that
+			// silently does nothing must be retried, not abandoned. This
+			// goroutine lives only as long as the connection does, so it
+			// stops when serve() returns and a fresh keepalive starts for
+			// the new session.
+			wedged.failure(b, time.Now(), err, func() { closeSession(b, session) })
+			continue
 		}
+		wedged.recovered()
 		for _, room := range b.acct.Rooms {
 			b.selfPing(ctx, session, room)
 		}
@@ -698,27 +711,85 @@ func (b *XMPPBridge) keepalive(ctx context.Context, session *xmpp.Session) {
 	}
 }
 
-// sessionCloseTimeout bounds how long closeSession waits for a graceful
-// session.Close() before forcing the underlying connection closed.
-const sessionCloseTimeout = 5 * time.Second
+// keepaliveWedge tracks one connection's wedge state so a keepalive that keeps
+// failing keeps forcing a reconnect without spamming the log.
+type keepaliveWedge struct {
+	since   time.Time // first failure of the current wedge; zero when healthy
+	lastNag time.Time // when the "still failing" line was last logged
+}
 
-// closeSession closes session, forcibly severing the underlying connection if
-// the graceful close doesn't complete within sessionCloseTimeout. A dead
-// connection can make the graceful stream-close write block on the kernel's
-// own TCP retransmission timeout (minutes), leaving the bridge silently stuck
-// instead of reconnecting.
+// failure records one failed keepalive tick and forces a reconnect. It fires
+// forceClose on EVERY failure, not just the first: the connection is only
+// repaired once the read loop unwinds and Run() re-dials, and a close that did
+// not achieve that must not be the end of the story (issue #90).
+func (w *keepaliveWedge) failure(b *XMPPBridge, now time.Time, err error, forceClose func()) {
+	switch {
+	case w.since.IsZero():
+		w.since, w.lastNag = now, now
+		b.log("warning", "keepalive ping failed; forcing reconnect: "+err.Error())
+	case now.Sub(w.lastNag) >= keepaliveNagInterval:
+		w.lastNag = now
+		b.log("warning", fmt.Sprintf(
+			"keepalive ping still failing after %s; forcing reconnect again: %v",
+			now.Sub(w.since).Round(time.Second), err))
+	}
+	forceClose()
+}
+
+// recovered clears the wedge state after a successful ping.
+func (w *keepaliveWedge) recovered() {
+	w.since = time.Time{}
+	w.lastNag = time.Time{}
+}
+
+// sessionCloseTimeout bounds how long hardClose waits for the graceful close
+// (and, afterwards, for it to finish once the transport is gone). It is a var
+// so tests can shrink it.
+var sessionCloseTimeout = 5 * time.Second
+
+// closeSession closes session, severing the underlying connection so the read
+// loop is guaranteed to unwind and Run() re-dials.
 func closeSession(b *XMPPBridge, session *xmpp.Session) {
+	hardClose(b, session.Conn(), func() { _ = session.Close() })
+}
+
+// hardClose runs graceful, then closes the transport unconditionally.
+//
+// The unconditional close is the point: session.Close() is XMPP-level
+// bookkeeping (it sends the stream close and tears down session state) and does
+// NOT guarantee that session.Serve() has returned. When only the write half of
+// a connection is broken -- the peer keeps sending us stanzas but stops
+// acknowledging ours -- the graceful close returns promptly while Serve() keeps
+// reading happily, so serve() never returns, Run() never re-dials, and every
+// later write times out on a socket nobody will replace (issue #90). Closing
+// the raw connection makes the pending read fail, which is what unwinds the
+// loop.
+func hardClose(b *XMPPBridge, conn net.Conn, graceful func()) {
 	done := make(chan struct{})
 	go func() {
-		session.Close()
+		graceful()
 		close(done)
 	}()
+
 	select {
 	case <-done:
 	case <-time.After(sessionCloseTimeout):
 		b.log("warning", "session.Close() did not return in time; forcing connection closed")
-		session.Conn().SetDeadline(time.Now())
-		<-done
+	}
+
+	if conn != nil {
+		// Also bound a blocked read in case the peer is silent rather than
+		// loud: Close covers both, and is a no-op if already closed.
+		_ = conn.Close()
+	}
+
+	// Never wait unbounded for the graceful close to notice: a close that is
+	// still blocked after the transport is gone cannot be helped, and the
+	// caller (keepalive or kick) must not be parked on it.
+	select {
+	case <-done:
+	case <-time.After(sessionCloseTimeout):
+		b.log("warning", "session.Close() still blocked after the connection was closed")
 	}
 }
 
@@ -817,6 +888,21 @@ func (b *XMPPBridge) connect(ctx context.Context) (*xmpp.Session, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	var d net.Dialer
+	// Keep both halves of the connection's failure modes bounded, so a stalled
+	// peer surfaces as an error the bridge can act on rather than as writes
+	// that hang for the kernel's full retransmission budget (issue #90):
+	// TCP_USER_TIMEOUT caps how long unacknowledged data is retransmitted
+	// before the write fails, and a short TCP keepalive declares a black-holed
+	// path dead in both directions within ~a minute.
+	d.Control = func(network, address string, c syscall.RawConn) error {
+		return hardenTCP(c)
+	}
+	d.KeepAliveConfig = net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     tcpKeepAliveIdle,
+		Interval: tcpKeepAliveInterval,
+		Count:    tcpKeepAliveCount,
+	}
 	conn, err := d.DialContext(dialCtx, "tcp", target)
 	if err != nil {
 		return nil, fmt.Errorf("dialing %s: %w", target, err)
