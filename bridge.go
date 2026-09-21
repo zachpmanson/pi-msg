@@ -1884,26 +1884,33 @@ func (b *Bridge) deliverReply(text string) bool {
 
 // maxRoutingNudges bounds how many routing reminders we send per user turn, so
 // a stubbornly-malformed agent can't loop forever. Applied at settle time (the
-// only point a reminder can fire, per #16).
+// only point a reminder can fire, per #16), and only to the reminder prompt:
+// the drop report itself is never rate-limited, or a genuinely lost reply would
+// go unrecorded.
 const maxRoutingNudges = 2
 
 // pendingNudge is a malformed room-mode reply staged while the agent streams.
-// The routing reminder is only sent at agent_settled if the run's FINAL
-// message was malformed (issue #16) — mid-run commentary drops silently, and a
-// message that later routes fine clears the staged correction.
+// Both the routing reminder AND the drop report (error-room card) are deferred
+// to agent_settled and fire only if the run's FINAL message was malformed
+// (issue #16) — mid-run commentary drops silently, and a message that later
+// routes fine clears the staged correction.
 type pendingNudge struct {
 	body   string
 	reason string
 }
 
-// rejectReply handles a room-mode reply that couldn't be routed: it forwards the
-// text to the write-only error room (falling back to the owner's 1:1 if unset),
-// then stages a routing correction. The actual nudge prompt is deferred to
-// agent_settled (firePendingNudge, issue #16), so mid-stream thinking
-// commentary never triggers a routing reminder.
+// rejectReply records a room-mode message that couldn't be routed. Nothing is
+// sent or logged here: a run emits one message per assistant turn, so most
+// unroutable text is mid-run narration ("Now the manifest and strings:") that
+// was never addressed to anyone and must not be reported as a dropped reply.
+// The correction is staged and the entire drop report — warning log, error-room
+// card, nudge prompt — is emitted once at agent_settled (firePendingNudge,
+// issues #16 and #92), and only if no later message in the run routed fine.
 func (b *Bridge) rejectReply(body, reason string) {
-	b.log("warning", "agent reply not routed: "+reason)
-	b.routeDropped(fmt.Sprintf("⚠️ malformed message: %s\n\n%s", reason, body))
+	// Keep a debug-level trace — the text is unrouteable either way — while
+	// leaving the warning for the settle-time decision, so that "agent reply not
+	// routed" in the journal means a reply that actually reached nobody.
+	b.log("info", "unroutable mid-run text (not yet a drop): "+reason)
 	b.stageNudge(body, reason)
 }
 
@@ -1925,19 +1932,16 @@ func (b *Bridge) clearPendingNudge() {
 	b.mu.Unlock()
 }
 
-// takeStagedNudge consumes the staged correction (if any) and reports the
-// reason to nudge about, bounded by the per-turn budget. Returns "" when
-// nothing is staged or the budget is exhausted — the reminder is silently
-// dropped in both cases (the text already reached the error room).
-func (b *Bridge) takeStagedNudge() string {
+// takeStagedNudge consumes the staged correction (if any), or nil when nothing
+// is staged. What it returns is output that genuinely reached no destination:
+// reaching settle on a staged nudge means the run ended on an unroutable
+// message.
+func (b *Bridge) takeStagedNudge() *pendingNudge {
 	b.mu.Lock()
 	p := b.pendingNudge
 	b.pendingNudge = nil
 	b.mu.Unlock()
-	if p == nil || !b.bumpRoutingNudge() {
-		return ""
-	}
-	return p.reason
+	return p
 }
 
 // maxTailNudges bounds how many empty-tail recovery prompts we send per user
@@ -2220,21 +2224,33 @@ func (b *Bridge) fireTailRecovery() bool {
 	return true
 }
 
-// firePendingNudge sends the staged routing reminder, if the run settled on a
-// malformed final message. Called from agent_settled only; the reminder is a
-// prompt, so it isn't confused for a real user.
+// firePendingNudge emits the drop report for the run's final message, if the
+// run settled on an unroutable one, and sends the routing reminder. Called from
+// agent_settled only; the reminder is a prompt, so it isn't confused for a real
+// user. The report (warning log + write-only error room card) is emitted here
+// rather than when the text arrived (#92): mid-run narration is not a reply, so
+// it never lands in the error room, which stays a signal for replies that were
+// genuinely lost. The reminder prompt alone is bounded per turn. Reports
+// whether the reminder was sent, so the caller can hold the empty-run banner.
 func (b *Bridge) firePendingNudge() bool {
-	reason := b.takeStagedNudge()
-	if reason == "" {
+	p := b.takeStagedNudge()
+	if p == nil {
 		return false
 	}
-	b.rpc.Prompt(fmt.Sprintf("[pi-msg: routing: Your previous message was NOT delivered to anyone in the chat: %s. Every reply MUST begin with a line \"to: <jid>\" naming the destination (e.g. \"to: %s\" for the owner, or a room/person jid). Resend your message now with a valid \"to:\" line.]", reason, b.acct.Owner), b.steerBehavior())
+	b.log("warning", "agent reply not routed: "+p.reason)
+	b.routeDropped(fmt.Sprintf("⚠️ malformed message: %s\n\n%s", p.reason, p.body))
+	if !b.bumpRoutingNudge() {
+		return false
+	}
+	b.rpc.Prompt(fmt.Sprintf("[pi-msg: routing: Your previous message was NOT delivered to anyone in the chat: %s. Every reply MUST begin with a line \"to: <jid>\" naming the destination (e.g. \"to: %s\" for the owner, or a room/person jid). Resend your message now with a valid \"to:\" line.]", p.reason, b.acct.Owner), b.steerBehavior())
 	return true
 }
 
 // routeDropped sends dropped/unrouteable output to the write-only error room
 // (Change #15) when one is configured, falling back to the owner's 1:1
-// otherwise so nothing is silently lost. The agent never reads the error room.
+// otherwise so nothing is silently lost. Called from firePendingNudge at
+// agent_settled: a message dropped mid-run is usually narration, not a reply,
+// and does not belong here (#92). The agent never reads the error room.
 func (b *Bridge) routeDropped(text string) {
 	if errRoom := b.acct.ErrorRoom; errRoom != "" {
 		b.xmpp.SendRoomTo(bareJid(errRoom), text)
