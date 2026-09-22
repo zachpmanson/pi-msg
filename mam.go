@@ -177,6 +177,35 @@ func mamSinceFor(windowStart time.Time, windowOK bool, seen time.Time, seenOK bo
 	return windowStart, true
 }
 
+// mamReconnectWindow bounds how far back a mid-session reconnect backfill may
+// reach. The restart path (mamSinceFor) is what recovers long downtime; the
+// reconnect path only has to cover the gap since the connection dropped, and
+// clamping keeps a session that has been idle for hours from dragging a large
+// slice of archive into a catch-up (#94).
+const mamReconnectWindow = 30 * time.Minute
+
+// reconnectSince resolves the archive lower bound for a mid-session reconnect
+// backfill (#94): the later of the last inbound the running bridge handled live
+// (`lastin`) and the last completed backfill (`mamseen`), clamped to at most
+// mamReconnectWindow behind now. Returns ok=false when neither cursor exists.
+func reconnectSince(lastIn time.Time, lastInOK bool, seen time.Time, seenOK bool, now time.Time) (time.Time, bool) {
+	cursor := time.Time{}
+	ok := false
+	if lastInOK {
+		cursor, ok = lastIn, true
+	}
+	if seenOK && (!ok || seen.After(cursor)) {
+		cursor, ok = seen, true
+	}
+	if !ok {
+		return time.Time{}, false
+	}
+	if floor := now.Add(-mamReconnectWindow); cursor.Before(floor) {
+		return floor, true
+	}
+	return cursor, true
+}
+
 // collectMAMResult consumes a XEP-0313 archived-message <result> from the read
 // loop, appending it to the matching in-flight collector. Unknown query ids are
 // dropped: a MAM result must never fall through to live dispatch, or an old

@@ -171,10 +171,20 @@ anything sent to a room while the bridge was down is simply lost.
   (`<config-dir>/<account>.mamseen`) — so a restart cannot re-deliver messages
   the running bridge already handled live. On the very first launch no archive
   is walked; the marker just starts the clock.
+- **Mid-session reconnect** — a dropped socket that comes back without the
+  process restarting recovers the same way (issue #94). The delayed backlog the
+  server pushes on reconnect is dropped by the dispatch path (it belongs to the
+  restart window, which is long closed), so every reconnect after the first runs
+  a backfill of its own, bounded to at most `30m` behind now and lower-bounded
+  by `<config-dir>/<account>.lastin` — the instant the bridge last handed an
+  inbound message to the agent. A non-buffered delayed drop is now logged rather
+  than silently discarded.
 - **Delivery** — fetched messages go into the same replay buffer as delayed
   stanzas and are handed to the resumed session in one chronological block
   (`Back online, catching up on N messages`). Duplicates (a message that was
-  both delay-pushed and archived) are dropped by XEP-0359 stanza id.
+  both delay-pushed and archived) are dropped by XEP-0359 stanza id, and the
+  `mamseen` cursor is advanced only after the block has been handed over, so a
+  crash mid-delivery re-fetches it instead of losing it.
 - **Degradation** — a server without an archive (`mod_mam` off) logs a warning
   and the delay-stanza path runs unchanged; startup never fails, so the default
   is safe for a server that lacks MAM.
