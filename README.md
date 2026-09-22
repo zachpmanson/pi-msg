@@ -226,8 +226,26 @@ the message's origin:
 from: <channel jid>     # the room (group msg) or the owner (DM) — reply here to answer in place
 sender: <person jid>    # room messages only, when the real JID is known — reply here to DM them
 stanza-id: <uuid>       # this message's id — reply here to answer this message specifically
+react-to: <jid>         # reactions only: where to react (room jid or sender)
+in-reply-to: <id> …     # inbound XEP-0461 only: what this message answers
 <message body>
 ```
+
+`in-reply-to:` appears when the sender's client stamped the message as a **reply**
+(XEP-0461). pi-msg resolves the stamped id against its stanza history — recording both
+directions, so a reply to our own message resolves too — and prints the author, how long
+ago it was sent, and a short quote:
+
+```
+in-reply-to: 6e7c6ed8-5485-4c01-be7a-07750c59ed27 (from zach@x/phone, 2m ago): "then send me latest master apk"
+```
+
+An id that cannot be resolved is reported as such (`… NOT in this session's history:
+either it was never delivered to this bridge, or it predates the session`) rather than
+dropped — that is the interesting case, and it is what a reply to a message lost in a
+reconnect gap looks like. Clients differ on the stamp's `to` attribute (some name the
+conversation partner rather than the author), so the id is authoritative and `to` is only
+reported as a hint.
 
 And **every** agent reply must begin with a `to:` line naming its destination:
 

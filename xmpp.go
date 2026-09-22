@@ -296,6 +296,13 @@ type InboundMessage struct {
 	// (no body). ReactionID is the stanza id of the message being reacted to.
 	Reactions  []string
 	ReactionID string
+
+	// ReplyToID / ReplyToJID carry a XEP-0461 <reply/> stamp: the stanza id of the
+	// message this one answers, and the JID it was stamped to. Rendered into the
+	// prompt as an `in-reply-to:` header so the agent can tell what is being
+	// referred to (issue #95).
+	ReplyToID  string
+	ReplyToJID string
 }
 
 // XMPPBridge owns a single account's XMPP connection: it maintains a
@@ -1130,13 +1137,15 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
 	}
-	// Record the inbound message in history so send_reaction can target it by ID.
+	// Record the inbound message in history so send_reaction can target it by ID,
+	// and so a later reply to it can be resolved and quoted (#95).
 	if m.id != "" {
-		b.recordMessage(m.id, m.from)
+		b.recordMessageBody(m.id, m.from, m.body)
 	}
 	// The agent is about to take this in — acknowledge it as read/delivered.
 	b.sendReceipts(m)
-	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Reactions: m.reactions, ReactionID: m.reactionFor})
+	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Reactions: m.reactions, ReactionID: m.reactionFor,
+		ReplyToID: m.replyToID, ReplyToJID: m.replyToJID})
 }
 
 // dispatchRoom applies groupchat guards and forwards room messages to onMsg,
@@ -1187,9 +1196,10 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
 	}
-	// Record the inbound room message in history so send_reaction can target it by ID.
+	// Record the inbound room message in history so send_reaction can target it
+	// by ID, and so a later reply to it can be resolved and quoted (#95).
 	if m.id != "" {
-		b.recordMessage(m.id, m.from)
+		b.recordMessageBody(m.id, m.from, m.body)
 	}
 	real := b.occupantRealJID(room, nick)
 	b.onMsg(InboundMessage{
@@ -1198,6 +1208,8 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 		RealJID:    real,
 		FromOwner:  real != "" && real == b.ownerBare,
 		Room:       room,
+		ReplyToID:  m.replyToID,
+		ReplyToJID: m.replyToJID,
 		ID:         m.id,
 		From:       m.from,
 		Reactions:  m.reactions,
@@ -1569,7 +1581,7 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, reply *
 	msg := chatStanza(id, toJID, typ, body, reply)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	b.recordMessage(id, to)
+	b.recordMessageBody(id, to, body)
 	return id, b.encode(ctx, session, msg)
 }
 
@@ -1645,25 +1657,40 @@ func (b *XMPPBridge) encodeReceipt(to, ns, local, forID string) error {
 
 // msgHistoryEntry records an inbound or outbound message stanza in the
 // history ring buffer, so the bridge can resolve a stanza ID to its source
-// JID without the agent having to remember it.
+// JID without the agent having to remember it. Body (truncated) lets an inbound
+// XEP-0461 reply quote what it answers (#95).
 type msgHistoryEntry struct {
 	FromJID   string
 	Timestamp time.Time
+	Body      string
 }
 
 // msgHistoryCap is the maximum number of stanza IDs retained in history.
 const msgHistoryCap = 500
 
-// recordMessage records a stanza ID -> JID mapping in the history ring
-// buffer, evicting the oldest entry if the buffer is full.
+// msgHistoryBodyCap is the most text retained per history entry, so 500 entries
+// cannot pin an unbounded amount of message content in memory.
+const msgHistoryBodyCap = 200
+
+// recordMessage records a stanza ID -> JID mapping in the history ring buffer,
+// evicting the oldest entry if the buffer is full. Used where the body is not
+// worth retaining (outbound sends).
 func (b *XMPPBridge) recordMessage(id, fromJID string) {
+	b.recordMessageBody(id, fromJID, "")
+}
+
+// recordMessageBody records a stanza ID -> (JID, body) mapping in the history
+// ring buffer. The body is what a later inbound reply to this message gets to
+// see, so both directions are recorded.
+func (b *XMPPBridge) recordMessageBody(id, fromJID, body string) {
 	if id == "" {
 		return
 	}
+	body = truncateLabel(strings.TrimSpace(body), msgHistoryBodyCap)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if _, exists := b.msgHistory[id]; exists {
-		b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now()}
+		b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now(), Body: body}
 		return
 	}
 	if len(b.msgHistory) >= msgHistoryCap {
@@ -1677,7 +1704,7 @@ func (b *XMPPBridge) recordMessage(id, fromJID string) {
 		}
 		delete(b.msgHistory, oldestKey)
 	}
-	b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now()}
+	b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now(), Body: body}
 }
 
 // lookupMessage returns the from-JID for a recorded stanza ID, or "" if not found.
@@ -1691,6 +1718,19 @@ func (b *XMPPBridge) lookupMessage(id string) string {
 		return e.FromJID
 	}
 	return ""
+}
+
+// lookupMessageEntry returns the recorded entry for a stanza ID, so an inbound
+// reply can be resolved to its author, timestamp and a short quote of what it
+// answers.
+func (b *XMPPBridge) lookupMessageEntry(id string) (msgHistoryEntry, bool) {
+	if id == "" {
+		return msgHistoryEntry{}, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.msgHistory[id]
+	return e, ok
 }
 
 // SendReaction reacts to message forID (authored by `to`) with the given emoji,
@@ -2218,15 +2258,28 @@ func element(toks []xml.Token, space, local string) (xml.StartElement, bool) {
 
 // childText returns the character data immediately following the first start
 // element with the given local name, or "".
+//
+// Only a DIRECT child of the stanza being read is considered (the scan stops at
+// nested depth): <body> is also the local name of the XHTML-IM payload
+// (`<html><body>`) and of the XEP-0461 `<fallback><body>` quote, either of which
+// could otherwise be returned as the message text (#95).
 func childText(toks []xml.Token, local string) string {
+	depth := 0
 	for i, tok := range toks {
-		se, ok := tok.(xml.StartElement)
-		if !ok || se.Name.Local != local {
-			continue
-		}
-		if i+1 < len(toks) {
-			if cd, ok := toks[i+1].(xml.CharData); ok {
-				return string(cd)
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if depth == 0 && t.Name.Local == local {
+				if i+1 < len(toks) {
+					if cd, ok := toks[i+1].(xml.CharData); ok {
+						return string(cd)
+					}
+				}
+				return ""
+			}
+			depth++
+		case xml.EndElement:
+			if depth > 0 {
+				depth--
 			}
 		}
 	}

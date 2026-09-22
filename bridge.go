@@ -731,7 +731,7 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	if m.Direct {
 		// Owner 1:1: origin is the owner; no separate sender. The reaction target
 		// is this message (routed to its full from-JID).
-		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID)
+		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m))
 		return
 	}
 	b.handleRoom(m)
@@ -839,13 +839,13 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 		if b.acct.RoomReactions {
 			reactTo = m.Room
 		}
-		b.handleCanonical(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID)
+		b.handleCanonical(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID, b.replyContext(m))
 	case actionCommentary:
 		reactTo := ""
 		if b.acct.RoomReactions {
 			reactTo = m.Room
 		}
-		b.dispatchCommentary(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID)
+		b.dispatchCommentary(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID, b.replyContext(m))
 	case actionAmbient:
 		b.bufferAmbient(m.Nick, m.Body)
 	}
@@ -873,7 +873,7 @@ func senderName(nick, sender, origin string) string {
 // only), both surfaced to the agent for explicit reply routing. nick is the
 // sender's occupant nick in a room, "" in a 1:1 — it only names the sender in
 // the unanswered-message hint's history.
-func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID string) {
+func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, replyTo string) {
 	t := strings.TrimSpace(text)
 	if t == "" {
 		return
@@ -886,14 +886,14 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID st
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
-	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo), b.steerBehavior())
+	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo, replyTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
 
 // dispatchCommentary sends a non-owner addressed message as an untrusted
 // prompt. Slash-commands from non-owners are treated as literal text, never
 // control commands.
-func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID string) {
+func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID, replyTo string) {
 	t := strings.TrimSpace(body)
 	if t == "" {
 		return
@@ -901,7 +901,7 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
-	b.rpc.Prompt(b.composePrompt(t, false, nick, origin, sender, reactID, reactTo), b.steerBehavior())
+	b.rpc.Prompt(b.composePrompt(t, false, nick, origin, sender, reactID, reactTo, replyTo), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
 
@@ -1380,7 +1380,68 @@ func (b *Bridge) routingContract() string {
 // "on-start" baseline), and the only corrective is firePendingNudge, which
 // re-injects the rule at agent_settled when a run's final message failed to
 // route (#16).
-func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender, reactID, reactTo string) string {
+// replyContext renders the `in-reply-to:` header value for an inbound message
+// carrying a XEP-0461 reply stamp, or "" when it carries none (#95).
+//
+// The stamped id is resolved against the stanza history, which records both
+// directions, so the agent sees who wrote the message being answered, how long
+// ago, and a short quote of it. That is the whole point: a bare "?" replying to
+// something is unanswerable without it, and it was the reason an agent answered
+// the wrong question on 2026-09-22.
+//
+// An id that cannot be resolved is reported as unresolvable rather than dropped.
+// That is the case worth naming: the replied-to message was never delivered
+// (issue #94) or predates the session. Clients differ on the `to` attribute —
+// some stamp the conversation partner rather than the author — so the id is
+// authoritative and `to` is only ever reported as a hint.
+func (b *Bridge) replyContext(m InboundMessage) string {
+	id, stamped := m.ReplyToID, m.ReplyToJID
+	if id == "" && stamped == "" {
+		return ""
+	}
+	if id == "" {
+		return fmt.Sprintf("an unidentified message (no id was stamped; the reply names %s)", stamped)
+	}
+	if b.xmpp != nil {
+		if e, ok := b.xmpp.lookupMessageEntry(id); ok {
+			who := e.FromJID
+			if who == "" {
+				who = "unknown sender"
+			}
+			when := "time unknown"
+			if !e.Timestamp.IsZero() {
+				when = shortAge(time.Since(e.Timestamp))
+			}
+			if e.Body != "" {
+				return fmt.Sprintf("%s (from %s, %s): %q", id, who, when, e.Body)
+			}
+			return fmt.Sprintf("%s (from %s, %s)", id, who, when)
+		}
+	}
+	hint := ""
+	if stamped != "" {
+		hint = fmt.Sprintf(" (the reply was stamped to %s)", stamped)
+	}
+	return fmt.Sprintf("%s — NOT in this session's history: either it was never delivered to this bridge, or it predates the session%s", id, hint)
+}
+
+// shortAge renders a coarse "how long ago" for a prompt header.
+func shortAge(d time.Duration) string {
+	switch {
+	case d < 0:
+		return "just now"
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
+func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender, reactID, reactTo, replyTo string) string {
 	var sb strings.Builder
 	// Seed the pi-msg routing contract once per session (fresh session or after
 	// /new) so the agent knows the protocol without paying a per-message cost.
@@ -1410,6 +1471,12 @@ func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender
 		if reactTo != "" {
 			fmt.Fprintf(&sb, "react-to: %s\n", reactTo)
 		}
+	}
+	// A reply names the message it answers, resolved to its author, age and a
+	// short quote so a bare "?" is answerable without the owner restating what
+	// they were referring to (#95).
+	if replyTo != "" {
+		fmt.Fprintf(&sb, "in-reply-to: %s\n", replyTo)
 	}
 	if canonical {
 		sb.WriteString(body)
@@ -3351,7 +3418,7 @@ func (b *Bridge) fireResumeTurn() {
 func (b *Bridge) fireInitialPrompt() {
 	b.setLifecycleReactTarget("", "")
 	b.setTurnDest(b.acct.Owner)
-	b.rpc.Prompt(b.composePrompt(b.initialPrompt, true, "", b.acct.Owner, "", "", ""), b.steerBehavior())
+	b.rpc.Prompt(b.composePrompt(b.initialPrompt, true, "", b.acct.Owner, "", "", "", ""), b.steerBehavior())
 	b.xmpp.SetPresence("dnd", "thinking…")
 }
 
@@ -3511,7 +3578,7 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage) {
 			b.xmpp.markSeen(m.ID)
 			b.noteInboundHandled()
 			if m.Direct {
-				b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID)
+				b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m))
 			} else {
 				b.handleRoom(m)
 			}
