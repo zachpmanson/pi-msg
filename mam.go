@@ -233,7 +233,11 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	if archIdx < 0 {
 		return
 	}
-	rest := toks[archIdx:]
+	// Slice from just inside the archived <message> so rest holds that
+	// message's own children: childText only matches a direct child of the
+	// stanza it is given (#95), and the archived element's open is still present
+	// at archIdx.
+	rest := toks[archIdx+1:]
 	body := childText(rest, "body")
 	if strings.TrimSpace(body) == "" {
 		return // chat-state / receipt / empty archive entry
@@ -250,9 +254,15 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 		}
 	}
 	if id != "" {
-		b.recordMessage(id, from)
+		b.recordMessageBody(id, from, body)
 	}
 	m := InboundMessage{Body: body, ID: id, From: from, Stamp: stamp}
+	// A recovered message can itself be a XEP-0461 reply; keep the stamp so the
+	// prompt names what it answers (#95).
+	if re, ok := element(rest, replyNS, "reply"); ok {
+		m.ReplyToID = attr(re.Attr, "id")
+		m.ReplyToJID = attr(re.Attr, "to")
+	}
 	if col.room != "" {
 		nick := resourcepart(from)
 		if self := b.ownNick(col.room); self != "" && strings.EqualFold(nick, self) {

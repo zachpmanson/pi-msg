@@ -287,7 +287,7 @@ func TestStanzaIDSurfacedWithoutRoomReactions(t *testing.T) {
 	const id = "3e2597d4-a470-4cdb-b972-431043bce34f"
 	acct := ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x", RoomTrigger: "pi"}
 	b := newTestBridge(acct) // RoomReactions is off
-	prompt := b.composePrompt("do it", true, "", "team@muc.x", "zach@x", id, "")
+	prompt := b.composePrompt("do it", true, "", "team@muc.x", "zach@x", id, "", "")
 	if !strings.Contains(prompt, "stanza-id: "+id) {
 		t.Errorf("prompt is missing the stanza id:\n%s", prompt)
 	}
@@ -296,5 +296,144 @@ func TestStanzaIDSurfacedWithoutRoomReactions(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "to: <stanza-id>") {
 		t.Errorf("the routing contract must document the stanza-id form:\n%s", prompt)
+	}
+}
+
+// An inbound XEP-0461 reply must reach the agent with enough context to know
+// what is being answered (#95). Before this, an owner replying "?" to a
+// message got answered about something else entirely, because the prompt
+// carried the reply's own text and nothing about its target.
+func TestInboundReplyContextResolves(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	b := newTestBridge(acct)
+	const orig = "6e7c6ed8-5485-4c01-be7a-07750c59ed27"
+	b.xmpp.recordMessageBody(orig, "zach@x/phone", "then send me latest master apk")
+
+	// Resolvable: id, author, age and a quote of what is being answered.
+	got := b.replyContext(InboundMessage{ReplyToID: orig, ReplyToJID: "pi@x"})
+	for _, want := range []string{orig, "zach@x/phone", `"then send me latest master apk"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("replyContext = %q, missing %q", got, want)
+		}
+	}
+
+	// Unresolvable: named as such, with the client's `to` as a hint. This is the
+	// case that actually happened — a reply to a message that never arrived.
+	unknown := "aaaaaaaa-1111-2222-3333-444444444444"
+	got = b.replyContext(InboundMessage{ReplyToID: unknown, ReplyToJID: "pi@x"})
+	if !strings.Contains(got, unknown) || !strings.Contains(got, "NOT in this session's history") {
+		t.Errorf("unresolvable reply = %q, want the id and an explicit miss", got)
+	}
+	if !strings.Contains(got, "pi@x") {
+		t.Errorf("unresolvable reply = %q, want the stamped-to jid as a hint", got)
+	}
+
+	// A stamp with no id (some clients only set `to`).
+	if got := b.replyContext(InboundMessage{ReplyToJID: "pi@x"}); !strings.Contains(got, "no id was stamped") {
+		t.Errorf("id-less reply = %q", got)
+	}
+	// No stamp at all: no header.
+	if got := b.replyContext(InboundMessage{}); got != "" {
+		t.Errorf("no reply stamp should render nothing, got %q", got)
+	}
+}
+
+// The rendered header sits with the other metadata lines, above the message.
+func TestComposePromptSurfacesInReplyTo(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	b := newTestBridge(acct)
+	const orig = "6e7c6ed8-5485-4c01-be7a-07750c59ed27"
+	b.xmpp.recordMessageBody(orig, "zach@x/phone", "merge to master")
+	m := InboundMessage{ReplyToID: orig, ReplyToJID: "pi@x"}
+	prompt := b.composePrompt("?", true, "", "team@muc.x", "zach@x", "id-123", "team@muc.x", b.replyContext(m))
+	lines := strings.Split(prompt, "\n")
+	fromIdx, idx := -1, -1
+	for i, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "from: "):
+			fromIdx = i
+		case strings.HasPrefix(l, "in-reply-to: "):
+			idx = i
+		}
+	}
+	if fromIdx < 0 {
+		t.Fatalf("prompt has no from line:\n%s", prompt)
+	}
+	if idx < 0 {
+		t.Fatalf("prompt has no in-reply-to line:\n%s", prompt)
+	}
+	if idx < fromIdx {
+		t.Errorf("in-reply-to must follow the from/stanza-id header lines:\n%s", prompt)
+	}
+	if !strings.Contains(lines[idx], `"merge to master"`) {
+		t.Errorf("in-reply-to line lacks the quote: %q", lines[idx])
+	}
+	// The header block must precede the message body itself.
+	if idx >= len(lines)-1 || strings.TrimSpace(lines[len(lines)-1]) != "?" {
+		t.Errorf("body not last after the header block:\n%s", prompt)
+	}
+}
+
+// <body> is a local name shared with the XHTML-IM payload and the XEP-0461
+// <fallback> quote. Only a direct child of the stanza counts, or a client that
+// sends HTML or fallback text could have the wrong body prompted (#95).
+func TestChildTextOnlyMatchesDirectChild(t *testing.T) {
+	// A direct <body> plus an HTML payload and a fallback quote: the direct one wins.
+	toks := []xml.Token{
+		xml.StartElement{Name: xml.Name{Local: "body"}},
+		xml.CharData("the real text"),
+		xml.EndElement{Name: xml.Name{Local: "body"}},
+		xml.StartElement{Name: xml.Name{Space: "http://jabber.org/protocol/xhtml-im", Local: "html"}},
+		xml.StartElement{Name: xml.Name{Space: "http://www.w3.org/1999/xhtml", Local: "body"}},
+		xml.CharData("html text"),
+		xml.EndElement{Name: xml.Name{Local: "body"}},
+		xml.EndElement{Name: xml.Name{Local: "html"}},
+	}
+	if got := childText(toks, "body"); got != "the real text" {
+		t.Errorf("childText = %q, want the direct child", got)
+	}
+	// Only nested copies (html + fallback): must NOT be mistaken for the body.
+	nested := []xml.Token{
+		xml.StartElement{Name: xml.Name{Local: "html"}},
+		xml.StartElement{Name: xml.Name{Local: "body"}},
+		xml.CharData("html text"),
+		xml.EndElement{Name: xml.Name{Local: "body"}},
+		xml.EndElement{Name: xml.Name{Local: "html"}},
+		xml.StartElement{Name: xml.Name{Space: "urn:xmpp:fallback:0", Local: "fallback"}},
+		xml.StartElement{Name: xml.Name{Local: "body"}},
+		xml.CharData("quoted text"),
+		xml.EndElement{Name: xml.Name{Local: "body"}},
+		xml.EndElement{Name: xml.Name{Local: "fallback"}},
+	}
+	if got := childText(nested, "body"); got != "" {
+		t.Errorf("childText = %q, want \"\" (no direct child body)", got)
+	}
+}
+
+// A reply target's quote is bounded and single-lined: it is pasted into a
+// prompt header, so a 10KB message must not be reproduced there.
+func TestMsgHistoryBodyBounded(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{Owner: "zach@x"}, func(InboundMessage) {}, nil)
+	long := strings.Repeat("x", 5000) + "\nsecond line"
+	b.recordMessageBody("id-1", "zach@x/phone", long)
+	e, ok := b.lookupMessageEntry("id-1")
+	if !ok {
+		t.Fatal("entry not recorded")
+	}
+	if n := len([]rune(e.Body)); n > msgHistoryBodyCap {
+		t.Errorf("stored body is %d runes, want <= %d", n, msgHistoryBodyCap)
+	}
+	if strings.Contains(e.Body, "\n") {
+		t.Errorf("stored body kept a newline: %q", e.Body)
+	}
+	// Outbound sends record a body too, so our own message can be quoted when the
+	// owner replies to it.
+	x := NewXMPPBridge(ResolvedAccount{Owner: "zach@x"}, func(InboundMessage) {}, nil)
+	x.recordMessageBody("id-2", "zach@x", "here is the apk")
+	if e, ok := x.lookupMessageEntry("id-2"); !ok || e.Body != "here is the apk" {
+		t.Errorf("lookup = (%+v,%v)", e, ok)
+	}
+	if _, ok := x.lookupMessageEntry("never-seen"); ok {
+		t.Error("unknown id reported as found")
 	}
 }

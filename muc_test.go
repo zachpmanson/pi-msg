@@ -124,7 +124,7 @@ func TestComposePrompt(t *testing.T) {
 
 	// Owner DM turn: "from:" is the owner, body follows directly (no sender
 	// line). No routing hint is appended (removed per issue #33).
-	got := b.composePrompt("hello", true, "", "zach@x.com", "", "", "")
+	got := b.composePrompt("hello", true, "", "zach@x.com", "", "", "", "")
 	if !strings.HasPrefix(got, "from: zach@x.com\nhello") {
 		t.Errorf("dm header wrong: %q", got)
 	}
@@ -133,13 +133,13 @@ func TestComposePrompt(t *testing.T) {
 	}
 
 	// Room turn from the owner: from: is the room, sender: is the owner's jid.
-	got = b.composePrompt("hi", true, "", "team@muc.x.com", "zach@x.com", "", "")
+	got = b.composePrompt("hi", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
 	if !strings.Contains(got, "from: team@muc.x.com\n") || !strings.Contains(got, "sender: zach@x.com\n") {
 		t.Errorf("room header wrong: %q", got)
 	}
 
 	// Commentary: wrapped as untrusted, includes nick + sender header.
-	got = b.composePrompt("help", false, "alice", "team@muc.x.com", "alice@x.com", "", "")
+	got = b.composePrompt("help", false, "alice", "team@muc.x.com", "alice@x.com", "", "", "")
 	if !strings.Contains(got, "NON-OWNER") || !strings.Contains(got, "alice") ||
 		!strings.Contains(got, "help") || !strings.Contains(got, "sender: alice@x.com") {
 		t.Errorf("commentary framing wrong: %q", got)
@@ -147,7 +147,7 @@ func TestComposePrompt(t *testing.T) {
 
 	// Ambient is prepended.
 	b.bufferAmbient("bob", "fyi")
-	got = b.composePrompt("do it", true, "", "team@muc.x.com", "zach@x.com", "", "")
+	got = b.composePrompt("do it", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
 	if !strings.Contains(got, "room commentary") || !strings.Contains(got, "do it") {
 		t.Errorf("canonical+ambient wrong: %q", got)
 	}
@@ -156,19 +156,19 @@ func TestComposePrompt(t *testing.T) {
 func TestRoutingSeedOnce(t *testing.T) {
 	b := roomBridge() // room-mode account
 	// First prompt seeds the contract (once); room-mode only.
-	got1 := b.composePrompt("go", true, "", "team@muc.x.com", "zach@x.com", "", "")
+	got1 := b.composePrompt("go", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
 	if !strings.Contains(got1, "[pi-msg: routing:") {
 		t.Errorf("first prompt should seed the routing contract: %q", got1)
 	}
 	// Subsequent prompts must NOT re-seed.
-	got2 := b.composePrompt("again", true, "", "team@muc.x.com", "zach@x.com", "", "")
+	got2 := b.composePrompt("again", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
 	if strings.Contains(got2, "[pi-msg: routing:") {
 		t.Errorf("second prompt re-seeded the contract: %q", got2)
 	}
 
 	// A non-room (1:1) account never seeds.
 	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
-	got := b1.composePrompt("hi", true, "", "zach@x.com", "", "", "")
+	got := b1.composePrompt("hi", true, "", "zach@x.com", "", "", "", "")
 	if strings.Contains(got, "[pi-msg: routing:") {
 		t.Errorf("1:1 account should not seed the routing contract: %q", got)
 	}
@@ -185,7 +185,7 @@ func TestInitialPromptCompose(t *testing.T) {
 	// Fresh room-mode spawn: routingSeeded is false (an initial prompt forces a
 	// fresh session), so the first prompt seeds the routing contract once.
 	b := roomBridge()
-	got := b.composePrompt(task, true, "", b.acct.Owner, "", "", "")
+	got := b.composePrompt(task, true, "", b.acct.Owner, "", "", "", "")
 	if !strings.Contains(got, "[pi-msg: routing:") {
 		t.Errorf("fresh room-mode initial prompt should seed the routing contract: %q", got)
 	}
@@ -198,7 +198,7 @@ func TestInitialPromptCompose(t *testing.T) {
 
 	// 1:1 account: the task is delivered verbatim, no routing contract.
 	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
-	if got := b1.composePrompt(task, true, "", "zach@x.com", "", "", ""); got != task {
+	if got := b1.composePrompt(task, true, "", "zach@x.com", "", "", "", ""); got != task {
 		t.Errorf("1:1 initial prompt = %q, want plain %q", got, task)
 	}
 }
