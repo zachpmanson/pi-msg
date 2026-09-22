@@ -319,9 +319,11 @@ func writePromptDirective(log func(level, msg string), acct, prompt string) {
 }
 
 // windowMarkerPath returns the per-account replay-window marker file, stored
-// alongside the config as <config-dir>/<account>.<kind>. Two kinds exist:
-// "swapstart" (one-shot, written on graceful shutdown) and "lastout"
-// (persistent floor, updated on every outbound message).
+// alongside the config as <config-dir>/<account>.<kind>. Four kinds exist:
+// "swapstart" (one-shot, written on graceful shutdown), "lastout" (persistent
+// floor, updated on every outbound message), "mamseen" (the timestamp of the
+// last completed MAM backfill) and "lastin" (persistent cursor, updated on
+// every inbound message handed to the agent; issue #94).
 func windowMarkerPath(acct, kind string) string {
 	return filepath.Join(filepath.Dir(configPath()), acct+"."+kind)
 }
@@ -399,6 +401,27 @@ func readMAMSeen(acct string) (time.Time, bool) {
 // backfill so the next launch queries only from there.
 func markMAMSeen(log func(level, msg string), acct string, t time.Time) {
 	writeWindowMarker(log, acct, "mamseen", t)
+}
+
+// markLastIn updates the persistent last-inbound cursor: the instant the bridge
+// last handed an inbound message to the agent. It is the lower bound for a
+// mid-session reconnect backfill (#94) — anything the running bridge handled
+// live is at or before this instant, so it is never fetched twice.
+func markLastIn(log func(level, msg string), acct string, t time.Time) {
+	writeWindowMarker(log, acct, "lastin", t)
+}
+
+// readLastIn reads the persistent last-inbound cursor without consuming it.
+func readLastIn(acct string) (time.Time, bool) {
+	raw, err := os.ReadFile(windowMarkerPath(acct, "lastin"))
+	if err != nil {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // readLastOut reads the persistent last-outbound floor without consuming it.

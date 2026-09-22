@@ -261,6 +261,16 @@ func TestReplayWindowMarkers(t *testing.T) {
 		t.Errorf("lastout should persist across reads, got %q", got)
 	}
 
+	// lastin is the inbound counterpart (#94): persistent, and absent before the
+	// first message is handled.
+	if _, ok := readLastIn("slippy"); ok {
+		t.Error("lastin should be absent before any inbound message")
+	}
+	markLastIn(logf, "slippy", ts)
+	if got, ok := readLastIn("slippy"); !ok || !got.UTC().Equal(ts) {
+		t.Errorf("lastin read = (%v,%v), want %v", got, ok, ts)
+	}
+
 	// replayWindowStart prefers swapstart over lastout.
 	later := ts.Add(5 * time.Minute)
 	markSwapStart(logf, "slippy", later)

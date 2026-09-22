@@ -1112,13 +1112,18 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	}
 	// Drop server-replayed history (offline / MAM catch-up on reconnect) unless
 	// it falls inside the restart swap window — then buffer it for the resumed
-	// session instead of silently dropping it.
+	// session instead of silently dropping it. A drop outside the window is
+	// logged: recoverable offline backlog arrives as delayed stanzas on a
+	// mid-session reconnect too, and without this line a lost message was
+	// indistinguishable from one that never arrived (#94).
 	if m.delay {
 		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
 			b.bufferReplay(InboundMessage{
 				Body: m.body, RealJID: b.ownerBare, FromOwner: true,
 				Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp,
 			})
+		} else {
+			b.logf("notice", fmt.Sprintf("dropped delayed 1:1 message outside the replay window (id=%s from=%s stamp=%s); the reconnect MAM backfill is what recovers it (#94)", m.id, m.from, stampLabel(m.delayStamp)))
 		}
 		return
 	}
@@ -1157,7 +1162,8 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	}
 	if m.delay {
 		// Replayed MUC history: buffer only what falls inside the restart swap
-		// window for the resumed session; drop the rest as stale backfill.
+		// window for the resumed session; drop the rest as stale backfill (logged,
+		// so a dropped owner message in a reconnect gap is visible — #94).
 		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
 			real := b.occupantRealJID(room, nick)
 			b.bufferReplay(InboundMessage{
@@ -1170,6 +1176,8 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 				From:      m.from,
 				Stamp:     m.delayStamp,
 			})
+		} else {
+			b.logf("notice", fmt.Sprintf("dropped delayed room message outside the replay window (room=%s nick=%s id=%s stamp=%s)", room, nick, m.id, stampLabel(m.delayStamp)))
 		}
 		return
 	}
@@ -1295,6 +1303,36 @@ func (b *XMPPBridge) seenDuplicate(id string) bool {
 		delete(b.seen, evicted)
 	}
 	return false
+}
+
+// hasSeen reports whether id was already handled, WITHOUT recording it. Used by
+// the reconnect backfill to skip archived copies of messages the running bridge
+// already delivered live (#94).
+func (b *XMPPBridge) hasSeen(id string) bool {
+	if id == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.seen[id]
+	return ok
+}
+
+// markSeen records id as handled without reporting whether it already was, so a
+// recovered message is not re-delivered by a later backfill.
+func (b *XMPPBridge) markSeen(id string) {
+	if id == "" {
+		return
+	}
+	b.seenDuplicate(id)
+}
+
+// stampLabel renders a delay stamp for a log line, "unknown" when absent.
+func stampLabel(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // Send delivers a chat message to the owner, splitting long text across

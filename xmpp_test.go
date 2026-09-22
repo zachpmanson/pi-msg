@@ -78,6 +78,39 @@ func TestSeenDuplicate(t *testing.T) {
 	}
 }
 
+// The reconnect backfill needs a non-recording membership test (hasSeen) plus an
+// explicit recorder (markSeen): a recovered message must be skipped if it
+// already arrived live, and recorded once delivered so the next backfill does
+// not re-deliver it (#94).
+func TestHasSeenAndMarkSeen(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{Owner: "o@x.com"}, func(InboundMessage) {}, nil)
+	if b.hasSeen("a") {
+		t.Error("hasSeen on a fresh id")
+	}
+	if b.hasSeen("") {
+		t.Error("hasSeen must not report the empty id as seen")
+	}
+	b.markSeen("a")
+	if !b.hasSeen("a") {
+		t.Error("hasSeen after markSeen")
+	}
+	// markSeen is a no-op for an empty id, and hasSeen stays false for it.
+	b.markSeen("")
+	if b.hasSeen("") {
+		t.Error("empty id must never be recorded")
+	}
+}
+
+func TestStampLabel(t *testing.T) {
+	if got := stampLabel(time.Time{}); got != "unknown" {
+		t.Errorf("zero stamp = %q, want unknown", got)
+	}
+	ts := time.Date(2026, 9, 22, 1, 14, 32, 0, time.UTC)
+	if got := stampLabel(ts); got != "2026-09-22T01:14:32Z" {
+		t.Errorf("stampLabel = %q", got)
+	}
+}
+
 func TestTokenHelpers(t *testing.T) {
 	// <body>hi</body> plus a delay element.
 	toks := []xml.Token{

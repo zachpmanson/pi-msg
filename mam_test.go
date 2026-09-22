@@ -232,3 +232,39 @@ func TestMAMSinceFor(t *testing.T) {
 		t.Errorf("no marker: got (%v,%v), want %v", got, ok, window)
 	}
 }
+
+// The reconnect lower bound (#94): the later of the last inbound handled live
+// and the last completed backfill, clamped so a long-idle session cannot drag
+// hours of archive into a catch-up.
+func TestReconnectSince(t *testing.T) {
+	now := time.Date(2026, 9, 22, 11, 16, 3, 0, time.UTC)
+	lastIn := now.Add(-8 * time.Minute) // handled at 11:08
+	seen := now.Add(-46 * time.Minute)  // last backfill, older
+
+	// lastin is the newer cursor: the outage window starts there.
+	got, ok := reconnectSince(lastIn, true, seen, true, now)
+	if !ok || !got.Equal(lastIn) {
+		t.Errorf("lastin newer: got (%v,%v), want %v", got, ok, lastIn)
+	}
+	// A newer backfill marker wins.
+	newer := now.Add(-2 * time.Minute)
+	got, ok = reconnectSince(lastIn, true, newer, true, now)
+	if !ok || !got.Equal(newer) {
+		t.Errorf("mamseen newer: got (%v,%v), want %v", got, ok, newer)
+	}
+	// No cursor at all: nothing to backfill.
+	if _, ok := reconnectSince(time.Time{}, false, time.Time{}, false, now); ok {
+		t.Error("no cursors should mean no backfill")
+	}
+	// A cursor far in the past is clamped to the reconnect window, not honoured.
+	stale := now.Add(-6 * time.Hour)
+	got, ok = reconnectSince(stale, true, time.Time{}, false, now)
+	if !ok || !got.Equal(now.Add(-mamReconnectWindow)) {
+		t.Errorf("stale cursor: got (%v,%v), want %v", got, ok, now.Add(-mamReconnectWindow))
+	}
+	// Only one cursor present still works (crash before any completed backfill).
+	got, ok = reconnectSince(time.Time{}, false, seen, true, now)
+	if !ok || !got.Equal(now.Add(-mamReconnectWindow)) {
+		t.Errorf("mamseen only: got (%v,%v), want clamped %v", got, ok, now.Add(-mamReconnectWindow))
+	}
+}

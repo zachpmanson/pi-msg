@@ -48,6 +48,18 @@ type Bridge struct {
 	mamArmed          bool      // XEP-0313 backfill is due on this launch (issue #84)
 	mamSince          time.Time // archive lower bound for the MAM query; zero = seed the marker only
 
+	// connectedOnce distinguishes the launch connect from a mid-session
+	// reconnect: the restart replay/backfill runs on the first connect only,
+	// while every later one triggers a MAM backfill over the gap (#94).
+	connectedOnce bool
+	// backfillMu serialises the restart drain and the reconnect backfill, and
+	// guards connectedOnce: a fast reconnect must not race the startup drain.
+	backfillMu sync.Mutex
+	// lastIn is the instant the bridge last handed an inbound message to the
+	// agent. Mirrored to <acct>.lastin on disk; it is the lower bound for the
+	// reconnect backfill (#94).
+	lastIn time.Time
+
 	// initialPrompt is the invocation-time initial prompt (--prompt/--command
 	// CLI flag, or a "prompt" start-directive payload): the task an on-demand
 	// persona is spawned with. Non-empty means a fresh, stateless launch — the
@@ -682,6 +694,12 @@ type HeartbeatProcess struct {
 // commands that need a response block only this handler, not pi's event
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
+	// Everything that reaches here has been taken in by the agent, so the
+	// persistent last-inbound cursor advances with it. Written after the
+	// hand-off, not before: if the process dies while the run is in flight the
+	// message is still outside the cursor and the next reconnect's backfill picks
+	// it up (#94).
+	defer b.noteInboundHandled()
 	b.resetRoutingNudges() // fresh user turn — allow corrections again
 	b.resetTailNudges()    // fresh user turn — allow one empty-tail recovery again
 	b.resetHintNudges()    // fresh user turn — allow one unanswered-message hint again
@@ -3342,6 +3360,16 @@ func (b *Bridge) fireInitialPrompt() {
 // off the drain so buffered swap-window messages are handed to the resumed
 // session once the grace period elapses.
 func (b *Bridge) onXMPPConnected() {
+	b.backfillMu.Lock()
+	first := !b.connectedOnce
+	b.connectedOnce = true
+	b.backfillMu.Unlock()
+	if !first {
+		// Mid-session reconnect: the restart window does not apply, so recover
+		// the gap from the archive instead (#94).
+		go b.recoverReconnectGap()
+		return
+	}
 	replay := b.replayWindowArmed
 	mam := b.mamArmed
 	if !replay && !mam {
@@ -3354,10 +3382,60 @@ func (b *Bridge) onXMPPConnected() {
 	go b.replayInbound(mam)
 }
 
+// noteInboundHandled advances the persistent last-inbound cursor to now.
+func (b *Bridge) noteInboundHandled() {
+	now := time.Now()
+	b.mu.Lock()
+	b.lastIn = now
+	b.mu.Unlock()
+	markLastIn(b.log, b.acct.Name, now)
+}
+
+// recoverReconnectGap backfills the archive across a mid-session reconnect.
+//
+// Delayed backlog pushed on reconnect is dropped by the dispatch path unless it
+// falls inside the restart swap window (xmpp.go), and the restart backfill runs
+// only once per launch — so without this a message sent while the socket was
+// down was lost with no trace (issue #94). The lower bound is the last inbound
+// the running bridge handled live, so nothing already seen is re-fetched;
+// archived copies of messages that did arrive live are skipped by stanza id in
+// deliverRecovered. Skipped for on-demand spawns, which start with only their
+// task (consistent with the startup replay).
+func (b *Bridge) recoverReconnectGap() {
+	if !b.acct.MAM || b.initialPrompt != "" {
+		return
+	}
+	lastIn, lastInOK := readLastIn(b.acct.Name)
+	seen, seenOK := readMAMSeen(b.acct.Name)
+	since, ok := reconnectSince(lastIn, lastInOK, seen, seenOK, time.Now())
+	if !ok {
+		return
+	}
+	b.backfillMu.Lock()
+	defer b.backfillMu.Unlock()
+	ctx, cancel := context.WithTimeout(b.ctx, mamTimeout)
+	defer cancel()
+	msgs := b.mamFetch(ctx, since)
+	if len(msgs) == 0 {
+		// Nothing in the gap: move the cursor so the next reconnect queries from
+		// here rather than re-walking the same window.
+		markMAMSeen(b.log, b.acct.Name, time.Now())
+		return
+	}
+	b.log("info", fmt.Sprintf("reconnect backfill: %d message(s) since %s", len(msgs), since.UTC().Format(time.RFC3339)))
+	b.deliverRecovered(msgs)
+}
+
+// mamScope is one archive scope for a backfill: the owner 1:1 conversation, or
+// one joined room.
+type mamScope struct{ room, with, label string }
+
 // mamBackfill fetches archived messages from the server's XEP-0313 archive for
 // the owner 1:1 and each joined room, and buffers them for the resumed session
 // (issue #84). Best-effort: a server without an archive (no mod_mam) logs a
-// warning and the existing delay-stanza replay still runs unaffected.
+// warning and the existing delay-stanza replay still runs unaffected. The
+// `mamseen` cursor is advanced by the caller only once the buffer has actually
+// been handed to the agent (#94).
 func (b *Bridge) mamBackfill() {
 	if b.mamSince.IsZero() {
 		// First launch with MAM enabled: nothing to recover, just start the clock.
@@ -3366,21 +3444,26 @@ func (b *Bridge) mamBackfill() {
 	}
 	ctx, cancel := context.WithTimeout(b.ctx, mamTimeout)
 	defer cancel()
-	scopes := []struct {
-		room  string
-		with  string
-		label string
-	}{{room: "", with: b.acct.Owner, label: "owner 1:1"}}
-	for _, room := range b.acct.Rooms {
-		scopes = append(scopes, struct {
-			room  string
-			with  string
-			label string
-		}{room: room, label: room})
+	msgs := b.mamFetch(ctx, b.mamSince)
+	for _, m := range msgs {
+		b.xmpp.bufferReplay(m)
 	}
-	total := 0
+	b.log("info", fmt.Sprintf("mam backfill: %d message(s) since %s", len(msgs), b.mamSince.UTC().Format(time.RFC3339)))
+	b.mamSince = time.Time{}
+}
+
+// mamFetch pulls archived messages for every scope (owner 1:1 plus each joined
+// room) since `since`, merged in chronological order so a catch-up reads the way
+// it was sent. Per-scope failures are logged and skipped rather than failing the
+// whole backfill.
+func (b *Bridge) mamFetch(ctx context.Context, since time.Time) []InboundMessage {
+	scopes := []mamScope{{room: "", with: b.acct.Owner, label: "owner 1:1"}}
+	for _, room := range b.acct.Rooms {
+		scopes = append(scopes, mamScope{room: room, label: room})
+	}
+	var all []InboundMessage
 	for _, sc := range scopes {
-		msgs, complete, err := b.xmpp.FetchMAM(ctx, sc.room, sc.with, b.mamSince, mamPageMax)
+		msgs, complete, err := b.xmpp.FetchMAM(ctx, sc.room, sc.with, since, mamPageMax)
 		if err != nil {
 			b.log("warning", fmt.Sprintf("mam backfill (%s) failed: %v", sc.label, err))
 			continue
@@ -3388,14 +3471,56 @@ func (b *Bridge) mamBackfill() {
 		if !complete {
 			b.log("warning", fmt.Sprintf("mam backfill (%s) truncated at %d message(s); older history in the window is not recovered", sc.label, len(msgs)))
 		}
-		for _, m := range msgs {
-			b.xmpp.bufferReplay(m)
-		}
-		total += len(msgs)
+		all = append(all, msgs...)
 	}
-	b.log("info", fmt.Sprintf("mam backfill: %d message(s) since %s", total, b.mamSince.UTC().Format(time.RFC3339)))
+	// Delay-stamped archived messages carry their own stamp; order on it so the
+	// merged scopes read chronologically (zero-stamp entries keep arrival order).
+	sort.SliceStable(all, func(i, j int) bool {
+		a, c := all[i].Stamp, all[j].Stamp
+		switch {
+		case a.IsZero():
+			return false
+		case c.IsZero():
+			return true
+		default:
+			return a.Before(c)
+		}
+	})
+	return all
+}
+
+// deliverRecovered hands a recovered backlog to the agent in order: a catch-up
+// banner first, then each message through the normal canonical/room path.
+//
+// Three properties matter (#94): messages that already arrived live are skipped
+// by stanza id; each recovered id is recorded as seen so a later backfill does
+// not re-deliver it; and the cursors (`mamseen`, `lastin`) are advanced only
+// after the hand-off, so a crash mid-delivery re-fetches instead of losing the
+// backlog.
+func (b *Bridge) deliverRecovered(msgs []InboundMessage) {
+	fresh := make([]InboundMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if b.xmpp.hasSeen(m.ID) {
+			continue
+		}
+		fresh = append(fresh, m)
+	}
+	if len(fresh) > 0 {
+		b.reply(fmt.Sprintf("Back online, catching up on %d messages", len(fresh)))
+		for _, m := range fresh {
+			b.xmpp.markSeen(m.ID)
+			b.noteInboundHandled()
+			if m.Direct {
+				b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID)
+			} else {
+				b.handleRoom(m)
+			}
+		}
+	}
+	// The backlog has been handed over (or was already seen): only now advance
+	// the backfill cursor, so a crash mid-delivery re-fetches the same window
+	// instead of losing it.
 	markMAMSeen(b.log, b.acct.Name, time.Now())
-	b.mamSince = time.Time{}
 }
 
 // replayInbound blocks until the replay windows closes, then hands any buffered
@@ -3410,16 +3535,7 @@ func (b *Bridge) replayInbound(mam bool) {
 		b.mamBackfill()
 	}
 	msgs := b.xmpp.DrainReplay(b.ctx)
-	if len(msgs) > 0 && b.ctx.Err() == nil {
-		b.reply(fmt.Sprintf("Back online, catching up on %d messages", len(msgs)))
-		for _, m := range msgs {
-			if m.Direct {
-				b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID)
-			} else {
-				b.handleRoom(m)
-			}
-		}
-	}
+	b.deliverRecovered(msgs)
 	if b.volunteerPending {
 		b.volunteerPending = false
 		b.fireResumeTurn()
