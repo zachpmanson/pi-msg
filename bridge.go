@@ -40,10 +40,15 @@ type Bridge struct {
 	// write a one-shot directive ("proactive" → fire a volunteer turn on resume,
 	// "idle" → stay silent, "prompt" → deliver an initial task prompt to a
 	// fresh on-demand spawn); the bridge reads and consumes it at startup.
-	resumed           bool      // a saved, usable session was resumed this launch
-	startDir          string    // directive consumed at startup: "proactive", "idle", "prompt", or ""
-	volunteered       bool      // whether the proactive volunteer turn has been fired
-	volunteerPending  bool      // proactive volunteer turn deferred until replay completes
+	resumed          bool   // a saved, usable session was resumed this launch
+	startDir         string // directive consumed at startup: "proactive", "idle", "prompt", or ""
+	volunteered      bool   // whether the proactive volunteer turn has been fired
+	volunteerPending bool   // proactive volunteer turn deferred until replay completes
+	// inbox is the durable inbound queue (#96): every message handed to pi is
+	// appended before the prompt and acknowledged once the run that took it in
+	// settles, so a stop mid-run cannot lose it.
+	inbox *inbox
+
 	replayWindowArmed bool      // a restart replay window was armed at startup
 	mamArmed          bool      // XEP-0313 backfill is due on this launch (issue #84)
 	mamSince          time.Time // archive lower bound for the MAM query; zero = seed the marker only
@@ -180,6 +185,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.ctx = ctx
 
 	b.xmpp = NewXMPPBridge(b.acct, b.onInbound, b.log)
+	b.inbox = newInbox(inboxPath(b.acct.Name), b.log)
 
 	// A fresh or resumed bridge is idle until something prompts it — start the
 	// idle clock now so an unused agent drifts to "away" after the timeout.
@@ -422,6 +428,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.xmpp.SetPresence("dnd", "thinking…")
 		b.lifecycleReact("👀") // picked up (opt-in via the reactions flag)
 	case "agent_settled":
+		b.ackInboxSettled()
 		b.setStreaming(false)
 		b.stopTyping()
 		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
@@ -728,6 +735,10 @@ func (b *Bridge) onInbound(m InboundMessage) {
 		b.handleReaction(m)
 		return
 	}
+	// Durably record the message BEFORE any prompt goes out (#96): a run that
+	// dies before its next tool yield would otherwise take the instruction with
+	// it, and a live-delivered message is not replayed by the server either.
+	b.inboxAppend(m)
 	if m.Direct {
 		// Owner 1:1: origin is the owner; no separate sender. The reaction target
 		// is this message (routed to its full from-JID).
@@ -3439,7 +3450,7 @@ func (b *Bridge) onXMPPConnected() {
 	}
 	replay := b.replayWindowArmed
 	mam := b.mamArmed
-	if !replay && !mam {
+	if !replay && !mam && b.inboxLen() == 0 {
 		return
 	}
 	// Clear both synchronously: onConnected fires on every (re)connect, and a
@@ -3490,7 +3501,8 @@ func (b *Bridge) recoverReconnectGap() {
 		return
 	}
 	b.log("info", fmt.Sprintf("reconnect backfill: %d message(s) since %s", len(msgs), since.UTC().Format(time.RFC3339)))
-	b.deliverRecovered(msgs)
+	b.deliverRecovered(msgs, nil)
+	markMAMSeen(b.log, b.acct.Name, time.Now())
 }
 
 // mamScope is one archive scope for a backfill: the owner 1:1 conversation, or
@@ -3556,15 +3568,20 @@ func (b *Bridge) mamFetch(ctx context.Context, since time.Time) []InboundMessage
 	return all
 }
 
-// deliverRecovered hands a recovered backlog to the agent in order: a catch-up
-// banner first, then each message through the normal canonical/room path.
+// deliverRecovered hands a recovered backlog to the resumed session in one
+// chronological block: a catch-up banner first, then each buffered/archived
+// message through the normal canonical/room path, then any unacknowledged inbox
+// entries.
 //
 // Three properties matter (#94): messages that already arrived live are skipped
 // by stanza id; each recovered id is recorded as seen so a later backfill does
-// not re-deliver it; and the cursors (`mamseen`, `lastin`) are advanced only
-// after the hand-off, so a crash mid-delivery re-fetches instead of losing the
-// backlog.
-func (b *Bridge) deliverRecovered(msgs []InboundMessage) {
+// not re-deliver it; and the cursors are advanced by the caller only after the
+// hand-off, so a crash mid-delivery re-fetches instead of losing the backlog.
+//
+// Inbox entries deliberately bypass the seen check (#96): their stanza *was*
+// delivered live, in the process that then died, so a recorded `seen` id would
+// suppress exactly the message this path exists to recover.
+func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
 	fresh := make([]InboundMessage, 0, len(msgs))
 	for _, m := range msgs {
 		if b.xmpp.hasSeen(m.ID) {
@@ -3572,22 +3589,23 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage) {
 		}
 		fresh = append(fresh, m)
 	}
-	if len(fresh) > 0 {
-		b.reply(fmt.Sprintf("Back online, catching up on %d messages", len(fresh)))
-		for _, m := range fresh {
-			b.xmpp.markSeen(m.ID)
-			b.noteInboundHandled()
-			if m.Direct {
-				b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m))
-			} else {
-				b.handleRoom(m)
-			}
+	total := len(fresh) + len(inboxes)
+	if total == 0 || b.ctx.Err() != nil {
+		return
+	}
+	b.reply(fmt.Sprintf("Back online, catching up on %d messages", total))
+	for _, m := range fresh {
+		b.xmpp.markSeen(m.ID)
+		b.noteInboundHandled()
+		if m.Direct {
+			b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m))
+		} else {
+			b.handleRoom(m)
 		}
 	}
-	// The backlog has been handed over (or was already seen): only now advance
-	// the backfill cursor, so a crash mid-delivery re-fetches the same window
-	// instead of losing it.
-	markMAMSeen(b.log, b.acct.Name, time.Now())
+	for _, e := range inboxes {
+		b.deliverInbox(e)
+	}
 }
 
 // replayInbound blocks until the replay windows closes, then hands any buffered
@@ -3602,11 +3620,94 @@ func (b *Bridge) replayInbound(mam bool) {
 		b.mamBackfill()
 	}
 	msgs := b.xmpp.DrainReplay(b.ctx)
-	b.deliverRecovered(msgs)
+	// Unacknowledged inbox entries ride in the same catch-up: they are input a
+	// stopped process had taken in but no settled run ever consumed (#96), and
+	// they come after the buffered messages, which are older.
+	b.deliverRecovered(msgs, b.inboxPending())
+	// Only a completed MAM walk may move the backfill cursor: the inbox is not
+	// the archive, and advancing past a window this launch never fetched would
+	// skip it on a later restart.
+	if mam {
+		markMAMSeen(b.log, b.acct.Name, time.Now())
+	}
 	if b.volunteerPending {
 		b.volunteerPending = false
 		b.fireResumeTurn()
 	}
+}
+
+// inboxNote marks a message re-delivered from the durable inbox. Delivery is
+// at-least-once, so the same instruction may already sit in the resumed
+// session's context — say so rather than repeating it unexplained.
+const inboxNote = "[pi-msg: re-delivered after a restart — this was queued to me before the process stopped and no settled run acknowledged it; it may repeat something already in your context]"
+
+// deliverInbox re-delivers one unacknowledged message after a restart. It goes
+// through the normal dispatch path, so room rules (trigger, non-owner
+// commentary, ambient buffering) are applied again exactly as they were the
+// first time. The entry stays in the inbox until the run that consumes it
+// settles, so a repeated stop cannot lose it; the note is appended rather than
+// prepended so a room trigger at the start of the body still matches.
+func (b *Bridge) deliverInbox(e inboxEntry) {
+	m := e.message()
+	if strings.TrimSpace(m.Body) == "" {
+		return
+	}
+	m.Body = strings.TrimSpace(m.Body) + "\n\n" + inboxNote
+	if m.Direct {
+		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m))
+		return
+	}
+	b.handleRoom(m)
+}
+
+// ackInboxSettled acknowledges the messages the run that just ended took in.
+// Entries younger than inboxAckGrace are kept: a message that arrived in the
+// same instant the run ended may belong to the *next* run, and acking it would
+// reintroduce exactly the loss this queue prevents.
+func (b *Bridge) ackInboxSettled() {
+	if b.inbox == nil {
+		return
+	}
+	if n := b.inbox.ackSettled(time.Now()); n > 0 {
+		b.log("info", fmt.Sprintf("inbox: acknowledged %d message(s)", n))
+	}
+}
+
+// inboxLen reports how many messages are awaiting acknowledgement.
+func (b *Bridge) inboxLen() int {
+	if b.inbox == nil {
+		return 0
+	}
+	return b.inbox.len()
+}
+
+// inboxPending copies the unacknowledged messages, in arrival order.
+func (b *Bridge) inboxPending() []inboxEntry {
+	if b.inbox == nil {
+		return nil
+	}
+	return b.inbox.pending()
+}
+
+// inboxAppend records an inbound message before it is handed to pi. Called from
+// onInbound: one hook, ahead of every prompt path (direct, room canonical and
+// commentary), while the message is still in hand.
+func (b *Bridge) inboxAppend(m InboundMessage) {
+	if b.inbox == nil || b.initialPrompt != "" {
+		return // a stateless doer starts with only its task, like the replay paths
+	}
+	b.inbox.append(inboxEntry{
+		ID:        m.ID,
+		From:      m.From,
+		Body:      m.Body,
+		Room:      m.Room,
+		Nick:      m.Nick,
+		RealJID:   m.RealJID,
+		FromOwner: m.FromOwner,
+		Direct:    m.Direct,
+		ReplyToID: m.ReplyToID,
+		At:        time.Now(),
+	})
 }
 
 // --- pure helpers ---

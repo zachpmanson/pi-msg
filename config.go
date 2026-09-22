@@ -328,6 +328,13 @@ func windowMarkerPath(acct, kind string) string {
 	return filepath.Join(filepath.Dir(configPath()), acct+"."+kind)
 }
 
+// inboxPath returns the per-account durable inbound inbox
+// (<config-dir>/<account>.inbox.jsonl), holding the inbound messages handed to
+// pi that no settled run has acknowledged yet (issue #96).
+func inboxPath(acct string) string {
+	return filepath.Join(filepath.Dir(configPath()), acct+".inbox.jsonl")
+}
+
 // writeWindowMarker writes an RFC3339 window marker for an account. Best-effort
 // like the session/start directive writers: errors are logged, never fatal.
 func writeWindowMarker(log func(level, msg string), acct, kind string, t time.Time) {

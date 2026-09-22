@@ -193,6 +193,34 @@ anything sent to a room while the bridge was down is simply lost.
 - **Skipped for on-demand spawns** (`--prompt`), matching the replay path: a
   stateless doer starts with only its task, not stale chat.
 
+## Durable inbound queue
+
+Inbound messages are recorded before they are handed to pi, and acknowledged once
+the run that took them in has settled:
+
+- **Append-before-prompt** — every inbound message (reactions aside) is written to
+  `<config-dir>/<account>.inbox.jsonl` from one hook ahead of the direct, room and
+  commentary paths.
+- **Ack-at-settle** — a settled run acknowledges everything that had been pending
+  for longer than 5s. The grace keeps a message that arrived in the same instant a
+  run ended from being acknowledged by that run: it may belong to the run starting
+  now, and acking it would lose it exactly the way the queue exists to prevent.
+- **Re-delivery at start** — anything still unacknowledged is handed to the
+  resumed session with the rest of the catch-up, re-classified exactly as it was
+  the first time (a room remark that never triggered a turn still doesn't), and
+  marked with a note saying it may repeat something already in context.
+
+This is what makes a **steer survivable**. pi injects a steered message at the next
+tool yield, so a stop before that yield — a deploy, a crash, a reboot — used to
+discard an instruction that the server had already delivered and so would never
+replay: on 2026-09-22 an owner instruction steered into a running turn was killed
+by a config switch 55 seconds later and never arrived. Delivery is
+**at-least-once**, not exactly-once: an entry arriving within the 5s ack grace of
+a settle is re-delivered even though that run did consume it, which is a far
+smaller problem than a silently dropped instruction. In steady state the file is
+absent — a settle rewrites whatever remains — and a run that never settles is
+bounded at 500 entries.
+
 ## Group chat (MUC)
 
 Set `room` on an account (a single MUC JID, or an array of them) and pi-msg
