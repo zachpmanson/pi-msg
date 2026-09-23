@@ -49,6 +49,14 @@ const (
 	// replaySlack tolerates clock skew when matching a message's delay stamp to
 	// the swap window.
 	replaySlack = 2 * time.Second
+	// directDelayFreshness is how old a delayed owner DM may be and still be
+	// delivered live. A client's own stream resumption can attach XEP-0203 delay
+	// metadata without reconnecting this bridge, so it cannot rely on the
+	// restart/reconnect replay paths to recover a recent message.
+	directDelayFreshness = 5 * time.Minute
+	// directDelayFutureSlack tolerates modest client clock skew without treating
+	// arbitrarily future-dated stanzas as fresh.
+	directDelayFutureSlack = time.Minute
 )
 
 const chatStatesNS = "http://jabber.org/protocol/chatstates"
@@ -594,6 +602,16 @@ func (b *XMPPBridge) inSwapWindow(stamp time.Time) bool {
 	return !stamp.Add(replaySlack).Before(start)
 }
 
+// recentDirectDelay reports whether a delayed owner DM is recent enough to
+// accept outside the restart replay window. The bounded future allowance
+// handles client clock skew while rejecting missing or implausibly future stamps.
+func recentDirectDelay(stamp, now time.Time) bool {
+	if stamp.IsZero() {
+		return false
+	}
+	return !stamp.Before(now.Add(-directDelayFreshness)) && !stamp.After(now.Add(directDelayFutureSlack))
+}
+
 // bufferReplay appends a swap-window (or MAM-backfilled) message to the
 // restart replay buffer. Duplicate stanza ids are dropped: the same message can
 // arrive twice — once as a server-pushed delayed stanza and once from the MAM
@@ -1117,22 +1135,25 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if strings.TrimSpace(m.body) == "" && len(m.reactions) == 0 {
 		return // chat-states, receipts, empty, or a reaction-only ack is forwarded below
 	}
-	// Drop server-replayed history (offline / MAM catch-up on reconnect) unless
-	// it falls inside the restart swap window — then buffer it for the resumed
-	// session instead of silently dropping it. A drop outside the window is
-	// logged: recoverable offline backlog arrives as delayed stanzas on a
-	// mid-session reconnect too, and without this line a lost message was
-	// indistinguishable from one that never arrived (#94).
+	// Server-replayed history (offline / MAM catch-up) is normally accepted only
+	// inside the restart swap window, where it is buffered for the resumed
+	// session. The owner's own client can also queue a recent DM through its
+	// stream interruption and attach XEP-0203 delay metadata without the bridge
+	// reconnecting; accept that message live rather than requiring a MAM trigger
+	// that may never happen (#100).
 	if m.delay {
 		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
 			b.bufferReplay(InboundMessage{
 				Body: m.body, RealJID: b.ownerBare, FromOwner: true,
 				Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp,
 			})
-		} else {
-			b.logf("notice", fmt.Sprintf("dropped delayed 1:1 message outside the replay window (id=%s from=%s stamp=%s); the reconnect MAM backfill is what recovers it (#94)", m.id, m.from, stampLabel(m.delayStamp)))
+			return
 		}
-		return
+		if !recentDirectDelay(m.delayStamp, time.Now()) {
+			b.log("notice", fmt.Sprintf("dropped stale delayed 1:1 message outside the replay window (id=%s from=%s stamp=%s)", m.id, m.from, stampLabel(m.delayStamp)))
+			return
+		}
+		b.log("info", fmt.Sprintf("delivering recent delayed 1:1 message outside the replay window (id=%s from=%s stamp=%s)", m.id, m.from, stampLabel(m.delayStamp)))
 	}
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
@@ -1144,7 +1165,7 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	}
 	// The agent is about to take this in — acknowledge it as read/delivered.
 	b.sendReceipts(m)
-	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Reactions: m.reactions, ReactionID: m.reactionFor,
+	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp, Reactions: m.reactions, ReactionID: m.reactionFor,
 		ReplyToID: m.replyToID, ReplyToJID: m.replyToJID})
 }
 
@@ -1186,7 +1207,7 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 				Stamp:     m.delayStamp,
 			})
 		} else {
-			b.logf("notice", fmt.Sprintf("dropped delayed room message outside the replay window (room=%s nick=%s id=%s stamp=%s)", room, nick, m.id, stampLabel(m.delayStamp)))
+			b.log("notice", fmt.Sprintf("dropped delayed room message outside the replay window (room=%s nick=%s id=%s stamp=%s)", room, nick, m.id, stampLabel(m.delayStamp)))
 		}
 		return
 	}
