@@ -304,6 +304,89 @@ func TestReplayInSwapWindow(t *testing.T) {
 	}
 }
 
+func TestRecentDirectDelayFreshness(t *testing.T) {
+	now := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		stamp time.Time
+		want  bool
+	}{
+		{name: "recent", stamp: now.Add(-2 * time.Second), want: true},
+		{name: "at freshness limit", stamp: now.Add(-directDelayFreshness), want: true},
+		{name: "too old", stamp: now.Add(-directDelayFreshness - time.Nanosecond), want: false},
+		{name: "modest future skew", stamp: now.Add(directDelayFutureSlack), want: true},
+		{name: "implausibly future", stamp: now.Add(directDelayFutureSlack + time.Nanosecond), want: false},
+		{name: "missing stamp", stamp: time.Time{}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recentDirectDelay(tc.stamp, now); got != tc.want {
+				t.Errorf("recentDirectDelay(%v) = %v, want %v", tc.stamp, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDispatchDirectRecentDelayedOutsideReplayWindow(t *testing.T) {
+	var got []InboundMessage
+	b := NewXMPPBridge(ResolvedAccount{Owner: "zach@x.com"}, func(m InboundMessage) {
+		got = append(got, m)
+	}, nil)
+	stamp := time.Now().Add(-2 * time.Second)
+	msg := incomingMsg{
+		typ: "chat", from: "zach@x.com/phone", body: "please do this", id: "queued-1",
+		delay: true, delayStamp: stamp,
+	}
+	b.dispatchDirect(msg)
+	if len(got) != 1 {
+		t.Fatalf("recent delayed DM delivered %d times, want once", len(got))
+	}
+	if m := got[0]; m.Body != msg.body || !m.Direct || !m.FromOwner || m.ID != msg.id || !m.Stamp.Equal(stamp) {
+		t.Errorf("delivered message = %+v, want recent delayed owner DM with stamp", m)
+	}
+	if !b.hasSeen(msg.id) {
+		t.Errorf("recent delayed DM id was not recorded for deduplication")
+	}
+
+	// A later live/archive copy with the same stanza id must not start a second turn.
+	msg.delay = false
+	b.dispatchDirect(msg)
+	if len(got) != 1 {
+		t.Errorf("duplicate copy delivered again; got %d messages", len(got))
+	}
+}
+
+func TestDispatchDirectStaleDelayedOutsideReplayWindow(t *testing.T) {
+	var got []InboundMessage
+	var logs []string
+	b := NewXMPPBridge(ResolvedAccount{Owner: "zach@x.com"}, func(m InboundMessage) {
+		got = append(got, m)
+	}, func(level, msg string) { logs = append(logs, level+": "+msg) })
+	b.dispatchDirect(incomingMsg{
+		typ: "chat", from: "zach@x.com/phone", body: "old backlog", id: "stale-1",
+		delay: true, delayStamp: time.Now().Add(-directDelayFreshness - time.Second),
+	})
+	if len(got) != 0 {
+		t.Fatalf("stale delayed DM was delivered: %+v", got)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "dropped stale delayed 1:1 message") {
+		t.Errorf("stale delayed DM drop was not logged: %v", logs)
+	}
+}
+
+func TestDispatchRoomRecentDelayedOutsideReplayWindowStillDrops(t *testing.T) {
+	var got []InboundMessage
+	b := NewXMPPBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi", Rooms: []string{"team@muc.x.com"}}, func(m InboundMessage) {
+		got = append(got, m)
+	}, nil)
+	b.dispatchRoom(incomingMsg{
+		typ: "groupchat", from: "team@muc.x.com/peppy", body: "old room history", id: "room-old",
+		delay: true, delayStamp: time.Now().Add(-time.Second),
+	})
+	if len(got) != 0 {
+		t.Errorf("recent delayed room history should remain suppressed: %+v", got)
+	}
+}
+
 func TestReplaySwapWindowActive(t *testing.T) {
 	b := &XMPPBridge{}
 	b.replayActive = true
