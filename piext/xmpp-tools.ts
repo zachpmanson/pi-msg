@@ -322,14 +322,31 @@ export default function xmppTools(pi: ExtensionAPI) {
 	// Inject the agent's identity ($PI_MSG_ACCOUNT) at the top of every system
 	// prompt so it's the first thing the agent reads. Prevents identity confusion
 	// in multi-persona fleets where several agents share the same project context.
+	//
+	// beforeAgentStartText (PI_MSG_BEFORE_AGENT_START_TEXT) is appended *after*
+	// the identity line, so identity stays the first thing read. before_agent_start
+	// fires on every turn, so the text is re-applied throughout a long session
+	// rather than fading like a one-off instruction — the same property the
+	// equivalent Claude Code UserPromptSubmit hook relies on. Empty means no
+	// injection (and the system prompt is then byte-identical to no-extension
+	// behaviour).
+	//
+	// A shell-command variant (beforeAgentStartHook, run via pi.exec) is not
+	// built yet — see zpm/pi-msg#103.
 	pi.on("before_agent_start", async (event) => {
 		const account = process.env.PI_MSG_ACCOUNT;
-		if (!account) return;
-		return {
-			systemPrompt: `You are **${account}**. This is your identity in Zach\'s fleet.
+		const text = process.env.PI_MSG_BEFORE_AGENT_START_TEXT ?? "";
+		if (!account && !text) return;
+		let systemPrompt = event.systemPrompt;
+		if (account) {
+			systemPrompt = `You are **${account}**. This is your identity in Zach\'s fleet.
 
-${event.systemPrompt}`,
-		};
+${systemPrompt}`;
+		}
+		if (text) {
+			systemPrompt = `${systemPrompt}\n\n${text}`;
+		}
+		return { systemPrompt };
 	});
 
 	// Which tools to register, chosen by pi-msg via PI_MSG_TOOLS (comma list).

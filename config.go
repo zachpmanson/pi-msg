@@ -58,6 +58,13 @@ type Account struct {
 	// messages (both owner and addressed non-owner commentary). Independent of
 	// the 1:1 reactions flag — you can opt into one, both, or neither.
 	RoomReactions bool `json:"roomReactions,omitempty"`
+	// BeforeAgentStartText, when set, is injected into the agent's system prompt
+	// at the start of every turn (via the companion extension's
+	// before_agent_start hook). Re-applying it each turn is the point: a steer
+	// survives long sessions where a one-off instruction fades, the same property
+	// the equivalent Claude Code UserPromptSubmit hook relies on. Empty means no
+	// injection. A shell-command variant (beforeAgentStartHook) is not built yet.
+	BeforeAgentStartText string `json:"beforeAgentStartText,omitempty"`
 	// Model is the model pattern to launch pi with (e.g.
 	// "anthropic/claude-sonnet-latest"). Optional.
 	Model string `json:"model,omitempty"`
@@ -148,10 +155,14 @@ type ResolvedAccount struct {
 	RoomTrigger   string
 	UploadService string
 	PingInterval  time.Duration
-	Avatar        string
-	ErrorRoom     string
-	MinCreditUsd  float64
-	MAM           bool
+	// BeforeAgentStartText is the literal text injected (verbatim, after the
+	// identity line) into the system prompt at the start of every turn; empty
+	// means no injection.
+	BeforeAgentStartText string
+	Avatar               string
+	ErrorRoom            string
+	MinCreditUsd         float64
+	MAM                  bool
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
@@ -587,11 +598,14 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		Nick:          nick,
 		RoomTrigger:   trigger,
 		UploadService: strings.TrimSpace(acct.UploadService),
-		PingInterval:  pingInterval,
-		Avatar:        strings.TrimSpace(acct.Avatar),
-		ErrorRoom:     strings.TrimSpace(acct.ErrorRoom),
-		MinCreditUsd:  maxCreditUsd(acct.CreditWatch),
-		MAM:           acct.MAM == nil || *acct.MAM,
+		// Trimmed so a whitespace-only value counts as "not set" rather than
+		// injecting a blank paragraph every turn.
+		BeforeAgentStartText: strings.TrimSpace(acct.BeforeAgentStartText),
+		PingInterval:         pingInterval,
+		Avatar:               strings.TrimSpace(acct.Avatar),
+		ErrorRoom:            strings.TrimSpace(acct.ErrorRoom),
+		MinCreditUsd:         maxCreditUsd(acct.CreditWatch),
+		MAM:                  acct.MAM == nil || *acct.MAM,
 	}, nil
 }
 

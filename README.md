@@ -149,12 +149,48 @@ Per-account fields:
 | `errorRoom` | no | — | write-only MUC dumping ground for dropped/unrouteable agent replies (see below) |
 | `pingInterval` | no | `60s` | keepalive cadence (Go duration): XEP-0199 server ping + XEP-0410 MUC self-ping; `0` disables |
 | `reactions` | no | `false` | XEP-0444 emoji reactions on 1:1 owner messages: lifecycle → 👀 picked up / ✅ done / ⛔ aborted, and enables the agent-driven `send_reaction` tool (see [Agent tools](#agent-tools)) |
+| `beforeAgentStartText` | no | — | literal text injected into the agent's system prompt on **every turn** (the companion extension's `before_agent_start`), after the identity line. Re-applied each turn, so a steer holds up in a long session instead of fading — the same property the equivalent Claude Code `UserPromptSubmit` hook relies on. Empty (or whitespace) means no injection; see [Per-turn prompt text](#per-turn-prompt-text-beforeagentstarttext) |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
 | `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic "done (no reply)". e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
 | `mam` | no | `true` | XEP-0313 archive backfill on startup; set `false` to opt out — see [Archive backfill](#archive-backfill-mam) |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
 `PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
+
+## Per-turn prompt text (`beforeAgentStartText`)
+
+`beforeAgentStartText` is injected into the agent's system prompt at the start
+of **every turn**, after the identity line. Re-applying it each turn is the
+point: a one-off instruction fades over a long session, a per-turn one does not.
+This is pi-msg's equivalent of a Claude Code `UserPromptSubmit` hook — the same
+mechanism, minus the shell command (a `beforeAgentStartHook` variant is planned,
+not built).
+
+A terse-replies setup (the same instruction as the Claude `terse-reminder.sh`
+hook):
+
+```json
+{
+  "accounts": {
+    "bot": {
+      "jid": "bot@chat.example.com",
+      "password": "…",
+      "owner": "zach@chat.example.com",
+      "beforeAgentStartText": "terse mode: <=8 lines, outcome first, no narration/boilerplate, ASD-STE100 Simplified Technical English. Short sentences, active voice, simple tenses, one word for one meaning, no contractions or idioms. Meaning beats rule compliance: never drop a fact or a caveat to satisfy a rule. Code, quotations and exact strings are exempt. Verbosity only if asked; always still surface risks, assumptions, and decisions made on their behalf."
+    }
+  }
+}
+```
+
+Notes:
+
+- The text is sent to the pi child process as `PI_MSG_BEFORE_AGENT_START_TEXT`
+  and read by the embedded companion extension on `before_agent_start`.
+- A whitespace-only value counts as unset (it is trimmed).
+- Same text each turn keeps the cached prompt prefix valid; changing it
+  mid-session invalidates the prefix from that point on.
+- With it unset, the system prompt is byte-identical to a run without the
+  setting.
 
 ## Archive backfill (MAM)
 

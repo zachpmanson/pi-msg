@@ -167,6 +167,20 @@ const ambientCap = 50
 // otherwise distinguish a dropped handoff from a peer still thinking.
 const cascadeCap = 25
 
+// rpcEnv is the environment the pi child process is launched with: the
+// companion extension's tool set (both tools are always available — lifecycle
+// auto-reactions (👀✅⛔) are gated in the bridge, not here), plus the
+// prompt-level opt-ins. beforeAgentStartText is not a tool but travels the same
+// way: the extension reads PI_MSG_BEFORE_AGENT_START_TEXT on before_agent_start
+// and appends it to the system prompt on every turn.
+func rpcEnv(acct ResolvedAccount) []string {
+	env := []string{"PI_MSG_TOOLS=" + strings.Join([]string{"file", "reaction"}, ",")}
+	if acct.BeforeAgentStartText != "" {
+		env = append(env, "PI_MSG_BEFORE_AGENT_START_TEXT="+acct.BeforeAgentStartText)
+	}
+	return env
+}
+
 // NewBridge constructs a bridge for the resolved account.
 func NewBridge(acct ResolvedAccount, debug bool) *Bridge {
 	return &Bridge{acct: acct, debug: debug}
@@ -210,11 +224,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 			b.log("info", "pi stderr: "+line)
 		}
 	})
-	// Tell the companion extension which tools to register. Both send_file and
-	// send_reaction are always available; only lifecycle auto-reactions (👀✅⛔)
-	// are gated behind the account's reactions flag.
-	tools := []string{"file", "reaction"}
-	b.rpc.env = []string{"PI_MSG_TOOLS=" + strings.Join(tools, ",")}
+	// Companion-extension environment: tool set + prompt-level opt-ins (see
+	// rpcEnv).
+	b.rpc.env = rpcEnv(b.acct)
 
 	// Session persistence: we always continue from the last session when one is
 	// usable. If we saved a session file on a previous run and it still exists
