@@ -31,19 +31,38 @@ import (
 //     classify/dispatch path, so the last acknowledged inbound is the real
 //     replay cursor.
 //
-// Delivery is at-least-once, not exactly-once: an entry that arrives moments
-// before a run settles survives that ack pass and is re-delivered next start
-// even though the run did consume it (see ackSettled). A duplicate is a far
-// smaller problem than a silently dropped instruction.
+// An entry is acknowledged at settle when either the run that is settling
+// consumed it — it was handed to pi (markDelivered) and the run produced
+// assistant text or ran a tool after that (ackPolicy.LastActive) — or it has been
+// pending longer than inboxAckGrace without being delivered at all, so no run
+// will ever consume it.
+//
+// Delivery is at-least-once, not exactly-once, but the window is now bounded by a
+// turn rather than open-ended: a delivery with no activity after it (a steer pi
+// never yielded, or a message that arrived as the run ended) stays pending and is
+// re-delivered at the next start.
+//
+// The older, age-only rule was the source of a real defect (issue #104): an entry
+// that arrived within the grace window of the settle that consumed it stayed
+// pending, and if the account then went quiet no later settle ever cleared it. It
+// survived for days and was re-delivered — and announced to the owner — on every
+// restart, so agents "caught up" on stale messages that were not new at all.
+//
+// Messages that never become a prompt (buffered ambient chatter, a bridge
+// command, a dropped own-echo) are dropped outright (drop): no run will ever
+// settle for them, so leaving them pending would strand them the same way.
 //
 // The file holds only unacknowledged entries: a settle rewrites what remains.
 // It is therefore empty in steady state, and bounded by inboxCap if a run never
 // settles.
 
 // inboxAckGrace is how long an entry must have been pending before a settle
-// acknowledges it. Without it, a message that arrives in the same instant a run
-// ends would be acked by that run's settle — and lost if the *next* run never
-// got to consume it (the exact failure this file exists to prevent).
+// acknowledges it *without* evidence that a run consumed it. Without it, a
+// message that arrives in the same instant a run ends would be acked by that
+// run's settle — and lost if the *next* run never got to consume it (the exact
+// failure this file exists to prevent). It is a backstop for entries that were
+// never delivered at all; a delivered entry is acknowledged as soon as the run
+// that took it in shows activity (see ackPolicy).
 const inboxAckGrace = 5 * time.Second
 
 // inboxCap bounds the file. Entries past it are dropped oldest-first with a
@@ -65,6 +84,13 @@ type inboxEntry struct {
 	// re-delivered reply still names its target (#95).
 	ReplyToID string    `json:"replyToID,omitempty"`
 	At        time.Time `json:"at"`
+
+	// deliveredAt is when pi was handed this message during the current process.
+	// In-memory only: a delivery does not survive a restart (the point of
+	// re-delivery is that the new process has not seen the entry yet), and a
+	// stale on-disk value would let a settle in the new process acknowledge an
+	// entry it never delivered.
+	deliveredAt time.Time
 }
 
 // message turns the entry back into the transport-agnostic inbound message the
@@ -169,6 +195,60 @@ func (in *inbox) pending() []inboxEntry {
 	return append([]inboxEntry(nil), in.entries...)
 }
 
+// markDelivered records that pi was handed this message, so the settle that ends
+// the run can acknowledge it without waiting for the grace. It matches by stanza
+// id when there is one, else by (from, body). Returns how many entries matched.
+func (in *inbox) markDelivered(id, from, body string, at time.Time) int {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	n := 0
+	for i := range in.entries {
+		if matchesEntry(in.entries[i], id, from, body) {
+			in.entries[i].deliveredAt = at
+			n++
+		}
+	}
+	return n
+}
+
+// drop removes entries for a message that never became a prompt — buffered
+// ambient chatter, a bridge command handled in-process, a dropped own-echo. No
+// run will ever settle for these, so they must not wait for an ack: before issue
+// #104 they stayed pending and were re-delivered as "unacknowledged" on every
+// restart.
+func (in *inbox) drop(id, from, body string) int {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	kept := in.entries[:0]
+	dropped := 0
+	for _, e := range in.entries {
+		if matchesEntry(e, id, from, body) {
+			dropped++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if dropped == 0 {
+		return 0
+	}
+	in.entries = kept
+	in.flushLocked()
+	return dropped
+}
+
+// matchesEntry reports whether an entry is the message identified by these
+// fields. The stanza id is authoritative when present; (from, body) is the
+// fallback for stanzas that arrive without one (XEP-0359 is not universal).
+func matchesEntry(e inboxEntry, id, from, body string) bool {
+	if id != "" {
+		return e.ID == id
+	}
+	if from == "" && body == "" {
+		return false
+	}
+	return e.From == from && e.Body == body
+}
+
 // len reports how many entries are unacknowledged.
 func (in *inbox) len() int {
 	in.mu.Lock()
@@ -176,17 +256,30 @@ func (in *inbox) len() int {
 	return len(in.entries)
 }
 
-// ackSettled acknowledges everything a settled run took in: every entry that had
-// already been pending for longer than inboxAckGrace. Entries younger than that
-// are kept, because they may belong to the run that is starting now rather than
-// the one that just ended.
-func (in *inbox) ackSettled(now time.Time) int {
+// ackPolicy is what a settling run reports about itself, so the inbox can tell
+// the entries it consumed from the ones it merely outlived.
+type ackPolicy struct {
+	// Now is the settle time.
+	Now time.Time
+	// LastActive is when the settling run last produced assistant text or ran a
+	// tool (zero when it produced neither). An entry delivered before that moment
+	// was read by the model — pi injects a steer at the next tool yield — so it
+	// can be acknowledged immediately. An entry delivered *after* it was not
+	// consumed and must stay pending for the next run (or at the next start).
+	LastActive time.Time
+}
+
+// ackSettled acknowledges everything the settling run took in: entries it
+// consumed (delivered, with run activity after the delivery), and entries that
+// have been pending longer than inboxAckGrace without any delivery evidence.
+func (in *inbox) ackSettled(p ackPolicy) int {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	kept := in.entries[:0]
 	acked := 0
 	for _, e := range in.entries {
-		if now.Sub(e.At) >= inboxAckGrace {
+		consumed := !e.deliveredAt.IsZero() && !p.LastActive.IsZero() && !p.LastActive.Before(e.deliveredAt)
+		if consumed || p.Now.Sub(e.At) >= inboxAckGrace {
 			acked++
 			continue
 		}

@@ -84,6 +84,11 @@ type Bridge struct {
 	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
 	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
 	heartbeatRun   bool          // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
+	// runActive is when the current run last took a message into its context —
+	// an injected steer or a fresh assistant turn begins one. The inbox compares
+	// it with a delivery stamp at settle to tell a message the run consumed from
+	// one it merely outlived (#104). Zero means no such event yet.
+	runActive time.Time
 	// finalMsgHadText records whether the most recent assistant message of this
 	// run carried deliverable text. A run that ends on a tool call leaves it
 	// false: the answer was never written, so nothing could be delivered.
@@ -435,6 +440,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setHandleWarned(false)
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
 		b.resetTailTracking() // fresh run: no message seen, no tool since delivery
+		b.clearRunActivity()
 		b.reactionAckRun = false
 		b.markActive() // a run is in flight — not idle
 		b.xmpp.SetPresence("dnd", "thinking…")
@@ -518,6 +524,12 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// and after /new in the command handler. Kept here in case a future pi
 		// starts emitting it.
 		b.refreshSessionFile()
+	case "message_start":
+		// A message entered the conversation (the prompt itself, a steer pi
+		// injected at its yield point, or the assistant's next turn). Anything
+		// handed to pi before this moment has been read, which is exactly what
+		// lets the settle acknowledge it without waiting out the grace (#104).
+		b.noteRunActivity()
 	case "message_end":
 		msg := ev.Obj("message")
 		if msg == nil || msg.Str("role") != "assistant" {
@@ -832,6 +844,7 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	// because it means the transport-level filter is broken.
 	if m.Nick != "" && b.xmpp != nil && strings.EqualFold(m.Nick, b.xmpp.ownNick(m.Room)) {
 		b.log("warning", fmt.Sprintf("own-echo reached dispatch despite transport guard (nick %q in %s); dropping", m.Nick, m.Room))
+		b.inboxDrop(m.ID, m.From, m.Body)
 		return
 	}
 	action, body := b.classify(m)
@@ -870,6 +883,9 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 		}
 		b.dispatchCommentary(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID, b.replyContext(m))
 	case actionAmbient:
+		// Buffered as context, no turn: no run will ever settle for it, so it
+		// must not stay in the durable queue (#104).
+		b.inboxDrop(m.ID, m.From, m.Body)
 		b.bufferAmbient(m.Nick, m.Body)
 	}
 }
@@ -899,13 +915,18 @@ func senderName(nick, sender, origin string) string {
 func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, replyTo string) {
 	t := strings.TrimSpace(text)
 	if t == "" {
+		b.inboxDrop(reactID, "", "")
 		return
 	}
 	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!")) && b.handleCommand(t) {
+		// Handled in-process: it never becomes a prompt, so nothing will ever
+		// settle for it (#104).
+		b.inboxDrop(reactID, "", "")
 		return
 	}
 	// A real prompt: point lifecycle/agent reactions at the message that drove it,
 	// and remember where a reply (or tool-driven file) should go by default.
+	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
@@ -919,8 +940,10 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID, replyTo string) {
 	t := strings.TrimSpace(body)
 	if t == "" {
+		b.inboxDrop(reactID, "", "")
 		return
 	}
+	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin)
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
@@ -2059,6 +2082,29 @@ func (b *Bridge) resetTailTracking() {
 	b.finalMsgHadText = false
 	b.toolSinceDelivery = false
 	b.mu.Unlock()
+}
+
+// noteRunActivity stamps the current run as having taken a message into its
+// context. The inbox reads the stamp at settle (#104).
+func (b *Bridge) noteRunActivity() {
+	b.mu.Lock()
+	b.runActive = time.Now()
+	b.mu.Unlock()
+}
+
+// clearRunActivity starts a new run with no activity recorded.
+func (b *Bridge) clearRunActivity() {
+	b.mu.Lock()
+	b.runActive = time.Time{}
+	b.mu.Unlock()
+}
+
+// lastRunActivity is when the current run last took a message into its context,
+// zero if it has not yet.
+func (b *Bridge) lastRunActivity() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.runActive
 }
 
 // setFinalMsgHadText records whether the assistant message that just ended
@@ -3662,6 +3708,7 @@ const inboxNote = "[pi-msg: re-delivered after a restart — this was queued to 
 func (b *Bridge) deliverInbox(e inboxEntry) {
 	m := e.message()
 	if strings.TrimSpace(m.Body) == "" {
+		b.inboxDrop(m.ID, m.From, m.Body)
 		return
 	}
 	m.Body = strings.TrimSpace(m.Body) + "\n\n" + inboxNote
@@ -3672,17 +3719,41 @@ func (b *Bridge) deliverInbox(e inboxEntry) {
 	b.handleRoom(m)
 }
 
-// ackInboxSettled acknowledges the messages the run that just ended took in.
-// Entries younger than inboxAckGrace are kept: a message that arrived in the
-// same instant the run ended may belong to the *next* run, and acking it would
-// reintroduce exactly the loss this queue prevents.
+// ackInboxSettled acknowledges the messages the run that just ended took in: the
+// ones it delivered and then read, and — as a backstop — any that have been
+// pending longer than inboxAckGrace without ever being delivered. An entry
+// handed to pi that the run never read (a steer pi did not yield, or a message
+// that arrived as the run ended) stays pending for the next run or the next
+// start (#96, #104).
 func (b *Bridge) ackInboxSettled() {
 	if b.inbox == nil {
 		return
 	}
-	if n := b.inbox.ackSettled(time.Now()); n > 0 {
+	p := ackPolicy{Now: time.Now(), LastActive: b.lastRunActivity()}
+	if n := b.inbox.ackSettled(p); n > 0 {
 		b.log("info", fmt.Sprintf("inbox: acknowledged %d message(s)", n))
 	}
+}
+
+// inboxMarkDelivered tells the durable queue that pi has been handed this
+// message. The entry is not dropped: it is acknowledged when the run that took
+// it in settles, so a run that dies first still gets it re-delivered (#96).
+func (b *Bridge) inboxMarkDelivered(id string) {
+	if b.inbox == nil || id == "" {
+		return
+	}
+	b.inbox.markDelivered(id, "", "", time.Now())
+}
+
+// inboxDrop removes a message that will never become a prompt — buffered
+// ambient chatter, a bridge command, a dropped own-echo. No run will settle for
+// it, so waiting for an ack would strand it until the next restart re-delivered
+// it as "unacknowledged" (#104).
+func (b *Bridge) inboxDrop(id, from, body string) {
+	if b.inbox == nil {
+		return
+	}
+	b.inbox.drop(id, from, body)
 }
 
 // inboxLen reports how many messages are awaiting acknowledgement.
