@@ -1528,3 +1528,14 @@ func TestNonCreditErrorUnchanged(t *testing.T) {
 		t.Error("non-credit error must not mark the run replied; the no-reply nudge should still apply")
 	}
 }
+
+func TestRPCEnv(t *testing.T) {
+	plain := rpcEnv(ResolvedAccount{})
+	if len(plain) != 1 || plain[0] != "PI_MSG_TOOLS=file,reaction" {
+		t.Errorf("rpcEnv(unset) = %v, want [PI_MSG_TOOLS=file,reaction]", plain)
+	}
+	withText := rpcEnv(ResolvedAccount{BeforeAgentStartText: "be brief"})
+	if len(withText) != 2 || withText[1] != "PI_MSG_BEFORE_AGENT_START_TEXT=be brief" {
+		t.Errorf("rpcEnv(text) = %v, want PI_MSG_TOOLS + PI_MSG_BEFORE_AGENT_START_TEXT", withText)
+	}
+}

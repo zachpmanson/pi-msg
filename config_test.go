@@ -46,6 +46,46 @@ func TestResolveAccountDefaults(t *testing.T) {
 	if got.RoomMode() {
 		t.Error("RoomMode() = true, want false (no room set)")
 	}
+	if got.BeforeAgentStartText != "" {
+		t.Errorf("BeforeAgentStartText = %q, want empty by default", got.BeforeAgentStartText)
+	}
+}
+
+func TestResolveAccountBeforeAgentStartText(t *testing.T) {
+	cfg := &Config{Accounts: map[string]Account{
+		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com",
+			BeforeAgentStartText: "  terse mode: be brief  "},
+	}}
+	got, err := resolveAccount(cfg, "")
+	if err != nil {
+		t.Fatalf("resolveAccount: %v", err)
+	}
+	// Trimmed, so a whitespace-only value counts as unset rather than injecting
+	// a blank paragraph every turn.
+	if got.BeforeAgentStartText != "terse mode: be brief" {
+		t.Errorf("BeforeAgentStartText = %q, want trimmed text", got.BeforeAgentStartText)
+	}
+
+	// The value must survive the config round trip under its JSON name.
+	path := writeConfig(t, *cfg)
+	loaded, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if loaded.Accounts["default"].BeforeAgentStartText != "  terse mode: be brief  " {
+		t.Error("beforeAgentStartText not parsed from JSON")
+	}
+
+	blank := &Config{Accounts: map[string]Account{
+		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", BeforeAgentStartText: "   "},
+	}}
+	got, err = resolveAccount(blank, "")
+	if err != nil {
+		t.Fatalf("resolveAccount: %v", err)
+	}
+	if got.BeforeAgentStartText != "" {
+		t.Errorf("whitespace-only value resolved to %q, want empty", got.BeforeAgentStartText)
+	}
 }
 
 func TestResolveAccountRoomMode(t *testing.T) {
