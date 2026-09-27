@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 )
@@ -32,7 +33,7 @@ func run() error {
 	// bridge restarts together, and a rejected config takes all of them down.
 	// Being able to run the parser against the real config first turns that into
 	// a pre-flight check instead of an outage.
-	checkFlag := flag.Bool("check", false, "validate the config, print the resolved account and its room rules, then exit without connecting")
+	checkFlag := flag.Bool("check", false, "validate the config, print every account and its room rules, then exit without connecting")
 	flag.Parse()
 
 	cfg, err := loadConfig(configPath())
@@ -42,13 +43,16 @@ func run() error {
 		}
 		return err
 	}
+	if *checkFlag {
+		// EVERY account, not just the selected one: the parse is strict and the
+		// failure it guards against is fleet-wide, so a pre-flight that only
+		// checked one account would pass while a sibling account's room silently
+		// failed to resolve (#106 review).
+		return checkAllAccounts(cfg)
+	}
 	acct, err := resolveAccount(cfg, os.Getenv("PI_MSG_ACCOUNT"))
 	if err != nil {
 		return err
-	}
-	if *checkFlag {
-		printAccountSummary(acct)
-		return nil
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -66,13 +70,43 @@ func run() error {
 	return b.Run(ctx)
 }
 
-// printAccountSummary is the --check report: the resolved account and, room by
-// room, the addressing rules that will actually be in force. Room rules are the
-// part worth printing — a room silently missing, or carrying an unexpected
-// trigger, is the whole reason to run a pre-flight check.
-func printAccountSummary(a ResolvedAccount) {
+// checkAllAccounts is the --check report: every account, resolved, with its
+// room rules. It returns an error if any account fails to resolve, so a
+// pre-flight run is a single command rather than one per account — and a broken
+// sibling account cannot pass unnoticed.
+func checkAllAccounts(cfg *Config) error {
 	out := os.Stdout
 	fmt.Fprintf(out, "config: %s\n", configPath())
+	names := accountNames(cfg)
+	sort.Strings(names)
+	var failed []string
+	for i, name := range names {
+		if i > 0 {
+			fmt.Fprintln(out)
+		}
+		acct, err := resolveAccount(cfg, name)
+		if err != nil {
+			// Report every failure, not just the first: fixing them one deploy at a
+			// time is exactly what a pre-flight is meant to avoid.
+			fmt.Fprintf(out, "account %s: INVALID: %v\n", name, err)
+			failed = append(failed, name)
+			continue
+		}
+		printAccountSummary(acct)
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%d account(s) invalid: %s", len(failed), strings.Join(failed, ", "))
+	}
+	fmt.Fprintf(out, "\n%d account(s) valid\n", len(names))
+	return nil
+}
+
+// printAccountSummary is the --check report for one account: the resolved account
+// and, room by room, the addressing rules that will actually be in force. Room
+// rules are the part worth printing — a room silently missing, or carrying an
+// unexpected trigger, is the whole reason to run a pre-flight check.
+func printAccountSummary(a ResolvedAccount) {
+	out := os.Stdout
 	fmt.Fprintf(out, "account: %s\n", a.Name)
 	fmt.Fprintf(out, "jid: %s\n", a.JID)
 	fmt.Fprintf(out, "owner: %s\n", a.Owner)

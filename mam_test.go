@@ -33,7 +33,7 @@ func newMAMTestBridge() *XMPPBridge {
 // is recorded for reaction targeting, and is tagged direct/canonical.
 func TestCollectMAMResultDirect(t *testing.T) {
 	b := newMAMTestBridge()
-	col := &mamCollector{}
+	col := &mamCollector{record: true}
 	b.mamPending["q1"] = col
 
 	toks := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q1' id='a1'>`+
@@ -69,7 +69,7 @@ func TestCollectMAMResultDirect(t *testing.T) {
 // the occupant nick; our own archived outbound is skipped.
 func TestCollectMAMResultRoom(t *testing.T) {
 	b := newMAMTestBridge()
-	col := &mamCollector{room: "testing@muc.chat.zachmanson.com"}
+	col := &mamCollector{record: true, room: "testing@muc.chat.zachmanson.com"}
 	b.mamPending["q2"] = col
 
 	for _, from := range []string{
@@ -100,7 +100,7 @@ func TestCollectMAMResultRoom(t *testing.T) {
 // input; an empty-body (chat-state) archive entry is dropped too.
 func TestCollectMAMResultUnknownAndEmpty(t *testing.T) {
 	b := newMAMTestBridge()
-	b.mamPending["q1"] = &mamCollector{}
+	b.mamPending["q1"] = &mamCollector{record: true}
 
 	unknown := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='nope'>`+
 		`<forwarded xmlns='urn:xmpp:forward:0'><message xmlns='jabber:client' from='zach@chat.zachmanson.com' id='x'><body>stray</body></message></forwarded></result>`)
@@ -122,7 +122,7 @@ func TestCollectMAMResultUnknownAndEmpty(t *testing.T) {
 // the server return the whole archive instead of the offline window.
 func TestMAMQueryPayloadMarshal(t *testing.T) {
 	since := time.Date(2026, 9, 15, 8, 15, 58, 0, time.UTC)
-	p := newMAMQueryPayload("qid-1", "zach@chat.zachmanson.com", since, mamPageMax)
+	p := newMAMQueryPayload("qid-1", "zach@chat.zachmanson.com", since, mamPageMax, false)
 
 	raw, err := xml.Marshal(p)
 	if err != nil {
@@ -144,7 +144,7 @@ func TestMAMQueryPayloadMarshal(t *testing.T) {
 
 	// A room query omits `with` (the room archive is addressed by JID) but still
 	// carries the time bound.
-	room := string(mustMarshal(t, newMAMQueryPayload("qid-2", "", since, 0)))
+	room := string(mustMarshal(t, newMAMQueryPayload("qid-2", "", since, 0, false)))
 	if strings.Contains(room, `var="with"`) {
 		t.Errorf("room payload should not carry a with filter:\n%s", room)
 	}
@@ -266,5 +266,50 @@ func TestReconnectSince(t *testing.T) {
 	got, ok = reconnectSince(time.Time{}, false, seen, true, now)
 	if !ok || !got.Equal(now.Add(-mamReconnectWindow)) {
 		t.Errorf("mamseen only: got (%v,%v), want clamped %v", got, ok, now.Add(-mamReconnectWindow))
+	}
+}
+
+// The last-page query is what makes read_room return the NEWEST messages. With
+// no RSM cursor the server returns the archive's first page, so a read would
+// hand the agent the room's oldest messages while claiming they were the latest
+// (#106 review): <before/> with no <after> and no start bound is what selects
+// the final page (XEP-0313 §4.3.3).
+func TestMAMLastPagePayload(t *testing.T) {
+	last := string(mustMarshal(t, newMAMQueryPayload("qid-3", "", time.Time{}, 30, true)))
+	if !strings.Contains(last, `<set xmlns="http://jabber.org/protocol/rsm"><max>30</max><before></before></set>`) {
+		t.Errorf("last-page payload must cap the page and ask for the final one:\n%s", last)
+	}
+	if strings.Contains(last, `var="start"`) {
+		// A start bound anchors the window at its BEGINNING, which is the bug.
+		t.Errorf("last-page payload must not carry a start bound:\n%s", last)
+	}
+
+	// The backfill (first-page) query keeps its start bound and no cursor.
+	first := string(mustMarshal(t, newMAMQueryPayload("qid-4", "", time.Now(), 200, false)))
+	if strings.Contains(first, "<before>") || !strings.Contains(first, `var="start"`) {
+		t.Errorf("the backfill query must stay start-bounded with no cursor:\n%s", first)
+	}
+}
+
+// A read must not write the stanza history: recording fetched ids clears the
+// "we sent this" flag on our own archived lines and can evict live ids that
+// `to: <stanza-id>` routing depends on (#106 review).
+func TestMAMReadDoesNotRecordHistory(t *testing.T) {
+	b := newMAMTestBridge()
+	col := &mamCollector{room: "testing@muc.chat.zachmanson.com"} // record=false: a read
+	b.mamPending["q1"] = col
+
+	toks := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q1' id='a1'>`+
+		`<forwarded xmlns='urn:xmpp:forward:0'><delay xmlns='urn:xmpp:delay' stamp='2026-09-15T01:00:00Z'/>`+
+		`<message xmlns='jabber:client' from='testing@muc.chat.zachmanson.com/peppy' id='m9' type='groupchat'>`+
+		`<body>on it</body></message></forwarded></result>`)
+	res, _ := element(toks, mamNS, "result")
+	b.collectMAMResult(toks, res)
+
+	if len(col.out) != 1 {
+		t.Fatalf("collected %d messages, want 1", len(col.out))
+	}
+	if got := b.lookupMessage("m9"); got != "" {
+		t.Errorf("a read recorded stanza m9 in history (%q), want nothing recorded", got)
 	}
 }

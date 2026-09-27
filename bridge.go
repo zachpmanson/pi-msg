@@ -133,8 +133,6 @@ type Bridge struct {
 	typingStream      string // accumulated streamed reply text (room-mode routing)
 	typingRoutingDone bool   // routing decision for the streaming reply already made
 
-	ambientMu sync.Mutex
-
 	// cascadeMu guards cascade, the count of consecutive agent-to-agent turns
 	// taken with no owner message in between (#23), and cascadeNotified, which
 	// keeps the room notice to one per episode.
@@ -632,6 +630,10 @@ func (b *Bridge) handleReadRoomRelay(id, room string, limit int) {
 	}
 	bare := bareJid(room)
 	if bare == "" {
+		if len(b.acct.Rooms) == 0 {
+			b.rpc.RespondUIRelay(id, "read_room: this account joins no rooms")
+			return
+		}
 		b.rpc.RespondUIRelay(id, "read_room needs a room: no room was named and this account joins more than one ("+strings.Join(b.acct.Rooms, ", ")+")")
 		return
 	}
@@ -653,7 +655,7 @@ func (b *Bridge) handleReadRoomRelay(id, room string, limit int) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), mamTimeout)
 		defer cancel()
-		msgs, complete, err := b.xmpp.FetchMAM(ctx, bare, "", time.Time{}, limit)
+		msgs, complete, err := b.xmpp.FetchMAMLastPage(ctx, bare, limit)
 		if err != nil {
 			reason := fmt.Sprintf("read_room %s failed: %v", bare, err)
 			b.log("warning", reason)
@@ -665,14 +667,16 @@ func (b *Bridge) handleReadRoomRelay(id, room string, limit int) {
 }
 
 // formatRoomRead renders archived room messages for the model: oldest first, one
-// line each, with the sender, age and the stanza id it can be replied to. An
-// empty or bodyless window says so explicitly rather than returning an empty
-// string, which the extension would report as a failed read.
+// line each, with the sender, age and the stanza id it can be replied to. Every
+// return value starts with the `[pi-msg: read_room:` header — including the
+// empty case, which is a successful read of an empty window — because the
+// companion extension treats any other result as a failed tool call (#106
+// review).
 func formatRoomRead(room string, msgs []InboundMessage, limit int, complete bool) string {
-	var sb strings.Builder
 	if len(msgs) == 0 {
-		return fmt.Sprintf("read_room: no archived messages in %s.", room)
+		return fmt.Sprintf("[pi-msg: read_room: no archived messages in %s (the room has archived nothing for this window).]", room)
 	}
+	var sb strings.Builder
 	fmt.Fprintf(&sb, "[pi-msg: read_room: last %d archived message(s) in %s, oldest first — read on demand, not a prompt; nothing here needs a reply unless you choose to send one.]", len(msgs), room)
 	for _, m := range msgs {
 		who := m.Nick
@@ -692,8 +696,11 @@ func formatRoomRead(room string, msgs []InboundMessage, limit int, complete bool
 		}
 		fmt.Fprintf(&sb, "\n  %s (%s)%s: %s", who, when, reply, strings.Join(strings.Fields(m.Body), " "))
 	}
-	if !complete || len(msgs) >= limit {
-		fmt.Fprintf(&sb, "\n  … window may be truncated at %d message(s); older history exists in the archive.", limit)
+	// The page is the newest `limit` messages, so a short result means the archive
+	// has nothing older to give, not that the page was cut short. `complete=false`
+	// reports that the server has more history behind this page.
+	if !complete {
+		fmt.Fprintf(&sb, "\n  … older history exists in the archive beyond these %d message(s).", len(msgs))
 	}
 	return sb.String()
 }
@@ -870,10 +877,11 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	// property the "drop an unactioned ambient entry" path used to buy after the
 	// fact, now by construction.
 	if !m.Direct {
-		if action, _ := b.classify(m); action == actionNotOurs {
+		if action, _, _ := b.classify(m); action == actionNotOurs {
 			b.log("info", fmt.Sprintf("room message in %s from %q does not address us; ignored", m.Room, m.Nick))
 			return
 		}
+		m.Addressed = true
 	}
 	// Durably record the message BEFORE any prompt goes out (#96): a run that
 	// dies before its next tool yield would otherwise take the instruction with
@@ -903,6 +911,15 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	}
 	joint := strings.Join(m.Reactions, " ")
 	b.log("notice", fmt.Sprintf("inbound reaction from %s: %s (target %q)", render, joint, m.ReactionID))
+	// A room reaction only addresses us when it is acking something WE said (or
+	// when it comes from the owner, who is trusted traffic). A reaction to
+	// another occupant's message is somebody else's conversation: with no ambient
+	// buffer and no passive awareness (#106), waking on it would be the last
+	// surviving room path where a non-addressing message costs a turn.
+	if !m.Direct && !m.FromOwner && !b.xmppIsSelfMessage(m.ReactionID) {
+		b.log("info", fmt.Sprintf("reaction from %s dropped: it targets a message that is not ours (#106)", render))
+		return
+	}
 	// A run already in flight must not be interrupted by a steering prompt, and
 	// there is no longer a buffer to hold the ack for later. An ack carries no
 	// obligation, so dropping it is the honest choice — say so in the log.
@@ -919,11 +936,19 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	}
 	b.reactionAckRun = true
 	b.rpc.Prompt(
-		fmt.Sprintf("[pi-msg: reaction: %s reacted %s to your message (XEP-0444 ack). You may acknowledge, act on it, or ignore — reply with \"to: noop\" if you have nothing to add.]", render, joint),
+		fmt.Sprintf("[pi-msg: reaction: %s reacted %s to a message of yours (XEP-0444 ack). You may acknowledge, act on it, or ignore — reply with \"to: noop\" if you have nothing to add.]", render, joint),
 		b.steerBehavior())
 	if b.xmpp != nil {
 		b.xmpp.SetPresence("dnd", "thinking…")
 	}
+}
+
+// xmppIsSelfMessage asks the transport whether a stanza id is one we sent, so a
+// room reaction can be matched to our own message. It answers false when there
+// is no transport (tests) or the id is unknown — the bridge then treats the
+// reaction as somebody else's conversation.
+func (b *Bridge) xmppIsSelfMessage(id string) bool {
+	return b.xmpp != nil && b.xmpp.isSelfMessage(id)
 }
 
 // roomAction is how a room message is treated.
@@ -940,24 +965,41 @@ const (
 // owner, a handle, a broadcast, or a reply to one of our own messages) and so
 // takes a turn, or it does not and is dropped entirely (#106). There is no third
 // tier — the ambient buffer that used to hold unaddressed chatter is gone.
-func (b *Bridge) classify(m InboundMessage) (roomAction, string) {
+//
+// The second return is the body to prompt with, and the third is the bare trigger
+// word when a bare mention was the only reason we were addressed (else "") —
+// the false-trigger counter.
+func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 	addressed, stripped := b.matchTrigger(m.Room, m.Body)
+	mention := ""
+	if addressed {
+		mention = b.bareMention(m.Room, m.Body)
+		if mention != "" {
+			b.log("notice", fmt.Sprintf("bare-name mention %q from %q in %s addressed us", mention, m.Nick, m.Room))
+		}
+	}
 	switch {
 	case m.FromOwner:
 		if addressed {
-			return actionCanonical, stripped
+			return actionCanonical, stripped, ""
 		}
-		return actionCanonical, m.Body
+		return actionCanonical, m.Body, ""
 	case addressed:
-		return actionCommentary, stripped
+		return actionCommentary, stripped, mention
 	case b.replyToOwnMessage(m):
 		// Someone answered something we said, without naming us. Treat it as
 		// addressing us (XEP-0461, #95) rather than dropping it: a reply to our
 		// own message is the one form of non-named traffic that is unambiguously
 		// meant for us.
-		return actionCommentary, m.Body
+		return actionCommentary, m.Body, ""
+	case m.Addressed:
+		// Address-hood already established when this message was received (see
+		// InboundMessage.Addressed): it is being re-delivered from the durable
+		// queue, and the evidence that made it ours may no longer be resolvable
+		// (an emptied stanza history after a restart).
+		return actionCommentary, m.Body, ""
 	default:
-		return actionNotOurs, m.Body
+		return actionNotOurs, m.Body, ""
 	}
 }
 
@@ -987,7 +1029,7 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 		b.inboxDrop(m.ID, m.From, m.Body)
 		return
 	}
-	action, body := b.classify(m)
+	action, body, _ := b.classify(m)
 	// Cascade bound (#23): an owner message resets the budget; agent-to-agent
 	// turns spend it. When exhausted the trigger is dropped rather than demoted
 	// to a buffered turn, so the count is a hard stop.
@@ -1553,7 +1595,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ does not reach them. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room
@@ -1725,6 +1767,35 @@ func (b *Bridge) matchTrigger(room, body string) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// bareMention returns the trigger word when a bare mention is the ONLY reason
+// the body addresses this agent — no sigil, no colon, no broadcast. It exists to
+// count the false positives the bare-mention rule deliberately accepts (#106):
+// the issue asked for the matched word and the sender to be logged for a week so
+// the trade could be measured, and without it the rate is unknowable.
+func (b *Bridge) bareMention(room, body string) string {
+	trig := b.acct.TriggerFor(room)
+	if trig == "" {
+		return ""
+	}
+	t := strings.TrimSpace(body)
+	// The leading colon/comma form, or an explicit @handle anywhere, is a real
+	// address: not a bare-mention false positive.
+	if len(t) > len(trig) && strings.EqualFold(t[:len(trig)], trig) {
+		switch t[len(trig)] {
+		case ':', ',':
+			return ""
+		}
+	}
+	scan := stripUnquoted(t)
+	if scan == "" || containsAddress(scan, trig) || containsBroadcast(scan) {
+		return ""
+	}
+	if containsMention(scan, trig) {
+		return trig
+	}
+	return ""
 }
 
 // broadcastHandles address every agent in the room at once. Agents reach for
@@ -3959,6 +4030,7 @@ func (b *Bridge) inboxAppend(m InboundMessage) {
 		RealJID:   m.RealJID,
 		FromOwner: m.FromOwner,
 		Direct:    m.Direct,
+		Addressed: true,
 		ReplyToID: m.ReplyToID,
 		At:        time.Now(),
 	})

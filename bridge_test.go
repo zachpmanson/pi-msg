@@ -439,8 +439,12 @@ func TestInboundReactionAck(t *testing.T) {
 	}
 
 	// Path 2: idle → the ack wakes the agent (reactionAckRun set, turnDest = room).
+	// A room reaction only reaches us when it acks a message WE sent, so the
+	// target id has to be one of ours.
 	b2 := roomBridge()
 	b2.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
+	b2.xmpp = NewXMPPBridge(b2.acct, func(InboundMessage) {}, b2.log)
+	b2.xmpp.recordSelfMessage("target-123", "team@muc.x.com", "our message")
 	b2.onInbound(InboundMessage{
 		Nick: "peppy", Room: "team@muc.x.com",
 		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "target-123",
@@ -450,6 +454,24 @@ func TestInboundReactionAck(t *testing.T) {
 	}
 	if b2.currentTurnDest() != "team@muc.x.com" {
 		t.Errorf("idle room reaction turnDest = %q, want room", b2.currentTurnDest())
+	}
+
+	// Path 3: idle, but the reaction acks somebody else's message → not ours, no
+	// turn. This is the last room path that could otherwise cost a turn for a
+	// message that does not address us (#106).
+	b4 := roomBridge()
+	b4.rpc = &RPCClient{}
+	b4.xmpp = NewXMPPBridge(b4.acct, func(InboundMessage) {}, b4.log)
+	b4.xmpp.recordSelfMessage("one-of-ours", "team@muc.x.com", "our message")
+	b4.onInbound(InboundMessage{
+		Nick: "peppy", Room: "team@muc.x.com",
+		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "someone-elses",
+	})
+	if b4.reactionAckRun {
+		t.Error("a reaction to another occupant's message must not wake us")
+	}
+	if b4.currentTurnDest() != "" {
+		t.Errorf("a dropped room reaction must not set a turn destination, got %q", b4.currentTurnDest())
 	}
 
 	// Owner reacting on 1:1 renders as "owner" and turns to the owner.

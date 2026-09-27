@@ -412,7 +412,7 @@ ${systemPrompt}`;
 			name: "read_room",
 			label: "Read room history (XMPP)",
 			description:
-				"Read the most recent messages from a group chat this bridge has joined, via the server's XEP-0313 archive. The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns the last N messages (default 30, max 100), oldest first, with sender, age and stanza ID. Reading does not reply to anything.",
+				"Read the most recent messages from a group chat this bridge has joined, via the server's XEP-0313 archive (the last page, so a short result means the archive has no more history). The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns the newest N messages (default 30, max 100), oldest first, with sender, age and stanza ID. Reading does not reply to anything.",
 			promptSnippet: "Read recent history from a joined group chat",
 			promptGuidelines: [
 				"Use read_room when you need the wider room conversation — a handoff you were not named in, or context behind a message that addressed you.",

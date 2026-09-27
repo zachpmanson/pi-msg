@@ -283,7 +283,7 @@ func chunkWords(text string, max int) []string {
 
 // InboundMessage is a received message the bridge should act on, after
 // transport-level guards. In 1:1 mode it is always the owner. In room mode it
-// may be any occupant; classification (canonical/commentary/ambient) is left
+// may be any occupant; classification (canonical/commentary/not-ours) is left
 // to the bridge.
 type InboundMessage struct {
 	Body      string // message text
@@ -311,6 +311,13 @@ type InboundMessage struct {
 	// referred to (issue #95).
 	ReplyToID  string
 	ReplyToJID string
+
+	// Addressed records that this message already passed the room-address check,
+	// set when it was received live and carried on a re-delivered inbox entry. An
+	// anchored reply to one of our own stanzas is only provably ours while the
+	// in-process stanza history holds that id, and a restart empties it — so the
+	// verdict travels with the message instead of being re-derived (#106 review).
+	Addressed bool
 }
 
 // XMPPBridge owns a single account's XMPP connection: it maintains a
@@ -1707,11 +1714,15 @@ func (b *XMPPBridge) recordMessage(id, fromJID string) {
 // recordSelfMessage records a stanza WE sent, so a later inbound XEP-0461 reply
 // to it can be recognised as addressing us (see classify, #106).
 func (b *XMPPBridge) recordSelfMessage(id, toJID, body string) {
-	b.recordMessageBody(id, toJID, body)
 	b.mu.Lock()
-	e := b.msgHistory[id]
-	e.Self = true
-	b.msgHistory[id] = e
+	b.recordMessageBodyLocked(id, toJID, body)
+	// Mark it as ours in the same critical section: an eviction landing between
+	// two acquisitions could re-insert a zero-value entry that then wins every
+	// oldest-eviction scan.
+	if e, ok := b.msgHistory[id]; ok {
+		e.Self = true
+		b.msgHistory[id] = e
+	}
 	b.mu.Unlock()
 }
 
@@ -1729,14 +1740,24 @@ func (b *XMPPBridge) isSelfMessage(id string) bool {
 // ring buffer. The body is what a later inbound reply to this message gets to
 // see, so both directions are recorded.
 func (b *XMPPBridge) recordMessageBody(id, fromJID, body string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.recordMessageBodyLocked(id, fromJID, body)
+}
+
+// recordMessageBodyLocked is recordMessageBody with b.mu already held, so a
+// caller can update the entry it just wrote in the same critical section.
+func (b *XMPPBridge) recordMessageBodyLocked(id, fromJID, body string) {
 	if id == "" {
 		return
 	}
 	body = truncateLabel(strings.TrimSpace(body), msgHistoryBodyCap)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, exists := b.msgHistory[id]; exists {
-		b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now(), Body: body}
+	if prev, exists := b.msgHistory[id]; exists {
+		// Keep Self: a re-record (a MAM fetch of our own archived line, a late
+		// duplicate) must not unmark a stanza we sent, or a peer's unaddressed
+		// XEP-0461 reply to it would be classified as not ours and dropped
+		// (#106 review).
+		b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now(), Body: body, Self: prev.Self}
 		return
 	}
 	if len(b.msgHistory) >= msgHistoryCap {

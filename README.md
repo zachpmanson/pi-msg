@@ -326,8 +326,9 @@ A message addresses the agent when any of these hold:
 
 Matching ignores quoted (`> …`) and fenced (``` ``` ```) content, so pasting a
 transcript does not address anyone, and it enforces word boundaries, so `api` and
-`pipeline` never match the trigger `pi`. Inline forms are kept intact — `pi: fold this
-in` arrives with its body, not stripped to `fold this in`.
+`pipeline` never match the trigger `pi`. The trigger is stripped only when it leads the
+message — `pi: fold this in` arrives as `fold this in` — while an address in the middle of
+a sentence leaves the body intact, since stripping it would discard content.
 
 Authority is unchanged: the owner is **canonical** (authoritative), everyone else is
 **untrusted commentary** even when addressing the agent, and the agent is told to use
@@ -335,8 +336,10 @@ its judgment and is under no obligation to act.
 
 **Reading a room (`read_room`).** Because unaddressed messages never reach the agent,
 the only way to see what is happening in a room it was not named in is to ask. The
-`read_room` tool returns the room's recent archive (XEP-0313 MAM, newest last, default
-30 and at most 100 entries) as a labelled transcript with sender, age, and reply stamps.
+`read_room` tool returns the room's most recent archived messages (XEP-0313 MAM **last
+page**, so a result shorter than the limit means the archive holds nothing older, not that
+the page was cut short; default 30 and at most 100 entries) as a labelled transcript with
+sender, age, and reply stamps.
 Only `normal` rooms are readable: the error room is not a joined room as far as the tool
 is concerned. The room list and this rule are seeded once per session in the agent's
 prompt, so the agent knows it must look rather than assume silence means an empty room.

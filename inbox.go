@@ -48,7 +48,7 @@ import (
 // survived for days and was re-delivered — and announced to the owner — on every
 // restart, so agents "caught up" on stale messages that were not new at all.
 //
-// Messages that never become a prompt (buffered ambient chatter, a bridge
+// Messages that never become a prompt (an unaddressed room message, a bridge
 // command, a dropped own-echo) are dropped outright (drop): no run will ever
 // settle for them, so leaving them pending would strand them the same way.
 //
@@ -80,6 +80,9 @@ type inboxEntry struct {
 	RealJID   string `json:"realJID,omitempty"`
 	FromOwner bool   `json:"fromOwner,omitempty"`
 	Direct    bool   `json:"direct,omitempty"`
+	// Addressed is the verdict of the room-address check that gated this append
+	// (see InboundMessage.Addressed): re-delivery must not have to re-derive it.
+	Addressed bool `json:"addressed,omitempty"`
 	// ReplyToID is the XEP-0461 stamp of the message this one answers, so a
 	// re-delivered reply still names its target (#95).
 	ReplyToID string    `json:"replyToID,omitempty"`
@@ -103,6 +106,7 @@ func (e inboxEntry) message() InboundMessage {
 		FromOwner: e.FromOwner,
 		Direct:    e.Direct,
 		ReplyToID: e.ReplyToID,
+		Addressed: e.Addressed,
 		Room:      e.Room,
 		ID:        e.ID,
 		From:      e.From,
@@ -211,11 +215,11 @@ func (in *inbox) markDelivered(id, from, body string, at time.Time) int {
 	return n
 }
 
-// drop removes entries for a message that never became a prompt — buffered
-// ambient chatter, a bridge command handled in-process, a dropped own-echo. No
-// run will ever settle for these, so they must not wait for an ack: before issue
-// #104 they stayed pending and were re-delivered as "unacknowledged" on every
-// restart.
+// drop removes entries for a message that never became a prompt — an
+// unaddressed room message, a bridge command handled in-process, a dropped
+// own-echo. No run will settle for such an entry, so it must not wait for an
+// ack: before issue #104 they stayed pending and were re-delivered as
+// "unacknowledged" on every restart.
 func (in *inbox) drop(id, from, body string) int {
 	in.mu.Lock()
 	defer in.mu.Unlock()

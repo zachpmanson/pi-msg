@@ -106,7 +106,7 @@ func TestClassify(t *testing.T) {
 		{InboundMessage{Body: "pi: do it", Nick: "zach", FromOwner: true}, actionCanonical, "do it"},
 	}
 	for _, c := range cases {
-		action, body := b.classify(c.m)
+		action, body, _ := b.classify(c.m)
 		if action != c.action || body != c.body {
 			t.Errorf("classify(%+v) = (%d,%q), want (%d,%q)", c.m, action, body, c.action, c.body)
 		}
@@ -123,19 +123,19 @@ func TestClassifyReplyToOwnMessage(t *testing.T) {
 
 	// Not ours (nobody's, or someone else's): still dropped.
 	m := InboundMessage{Body: "and another thing", Nick: "alice", Room: "team@muc.x.com", ReplyToID: "someone-elses-id"}
-	if action, _ := b.classify(m); action != actionNotOurs {
+	if action, _, _ := b.classify(m); action != actionNotOurs {
 		t.Errorf("reply to an unknown/foreign stanza = %d, want actionNotOurs", action)
 	}
 
 	// Ours: addressed.
 	b.xmpp.recordSelfMessage("our-stanza-id", "team@muc.x.com", "the earlier thing")
 	m.ReplyToID = "our-stanza-id"
-	if action, _ := b.classify(m); action != actionCommentary {
+	if action, _, _ := b.classify(m); action != actionCommentary {
 		t.Errorf("reply to our own stanza = %d, want actionCommentary", action)
 	}
 	// The owner replying to our stanza stays canonical.
 	m.FromOwner = true
-	if action, _ := b.classify(m); action != actionCanonical {
+	if action, _, _ := b.classify(m); action != actionCanonical {
 		t.Errorf("owner reply to our own stanza = %d, want actionCanonical", action)
 	}
 }
@@ -659,8 +659,11 @@ func TestReadRoomRelayRejectsUnjoinedRoom(t *testing.T) {
 
 func TestFormatRoomRead(t *testing.T) {
 	got := formatRoomRead("team@muc.x", nil, 30, true)
-	if !strings.Contains(got, "no archived messages") {
-		t.Errorf("empty archive should say so: %q", got)
+	// The extension rejects any result without this prefix, so an empty archive
+	// (a successful read of nothing) must still carry it — otherwise a working
+	// read is reported to the model as a failed tool call.
+	if !strings.HasPrefix(got, "[pi-msg: read_room:") || !strings.Contains(got, "no archived messages") {
+		t.Errorf("an empty archive must carry the header and say so: %q", got)
 	}
 
 	stamp := time.Now().Add(-3 * time.Minute)
@@ -682,13 +685,89 @@ func TestFormatRoomRead(t *testing.T) {
 	if !strings.Contains(got, "[in reply to abc123]") {
 		t.Errorf("XEP-0461 stamp not surfaced: %q", got)
 	}
-	if strings.Contains(got, "truncated") {
-		t.Errorf("a complete window should not claim truncation: %q", got)
+	if strings.Contains(got, "older history") {
+		t.Errorf("a complete window should not claim older history: %q", got)
 	}
 
-	// A full page or an incomplete result set must warn about the window.
+	// An incomplete result set means the server has more behind this page.
 	got = formatRoomRead("team@muc.x", msgs, 3, false)
-	if !strings.Contains(got, "truncated") {
+	if !strings.Contains(got, "older history exists") {
 		t.Errorf("an incomplete window should warn: %q", got)
+	}
+}
+
+// A message classified as addressed keeps that verdict through the durable
+// queue. Re-deriving it after a restart cannot work for an anchored reply — the
+// stanza history that proved the target was ours is gone — so a re-delivered
+// message would be dropped as "not ours" and removed permanently (#106 review).
+func TestRedeliveredAddressedMessageKeepsItsVerdict(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	b := newTestBridge(acct)
+	var buf bytes.Buffer
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.inbox = newInbox(t.TempDir()+"/acct.inbox.jsonl", nil)
+	// Fresh process: nothing is in the stanza history, so the reply target is
+	// unresolvable now — exactly the situation after a restart.
+	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, b.log)
+
+	b.deliverInbox(inboxEntry{
+		ID: "r1", Room: "team@muc.x", Nick: "peppy", From: "team@muc.x/peppy",
+		Body: "and another thing", ReplyToID: "a-stanza-we-sent-before-the-restart",
+		Addressed: true,
+	})
+	if !strings.Contains(buf.String(), "and another thing") {
+		t.Errorf("a message addressed on arrival was not prompted after re-delivery: %q", buf.String())
+	}
+
+	// Without the recorded verdict the same entry is dropped: the behaviour the
+	// flag exists to prevent.
+	var buf2 bytes.Buffer
+	b2 := newTestBridge(acct)
+	b2.rpc = &RPCClient{stdin: &nopClose{buf: &buf2}, mu: sync.Mutex{}}
+	b2.inbox = newInbox(t.TempDir()+"/acct.inbox.jsonl", nil)
+	b2.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, b2.log)
+	b2.deliverInbox(inboxEntry{
+		ID: "r2", Room: "team@muc.x", Nick: "peppy", From: "team@muc.x/peppy",
+		Body: "and another thing", ReplyToID: "a-stanza-we-sent-before-the-restart",
+	})
+	if strings.Contains(buf2.String(), "and another thing") {
+		t.Errorf("an unclassified reply to an unknown stanza should not prompt: %q", buf2.String())
+	}
+}
+
+// The bare-mention counter: bareMention isolates the case where a bare name is
+// the ONLY reason a message addresses us, so the false-positive rate the
+// bare-name rule trades for can be measured from the log (#106).
+func TestBareMentionCounter(t *testing.T) {
+	b := roomBridge() // trigger "pi"
+
+	if got := b.bareMention("team@muc.x.com", "ask pi for the path"); got != "pi" {
+		t.Errorf("bareMention = %q, want pi", got)
+	}
+	// Explicit addresses are not false positives.
+	for _, body := range []string{"pi: do it", "pi, go", "@pi do it", "@everyone report", "unrelated chatter", "the pilot flew"} {
+		if got := b.bareMention("team@muc.x.com", body); got != "" {
+			t.Errorf("bareMention(%q) = %q, want empty", body, got)
+		}
+	}
+	// A bare mention still counts when the trigger is only part of the reason we
+	// are addressed... it is not: a broadcast or a handle elsewhere means this is
+	// not a bare-mention case, and the counter must not inflate.
+	if got := b.bareMention("team@muc.x.com", "@everyone ask pi about the path"); got != "" {
+		t.Errorf("bareMention with a broadcast = %q, want empty", got)
+	}
+}
+
+// The seeded routing contract must state the new rule. It is the only place the
+// false-positive cost of bare mentions is disclosed to the agents living with
+// it, and the old wording said the opposite (#106).
+func TestRoutingContractStatesBareMentions(t *testing.T) {
+	b := roomBridge()
+	got := b.routingContract()
+	if strings.Contains(got, "a name without @ does not reach") {
+		t.Errorf("routing contract still denies bare mentions: %q", got)
+	}
+	if !strings.Contains(got, "a name without @ also reaches it") {
+		t.Errorf("routing contract does not state the bare-mention rule: %q", got)
 	}
 }

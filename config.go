@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,8 +41,10 @@ type roomSpec struct {
 	// Role is "error" for the write-only error room, or empty for a normal room.
 	// At most one entry may be the error room (see ErrorRoom).
 	Role string `json:"role,omitempty"`
-	// Trigger overrides the account-level roomTrigger for this room.
-	Trigger string `json:"trigger,omitempty"`
+	// Trigger overrides the account-level roomTrigger for this room. A pointer so
+	// that an explicit empty string is distinguishable from an absent key (and
+	// rejected: see resolveRooms).
+	Trigger *string `json:"trigger,omitempty"`
 	// Reactions overrides the account-level roomReactions for this room. Only
 	// present when set, so an explicit false is distinguishable from unset.
 	Reactions *bool `json:"reactions,omitempty"`
@@ -54,6 +57,12 @@ const (
 )
 
 func (r *roomList) UnmarshalJSON(b []byte) error {
+	// An explicit null must not resolve to "no rooms": that is exactly the silent
+	// failure this strict parser exists to prevent — an MUC account sitting
+	// outside its room, with the config looking deliberately empty (#106 review).
+	if string(bytes.TrimSpace(b)) == "null" {
+		return errors.New("\"rooms\" must be an array of objects, not null — remove the key entirely for a 1:1 account, or list the rooms to join")
+	}
 	var raw []json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return fmt.Errorf("\"rooms\" must be an array of objects, e.g. [{\"jid\": \"team@muc.example.com\"}]")
@@ -578,7 +587,7 @@ func loadConfig(path string) (*Config, error) {
 	}
 	var cfg Config
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("pi-msg: config at %s is not valid JSON: %w", path, err)
+		return nil, fmt.Errorf("pi-msg: config at %s is invalid: %w", path, err)
 	}
 	if cfg.Accounts == nil {
 		return nil, fmt.Errorf("pi-msg: config at %s must have an \"accounts\" object", path)
@@ -737,8 +746,18 @@ func resolveRooms(acct Account) (rooms []string, specs []RoomSpec, errorRoom str
 		seen[jid] = true
 		switch spec.Role {
 		case roomRoleNormal, "normal":
+			if spec.Trigger != nil && strings.TrimSpace(*spec.Trigger) == "" {
+				// An empty trigger would leave the room with no way to address the
+				// agent but the owner and broadcasts — almost certainly a mistake, and
+				// silent if inherited, so say so. Omit the key to inherit the account
+				// trigger instead.
+				return nil, nil, "", fmt.Errorf("rooms[%d]: \"trigger\" is empty; omit it to inherit the account trigger, or give the word that addresses this agent in %q", i, jid)
+			}
 			rooms = append(rooms, jid)
-			rs := RoomSpec{JID: jid, Trigger: strings.TrimSpace(spec.Trigger)}
+			rs := RoomSpec{JID: jid}
+			if spec.Trigger != nil {
+				rs.Trigger = strings.TrimSpace(*spec.Trigger)
+			}
 			if spec.Reactions != nil {
 				rs.Reactions, rs.reactionsSet = *spec.Reactions, true
 			}
