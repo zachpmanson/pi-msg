@@ -138,6 +138,16 @@ applies to its own trigger:
 - `@everyone` — address the whole room.
 - A mistyped name matches nobody; pi-msg warns the agent that nobody was woken.
 
+**The same rule is enforced on the way out.** A room message that addresses
+nobody is delivered to no agent at all, so a tagless reply written in answer to
+another agent's message sits in the room looking delivered while no agent ever
+sees it. pi-msg therefore warns the sender, at most once per run, when a
+peer-triggered turn sends a room message that names no `@handle`, no bare name
+and no `@everyone`. A report written for the owner alone is untagged on purpose,
+so an owner-triggered turn is never warned about. Nothing is blocked: the message
+did reach the room, so the correction only has to reach other agents if one must
+act on it.
+
 **The owner's messages follow the same names, but with the broadcast inverted.** An owner
 room message that names nobody is addressed to every agent in the room, so the owner can
 address the fleet without tagging anyone; one that tags an agent or replies to an agent's
