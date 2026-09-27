@@ -144,6 +144,15 @@ type Bridge struct {
 	// handleWarnedRun bounds the unknown-@handle warning to one per run, so a
 	// stubbornly-misspelling agent can't be nudged in a loop.
 	handleWarnedRun bool
+
+	// untaggedWarnedRun bounds the "addressed nobody" warning to one per run,
+	// for the same reason: a nudge that can repeat is a nudge that can loop.
+	untaggedWarnedRun bool
+	// peerRun records that the run being answered was opened by ANOTHER agent's
+	// addressed message, not by the owner. Only a peer handoff expects a tag, so
+	// only a peer handoff is warned about an untagged room reply — a status
+	// report written for the owner alone is not a mistake.
+	peerRun bool
 }
 
 // cascadeCap bounds consecutive commentary-triggered turns with no intervening
@@ -450,6 +459,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setStreaming(true)
 		b.setReplied(false)
 		b.setHandleWarned(false)
+		b.setUntaggedWarned(false)
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
 		b.resetTailTracking() // fresh run: no message seen, no tool since delivery
 		b.clearRunActivity()
@@ -946,9 +956,9 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	// Idle: wake the agent so the ack is readable now. It may acknowledge, act,
 	// or reply "to: noop" — no owner message required (issue #27).
 	if m.Direct {
-		b.setTurnDest(b.acct.Owner)
+		b.setTurnDest(b.acct.Owner, false)
 	} else {
-		b.setTurnDest(m.Room)
+		b.setTurnDest(m.Room, false) // a reaction ack is not a handoff
 	}
 	b.reactionAckRun = true
 	b.rpc.Prompt(
@@ -1223,7 +1233,7 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 	// and remember where a reply (or tool-driven file) should go by default.
 	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
-	b.setTurnDest(origin)
+	b.setTurnDest(origin, false) // the owner wrote it, so no tag is expected
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
 	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo, replyTo), b.steerBehavior())
 	b.busyPresence("thinking…")
@@ -1240,7 +1250,7 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 	}
 	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
-	b.setTurnDest(origin)
+	b.setTurnDest(origin, true) // a peer's handoff: an untagged reply here is the mistake
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
 	b.rpc.Prompt(b.composePrompt(t, false, nick, origin, sender, reactID, reactTo, replyTo), b.steerBehavior())
 	b.busyPresence("thinking…")
@@ -2139,6 +2149,28 @@ func (b *Bridge) unknownHandles(room, body string) (unknown, valid []string) {
 	return unknown, valid
 }
 
+// mentionsIn returns the "@handle" names appearing in body, in order, with the
+// "@" sigil dropped. A trailing "." or "@" disqualifies one: "@foo.bar" and
+// "@foo@bar" are domains and JID fragments, not mentions.
+//
+// The scan runs on stripUnquoted(body) — a fenced block, a quoted line or an
+// inline `code` span addresses nobody — and the names are sliced from THAT
+// string, never from body. Stripping shortens the text, so indices taken from
+// the scan and applied to body slice the wrong characters: a mention written
+// after a code span came back as a garbled name that matched no occupant, and
+// the sender was warned about a handle it never typed.
+func mentionsIn(body string) []string {
+	scan := stripUnquoted(body)
+	var names []string
+	for _, m := range handleRe.FindAllStringSubmatchIndex(scan, -1) {
+		if m[3] < len(scan) && (scan[m[3]] == '.' || scan[m[3]] == '@') {
+			continue
+		}
+		names = append(names, scan[m[2]:m[3]])
+	}
+	return names
+}
+
 // handleIssues inspects the "@name" mentions in body for the two ways a mention
 // can silently reach nobody: a handle no occupant answers to, and a mention of
 // our own handle. Tagging yourself is inert because the bridge drops our own
@@ -2179,12 +2211,7 @@ func (b *Bridge) handleIssues(room, body string) (unknown []string, selfTag stri
 	}
 	seen := map[string]struct{}{}
 	nth := 0
-	for _, m := range handleRe.FindAllStringSubmatchIndex(stripUnquoted(body), -1) {
-		name := body[m[2]:m[3]]
-		// "@foo.bar" / "@foo@bar" is a domain or JID fragment, not a mention.
-		if m[3] < len(body) && (body[m[3]] == '.' || body[m[3]] == '@') {
-			continue
-		}
+	for _, name := range mentionsIn(body) {
 		nth++
 		if me != "" && strings.EqualFold(name, me) {
 			// Only the FIRST mention in a message is treated as an attempted
@@ -2279,6 +2306,111 @@ func (b *Bridge) handleWarned() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.handleWarnedRun
+}
+
+// addressesRoom reports whether an outbound room body addresses at least one
+// other participant — an "@handle" (a real one, or @everyone and its friends)
+// or a bare name (#106). It is the only question that matters for an outbound
+// room message, because pi-msg drops an unaddressed one at dispatch: it is
+// delivered to no agent at all, and the owner is the only reader it ever gets.
+//
+// An unknown or self handle does NOT count as addressing anyone — such a message
+// needs the same correction as one with no mention at all, and it already has
+// its own, more specific warning (warnHandleProblems).
+//
+// An empty roster returns true, i.e. never warn. With no occupant map a bare
+// name cannot be told from ordinary prose, and a wrong warning is worse than
+// none — the rule handleIssues already follows.
+func (b *Bridge) addressesRoom(room, body string) bool {
+	if b.xmpp == nil || room == "" {
+		return true
+	}
+	occupants := b.xmpp.OccupantNicks(room)
+	if len(occupants) == 0 {
+		return true
+	}
+	scan := stripUnquoted(body)
+	if strings.TrimSpace(scan) == "" {
+		// Everything was quoted, fenced or inline code: it addresses nobody.
+		return false
+	}
+	me := b.xmpp.ownNick(room)
+	if me == "" {
+		me = b.acct.Nick
+	}
+	// Handles answer "@x" mentions; bare answers a plain name. They differ by
+	// the broadcast words: "@everyone" is an address, but the bare word
+	// "everyone" — "that's all from me", "we're all here" — is ordinary prose
+	// and must not read as one.
+	handles := map[string]struct{}{}
+	bare := map[string]struct{}{}
+	for _, n := range occupants {
+		if me != "" && strings.EqualFold(n, me) {
+			continue // our own nick is never an address we can use
+		}
+		handles[strings.ToLower(n)] = struct{}{}
+		bare[strings.ToLower(n)] = struct{}{}
+	}
+	if i := strings.IndexByte(b.acct.Owner, '@'); i > 0 {
+		handles[strings.ToLower(b.acct.Owner[:i])] = struct{}{}
+		bare[strings.ToLower(b.acct.Owner[:i])] = struct{}{}
+	}
+	for _, h := range broadcastHandles {
+		handles[h] = struct{}{}
+	}
+	for _, name := range mentionsIn(body) {
+		if _, ok := handles[strings.ToLower(name)]; ok {
+			return true
+		}
+	}
+	for name := range bare {
+		if containsMention(scan, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// untaggedRoomNotice is the wording of the untagged-reply warning. Split out so
+// the text can be asserted without an rpc client, like cascadeStopNotice.
+func untaggedRoomNotice(addressable []string) string {
+	var sb strings.Builder
+	sb.WriteString("[pi-msg: routing: your last message to the room tagged nobody — it named no @handle and no agent by name, so pi-msg delivered it to no agent at all. It sits in the room for the owner, who reads the untagged traffic, and for nobody else.")
+	if len(addressable) > 0 {
+		fmt.Fprintf(&sb, " The handles that work here right now are: @%s — or @everyone to address the whole room.", strings.Join(addressable, ", @"))
+	} else {
+		sb.WriteString(" No other handle is addressable in this room right now.")
+	}
+	// Deliberately NOT offering "to: noop": the same lesson as
+	// warnHandleProblems — a fleet trained to prefer silence takes the cheap
+	// out, and this message has already been delivered to the room.
+	sb.WriteString(" If anyone needs to act on it, resend naming them.]")
+	return sb.String()
+}
+
+// warnUntaggedRoomReply warns an agent, at most once per run, that its room
+// reply addressed nobody. It is the outbound half of the addressing rules
+// (#106/#109): an unaddressed room message is delivered to no agent at all, so
+// the one failure mode that cannot be seen from inside — the message appears in
+// the room, the sender believes the handoff landed — is exactly this one.
+//
+// Gated on a peer-triggered run: a report written for the owner alone is
+// untagged on purpose, and warning about it every run would teach agents that
+// tagging is always required, which is not the rule. Non-blocking either way —
+// the message did reach the room.
+func (b *Bridge) warnUntaggedRoomReply(room, body string) {
+	if !b.peerTriggered() || b.untaggedWarned() {
+		return
+	}
+	if b.addressesRoom(room, body) {
+		return
+	}
+	b.setUntaggedWarned(true)
+	_, _, valid := b.handleIssues(room, body)
+	b.log("warning", fmt.Sprintf("room reply in %s addressed nobody; addressable: %v", room, valid))
+	if b.rpc != nil {
+		b.rpc.Prompt(untaggedRoomNotice(valid), b.steerBehavior())
+	}
 }
 
 // ambient buffer removed (#106): unaddressed room messages are dropped at
@@ -2384,6 +2516,10 @@ func (b *Bridge) deliverReply(text string) bool {
 				// nobody and reports nothing, so the sender believes the
 				// handoff landed.
 				b.warnHandleProblems(bareJid(s.dest), s.body)
+				// A message with NO mention is inert in the same way, and is the
+				// more common slip: it reads as a reply in the room while no
+				// agent is delivered it at all.
+				b.warnUntaggedRoomReply(bareJid(s.dest), s.body)
 			} else {
 				stanzaID = b.xmpp.SendChatReply(s.dest, s.body, reply)
 			}
@@ -3706,10 +3842,36 @@ func (b *Bridge) setLifecycleReactTarget(to, id string) {
 // setTurnDest records the reply destination for the current turn (the owner in
 // 1:1, or the room in room mode), used as the default target for a tool-driven
 // file send when the agent doesn't name one.
-func (b *Bridge) setTurnDest(dest string) {
+// setTurnDest records the reply destination for the current turn and whether
+// that turn was opened by another agent (peer). Taking both here rather than
+// adding a second setter is deliberate: every path that names a destination has
+// to declare who opened the run, so the untagged-reply warning cannot inherit a
+// stale peer flag from the previous turn.
+func (b *Bridge) setTurnDest(dest string, peer bool) {
 	b.mu.Lock()
 	b.turnDest = dest
+	b.peerRun = peer
 	b.mu.Unlock()
+}
+
+// peerTriggered reports whether the current run was opened by another agent's
+// addressed message.
+func (b *Bridge) peerTriggered() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.peerRun
+}
+
+func (b *Bridge) setUntaggedWarned(v bool) {
+	b.mu.Lock()
+	b.untaggedWarnedRun = v
+	b.mu.Unlock()
+}
+
+func (b *Bridge) untaggedWarned() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.untaggedWarnedRun
 }
 
 func (b *Bridge) currentTurnDest() string {
@@ -3839,7 +4001,7 @@ func (b *Bridge) fireHeartbeat(text string) {
 		return
 	}
 	b.heartbeatRun = true
-	b.setTurnDest(b.acct.Owner)
+	b.setTurnDest(b.acct.Owner, false)
 	b.rpc.Prompt(text, b.steerBehavior())
 	b.xmpp.SetPresence("dnd", "thinking…")
 	b.log("info", "process heartbeat injected")
@@ -3865,7 +4027,7 @@ func (b *Bridge) flushPendingHeartbeats() {
 func (b *Bridge) fireResumeTurn() {
 	b.volunteered = true
 	b.setLifecycleReactTarget("", "")
-	b.setTurnDest(b.acct.Owner)
+	b.setTurnDest(b.acct.Owner, false)
 	b.rpc.Prompt(
 		"[pi-msg: startup: your session was resumed (continued from a previous process). "+
 			"You may volunteer to continue the conversation or task from the previous session. "+
@@ -3882,7 +4044,7 @@ func (b *Bridge) fireResumeTurn() {
 // the reply routes to the owner, mirroring fireResumeTurn.
 func (b *Bridge) fireInitialPrompt() {
 	b.setLifecycleReactTarget("", "")
-	b.setTurnDest(b.acct.Owner)
+	b.setTurnDest(b.acct.Owner, false)
 	b.rpc.Prompt(b.composePrompt(b.initialPrompt, true, "", b.acct.Owner, "", "", "", ""), b.steerBehavior())
 	b.xmpp.SetPresence("dnd", "thinking…")
 }
