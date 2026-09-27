@@ -17,10 +17,12 @@
 //
 // Which tools are registered is chosen by pi-msg via the PI_MSG_TOOLS env var
 // (comma-separated); this mirrors the account's config (e.g. send_reaction is
-// gated on the `reactions` opt-in). This is the "structured tool call instead
+// gated on the `reactions` opt-in, read_room on the account having joined a
+// room). This is the "structured tool call instead
 // of in-band text" path from issue #8 / docs/subagents.md. Routing (`to:`)
 // intentionally stays prompt-injected; only discrete side-effect actions move
-// to tools.
+// to tools — read_room is the one read-side tool, and with no ambient buffer
+// (#106) it is how an agent inspects a room it was not addressed in.
 //
 // Types are erased by jiti at load time, so the `import type` never resolves at
 // runtime; only the value import (`typebox`) is resolved, against Pi's own deps.
@@ -353,7 +355,7 @@ ${systemPrompt}`;
 	// Unset (e.g. running the extension standalone) enables both.
 	const raw = process.env.PI_MSG_TOOLS;
 	const enabled =
-		raw === undefined ? new Set(["file", "reaction"]) : new Set(raw.split(",").map((s) => s.trim()));
+		raw === undefined ? new Set(["file", "reaction", "room"]) : new Set(raw.split(",").map((s) => s.trim()));
 
 	// relay hands an action to pi-msg and blocks for its string result: "ok" on
 	// success, or a failure reason that becomes the tool error the model sees.
@@ -400,6 +402,42 @@ ${systemPrompt}`;
 				return {
 					content: [{ type: "text", text: `Reacted with ${emoji}.` }],
 					details: { emoji, ...(p.messageId ? { messageId: p.messageId } : {}) },
+				};
+			},
+		});
+	}
+
+	if (enabled.has("room")) {
+		pi.registerTool({
+			name: "read_room",
+			label: "Read room history (XMPP)",
+			description:
+				"Read the most recent messages from a group chat this bridge has joined, via the server's XEP-0313 archive (the last page, so a short result means the archive has no more history). The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns the newest N messages (default 30, max 100), oldest first, with sender, age and stanza ID. Reading does not reply to anything.",
+			promptSnippet: "Read recent history from a joined group chat",
+			promptGuidelines: [
+				"Use read_room when you need the wider room conversation — a handoff you were not named in, or context behind a message that addressed you.",
+				"Omit `room` when the account joins a single room; pass it when it joins several.",
+				"read_room only reads. Send anything you want to say with a normal reply (a `to: <room jid>` line).",
+			],
+			parameters: Type.Object({
+				room: Type.Optional(Type.String({ description: "Room JID to read; defaults to the only joined room when the account joins one" })),
+				limit: Type.Optional(Type.Number({ description: "How many recent messages to fetch (default 30, max 100)" })),
+			}),
+			async execute(_toolCallId, params) {
+				const p = params as { room?: string; limit?: number };
+				const args: Record<string, unknown> = { room: p.room ?? "" };
+				if (typeof p.limit === "number" && Number.isFinite(p.limit)) {
+					args.limit = Math.trunc(p.limit);
+				}
+				const result = await relay("read_room", args);
+				// A successful read always starts with the pi-msg header; anything else
+				// is the failure reason, which must reach the model as the tool error.
+				if (!result.startsWith("[pi-msg: read_room:")) {
+					throw new Error("read_room failed: " + result);
+				}
+				return {
+					content: [{ type: "text", text: result }],
+					details: { room: p.room ?? "", limit: args.limit },
 				};
 			},
 		});

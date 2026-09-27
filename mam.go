@@ -44,7 +44,8 @@ type mamFormField struct {
 }
 
 // mamQueryPayload is the XEP-0313 query: a data form selecting the archive
-// (optionally filtered by `with`) plus an RSM <set> capping the page size.
+// (optionally filtered by `with`) plus an RSM <set> capping the page size and
+// optionally selecting the last page.
 type mamQueryPayload struct {
 	XMLName xml.Name `xml:"urn:xmpp:mam:2 query"`
 	QueryID string   `xml:"queryid,attr"`
@@ -52,9 +53,16 @@ type mamQueryPayload struct {
 		Type  string         `xml:"type,attr"`
 		Field []mamFormField `xml:"field"`
 	} `xml:"jabber:x:data x"`
-	Set *struct {
-		Max int `xml:"max"`
-	} `xml:"http://jabber.org/protocol/rsm set,omitempty"`
+	Set *mamRSMSet `xml:"http://jabber.org/protocol/rsm set,omitempty"`
+}
+
+// mamRSMSet is the RSM element of a MAM query: a page size, and optionally the
+// empty <before/> that selects the LAST page of the result set (XEP-0313
+// §4.3.3). With no cursor at all the server returns the first page, which is the
+// opposite of what an on-demand read wants.
+type mamRSMSet struct {
+	Max    int       `xml:"max"`
+	Before *struct{} `xml:"before,omitempty"`
 }
 
 // mamCollector gathers the archived messages for one in-flight query. The
@@ -62,6 +70,12 @@ type mamQueryPayload struct {
 type mamCollector struct {
 	room string // bare room JID for a MUC-scoped query, "" for the owner 1:1
 	out  []InboundMessage
+	// record controls whether the fetched stanzas enter the stanza history.
+	// Backfill needs that (a later reply resolves through it); an on-demand read
+	// must not, because recording clears the "we sent this" flag on our own
+	// archived lines and can evict live ids that `to: <stanza-id>` routing
+	// depends on (#106 review).
+	record bool
 }
 
 // FetchMAM queries a XEP-0313 archive for messages at or after since and
@@ -76,12 +90,30 @@ type mamCollector struct {
 // precedes the IQ result), so by the time EncodeIQElement returns the collector
 // holds them all.
 func (b *XMPPBridge) FetchMAM(ctx context.Context, room, with string, since time.Time, max int) ([]InboundMessage, bool, error) {
+	return b.fetchMAM(ctx, room, with, since, max, false, true)
+}
+
+// FetchMAMLastPage queries the most recent `max` archived messages of a room —
+// the XEP-0313 last page (RSM <before/>, no start bound). This is what an
+// on-demand read wants: a query with no RSM cursor returns the archive's FIRST
+// page, so read_room would hand the agent the room's oldest messages while
+// claiming they were the latest (#106 review).
+//
+// Fetched stanzas are deliberately NOT recorded in the stanza history: a read
+// must not perturb routing state (see mamCollector.record).
+func (b *XMPPBridge) FetchMAMLastPage(ctx context.Context, room string, max int) ([]InboundMessage, bool, error) {
+	return b.fetchMAM(ctx, room, "", time.Time{}, max, true, false)
+}
+
+// fetchMAM is the shared XEP-0313 query. lastPage selects the final page via RSM
+// <before/>; record controls whether the fetched ids enter the stanza history.
+func (b *XMPPBridge) fetchMAM(ctx context.Context, room, with string, since time.Time, max int, lastPage, record bool) ([]InboundMessage, bool, error) {
 	session := b.currentSession()
 	if session == nil {
 		return nil, false, errors.New("not online")
 	}
 	qid := newStanzaID()
-	col := &mamCollector{room: room}
+	col := &mamCollector{room: room, record: record}
 	b.mamMu.Lock()
 	if b.mamPending == nil {
 		b.mamPending = make(map[string]*mamCollector)
@@ -94,7 +126,12 @@ func (b *XMPPBridge) FetchMAM(ctx context.Context, room, with string, since time
 		b.mamMu.Unlock()
 	}()
 
-	payload := newMAMQueryPayload(qid, with, since, max)
+	payload := newMAMQueryPayload(qid, with, since, max, lastPage)
+	if payload.Set == nil {
+		// The last-page cursor lives inside <set>; ask for a page even when the
+		// caller passed no max, so the request still means "the newest N".
+		payload.Set = &mamRSMSet{Max: mamPageMax, Before: &struct{}{}}
+	}
 
 	iq := stanza.IQ{ID: qid, Type: stanza.SetIQ}
 	if room != "" {
@@ -140,10 +177,11 @@ func (b *XMPPBridge) FetchMAM(ctx context.Context, room, with string, since time
 }
 
 // newMAMQueryPayload builds the XEP-0313 query. The time bound is a data-form
-// `start` field, NOT RSM: without it the query returns the account's whole
-// archive (newest page first), so a backfill would replay ancient history
-// instead of the offline window. RSM's <set> only caps the page size.
-func newMAMQueryPayload(qid, with string, since time.Time, max int) mamQueryPayload {
+// `start` field, NOT RSM: without it the query returns the whole archive from the
+// beginning, so a backfill would replay ancient history instead of the offline
+// window. RSM's <set> caps the page size, and (with Before set to an empty
+// element) selects the last page rather than the first.
+func newMAMQueryPayload(qid, with string, since time.Time, max int, lastPage bool) mamQueryPayload {
 	p := mamQueryPayload{QueryID: qid}
 	p.X.Type = "submit"
 	p.X.Field = []mamFormField{{Var: "FORM_TYPE", Value: mamNS}}
@@ -154,9 +192,11 @@ func newMAMQueryPayload(qid, with string, since time.Time, max int) mamQueryPayl
 		p.X.Field = append(p.X.Field, mamFormField{Var: "with", Value: with})
 	}
 	if max > 0 {
-		p.Set = &struct {
-			Max int `xml:"max"`
-		}{Max: max}
+		p.Set = &mamRSMSet{Max: max}
+		if lastPage {
+			// No cursor plus <before/> = the final page (XEP-0313 §4.3.3).
+			p.Set.Before = &struct{}{}
+		}
 	}
 	return p
 }
@@ -244,17 +284,35 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	}
 	from := attr(archStart.Attr, "from")
 	id := attr(archStart.Attr, "id")
-	if col.room == "" && bareJid(from) == bareJid(b.acct.JID) {
-		return // our own outbound, archived with the counterparty's stream
+	// Own-message detection comes BEFORE the history write: an archived copy of
+	// one of our own lines must be recorded as ours (so a peer's later
+	// unaddressed XEP-0461 reply to it still resolves), never as a plain inbound
+	// stanza that would clear that flag (#106 review).
+	ownLine := false
+	nick := ""
+	if col.room == "" {
+		ownLine = bareJid(from) == bareJid(b.acct.JID)
+	} else {
+		nick = resourcepart(from)
+		if self := b.ownNick(col.room); self != "" && strings.EqualFold(nick, self) {
+			ownLine = true
+		}
+	}
+	if id != "" && col.record {
+		if ownLine {
+			b.recordSelfMessage(id, from, body)
+		} else {
+			b.recordMessageBody(id, from, body)
+		}
+	}
+	if ownLine {
+		return // our own message, archived against the other side's stream
 	}
 	var stamp time.Time
 	if d, ok := element(toks, delayNS, "delay"); ok {
 		if t, err := time.Parse(time.RFC3339, attr(d.Attr, "stamp")); err == nil {
 			stamp = t
 		}
-	}
-	if id != "" {
-		b.recordMessageBody(id, from, body)
 	}
 	m := InboundMessage{Body: body, ID: id, From: from, Stamp: stamp}
 	// A recovered message can itself be a XEP-0461 reply; keep the stamp so the
@@ -264,10 +322,6 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 		m.ReplyToJID = attr(re.Attr, "to")
 	}
 	if col.room != "" {
-		nick := resourcepart(from)
-		if self := b.ownNick(col.room); self != "" && strings.EqualFold(nick, self) {
-			return // our own groupchat line: the archive stores it as room/our-nick
-		}
 		real := b.occupantRealJID(col.room, nick)
 		m.Room = col.room
 		m.Nick = nick

@@ -422,24 +422,29 @@ func TestReactionEmojis(t *testing.T) {
 }
 
 func TestInboundReactionAck(t *testing.T) {
-	// Path 1: a run is in flight → the ack is buffered to ambient, not a wake.
+	// Path 1: a run is in flight → the ack is dropped, not a wake. The ambient
+	// buffer that used to hold it was removed in #106, and an ack carries no
+	// obligation, so nothing may interrupt or queue behind the live run.
 	b := roomBridge() // room-mode, owner zach@x.com
 	b.setStreaming(true)
 	b.onInbound(InboundMessage{
 		Nick: "peppy", Room: "team@muc.x.com",
 		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "target-123",
 	})
-	amb := b.drainAmbient()
-	if !strings.Contains(amb, "peppy") || !strings.Contains(amb, "\U0001FAE1") || !strings.Contains(amb, "XEP-0444") {
-		t.Errorf("streaming ack not buffered as ambient: %q", amb)
-	}
 	if b.reactionAckRun {
 		t.Error("streaming path should not set reactionAckRun")
 	}
+	if b.currentTurnDest() != "" {
+		t.Errorf("a dropped ack must not set a turn destination, got %q", b.currentTurnDest())
+	}
 
 	// Path 2: idle → the ack wakes the agent (reactionAckRun set, turnDest = room).
+	// A room reaction only reaches us when it acks a message WE sent, so the
+	// target id has to be one of ours.
 	b2 := roomBridge()
 	b2.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
+	b2.xmpp = NewXMPPBridge(b2.acct, func(InboundMessage) {}, b2.log)
+	b2.xmpp.recordSelfMessage("target-123", "team@muc.x.com", "our message")
 	b2.onInbound(InboundMessage{
 		Nick: "peppy", Room: "team@muc.x.com",
 		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "target-123",
@@ -450,8 +455,23 @@ func TestInboundReactionAck(t *testing.T) {
 	if b2.currentTurnDest() != "team@muc.x.com" {
 		t.Errorf("idle room reaction turnDest = %q, want room", b2.currentTurnDest())
 	}
-	if got := b2.drainAmbient(); got != "" {
-		t.Errorf("idle reaction should not buffer ambient: %q", got)
+
+	// Path 3: idle, but the reaction acks somebody else's message → not ours, no
+	// turn. This is the last room path that could otherwise cost a turn for a
+	// message that does not address us (#106).
+	b4 := roomBridge()
+	b4.rpc = &RPCClient{}
+	b4.xmpp = NewXMPPBridge(b4.acct, func(InboundMessage) {}, b4.log)
+	b4.xmpp.recordSelfMessage("one-of-ours", "team@muc.x.com", "our message")
+	b4.onInbound(InboundMessage{
+		Nick: "peppy", Room: "team@muc.x.com",
+		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "someone-elses",
+	})
+	if b4.reactionAckRun {
+		t.Error("a reaction to another occupant's message must not wake us")
+	}
+	if b4.currentTurnDest() != "" {
+		t.Errorf("a dropped room reaction must not set a turn destination, got %q", b4.currentTurnDest())
 	}
 
 	// Owner reacting on 1:1 renders as "owner" and turns to the owner.
@@ -487,25 +507,25 @@ func TestIdleAwayClock(t *testing.T) {
 }
 
 // TestInboundRearmsIdleClock guards against the "busy-room bot never goes
-// away" regression: an inbound message that never becomes a run (ambient room
-// chatter, buffered with no prompt) previously left idleSince cleared by
-// markActive, and since agent_settled never fires for it, the idle watcher had
-// no way to ever drift the agent back to "away". onInbound must re-arm the
-// clock so a quiet stretch still produces an away transition.
+// away" regression: an inbound message that never becomes a run previously left
+// idleSince cleared by markActive, and since agent_settled never fires for it,
+// the idle watcher had no way to ever drift the agent back to "away". onInbound
+// must re-arm the clock so a quiet stretch still produces an away transition.
+// The reaction-ack path is the remaining case that reaches onInbound without
+// becoming a run (#106 dropped unaddressed room chatter entirely).
 func TestInboundRearmsIdleClock(t *testing.T) {
 	b := roomBridge()
 	b.idleSince = time.Time{} // e.g. just cleared by a prior markActive
 	b.awayAnnounced = false
 
-	// Ambient room message: not from the owner, not addressed to the bot →
-	// buffered, no run, no agent_settled.
+	// An unaddressed room message: dropped without a turn or a record.
 	b.onInbound(InboundMessage{
 		Nick: "falco", Room: "team@muc.x.com",
-		From: "falco@x.com/falco", Body: "some ambient chatter",
+		From: "falco@x.com/falco", Body: "some unrelated chatter",
 	})
 
 	if b.idleSince.IsZero() {
-		t.Fatal("ambient inbound should re-arm the idle clock; zero idleSince = can never go away")
+		t.Fatal("inbound should re-arm the idle clock; zero idleSince = can never go away")
 	}
 	if elapsed := time.Since(b.idleSince); elapsed > time.Second {
 		t.Errorf("idleSince should be restarted to ~now, got %v old", elapsed)

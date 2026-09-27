@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,23 +12,94 @@ import (
 	"time"
 )
 
-// roomList is the set of MUC JIDs from the "room" config field. It accepts
-// either a single JID string ("room": "a@muc…") or an array of JID strings
-// ("room": ["a@muc…", "b@muc…"]) so older single-room configs keep working.
-type roomList []string
+// roomList is the "rooms" config field: the MUC rooms to join, each with its
+// own addressing rules (issue #106). The format is an array of objects:
+//
+//	"rooms": [
+//	  {"jid": "team@muc.example.com"},
+//	  {"jid": "chatter@muc.example.com", "trigger": "pi"},
+//	  {"jid": "errors@muc.example.com", "role": "error"}
+//	]
+//
+// Only this form is accepted — the older single-JID string and array-of-strings
+// spellings are rejected at load time with the replacement spelling in the
+// message, because silently resolving them to no rooms would take a MUC account
+// out of its room without saying so.
+//
+// There is deliberately no buffering policy here. A room message either
+// addresses this agent (a turn) or it is not part of its world at all: the
+// ambient buffer was removed in #106, so there is nothing per-room left to
+// configure about it.
+type roomList []roomSpec
+
+// roomSpec is one entry of the "rooms" array, as written in the config file.
+// Keys are validated strictly: an unknown key is a load error rather than being
+// ignored, so a typo cannot silently disable a room's rules.
+type roomSpec struct {
+	// JID is the bare MUC JID to join.
+	JID string `json:"jid"`
+	// Role is "error" for the write-only error room, or empty for a normal room.
+	// At most one entry may be the error room (see ErrorRoom).
+	Role string `json:"role,omitempty"`
+	// Trigger overrides the account-level roomTrigger for this room. A pointer so
+	// that an explicit empty string is distinguishable from an absent key (and
+	// rejected: see resolveRooms).
+	Trigger *string `json:"trigger,omitempty"`
+	// Reactions overrides the account-level roomReactions for this room. Only
+	// present when set, so an explicit false is distinguishable from unset.
+	Reactions *bool `json:"reactions,omitempty"`
+}
+
+// roomRoles are the accepted values of roomSpec.Role.
+const (
+	roomRoleNormal = ""
+	roomRoleError  = "error"
+)
 
 func (r *roomList) UnmarshalJSON(b []byte) error {
-	var one string
-	if err := json.Unmarshal(b, &one); err == nil {
-		*r = roomList{one}
-		return nil
+	// An explicit null must not resolve to "no rooms": that is exactly the silent
+	// failure this strict parser exists to prevent — an MUC account sitting
+	// outside its room, with the config looking deliberately empty (#106 review).
+	if string(bytes.TrimSpace(b)) == "null" {
+		return errors.New("\"rooms\" must be an array of objects, not null — remove the key entirely for a 1:1 account, or list the rooms to join")
 	}
-	var many []string
-	if err := json.Unmarshal(b, &many); err != nil {
-		return fmt.Errorf("\"room\" must be a JID string or an array of JID strings")
+	var raw []json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return fmt.Errorf("\"rooms\" must be an array of objects, e.g. [{\"jid\": \"team@muc.example.com\"}]")
 	}
-	*r = many
+	out := make(roomList, 0, len(raw))
+	for i, entry := range raw {
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(entry, &keys); err != nil {
+			return fmt.Errorf("rooms[%d] must be an object, e.g. {\"jid\": \"team@muc.example.com\"}", i)
+		}
+		for k := range keys {
+			switch k {
+			case "jid", "role", "trigger", "reactions":
+			default:
+				return fmt.Errorf("rooms[%d]: unknown key %q (allowed: jid, role, trigger, reactions)", i, k)
+			}
+		}
+		var spec roomSpec
+		if err := json.Unmarshal(entry, &spec); err != nil {
+			return fmt.Errorf("rooms[%d]: %w", i, err)
+		}
+		out = append(out, spec)
+	}
+	*r = out
 	return nil
+}
+
+// RoomSpec is one resolved room: the JID plus the addressing rules actually in
+// force for it (account defaults already applied).
+type RoomSpec struct {
+	JID     string
+	Trigger string
+	// Reactions is the effective XEP-0444 setting for this room.
+	Reactions bool
+	// reactionsSet records that the room carried an explicit value, so the
+	// account default is applied only when it did not.
+	reactionsSet bool
 }
 
 // Account is one XMPP account the bridge can connect as, as stored in the
@@ -72,12 +144,16 @@ type Account struct {
 	// process cwd.
 	Workdir string `json:"workdir,omitempty"`
 
-	// Room, when set, additionally joins these bare MUC JIDs (e.g.
-	// "team@muc.chat.example.com") and relays group chat. Accepts a single JID
-	// string or an array of JID strings. The owner can still DM the bot 1:1 in
-	// either mode; each reply goes back to whichever channel the message arrived
-	// on.
-	Room roomList `json:"room,omitempty"`
+	// Rooms, when set, additionally joins these bare MUC JIDs (e.g.
+	// "team@muc.chat.example.com") and relays group chat. An array of objects,
+	// each {"jid": …, "trigger": …, "reactions": …, "role": "error"}. The owner
+	// can still DM the bot 1:1 in either mode; each reply goes back to whichever
+	// channel the message arrived on.
+	Rooms roomList `json:"rooms,omitempty"`
+	// Room is the retired singular "room" field, retained only so a config still
+	// using it fails with the replacement spelling instead of silently resolving
+	// to no rooms.
+	Room json.RawMessage `json:"room,omitempty"`
 	// Nick is the occupant nickname used in the rooms. Defaults to the JID
 	// localpart.
 	Nick string `json:"nick,omitempty"`
@@ -94,13 +170,10 @@ type Account struct {
 	// detect silent disconnects. A Go duration string ("60s", "2m"). Defaults
 	// to "60s"; "0" disables keepalive.
 	PingInterval string `json:"pingInterval,omitempty"`
-	// ErrorRoom, when set, is a bare MUC JID (e.g.
-	// "errors@muc.chat.example.com") used as a write-only dumping ground for
-	// dropped/unrouteable agent replies. The bridge joins it at the XMPP layer
-	// so it can send groupchat there, but it is deliberately NOT exposed to the
-	// agent (not a readable room, not in the reply/send allowlist), so the
-	// agents can't read each other's rejected output or act on it. If unset,
-	// unrouteable replies fall back to the owner's 1:1.
+	// ErrorRoom is the RETIRED singular spelling. It is parsed only so that
+	// resolveAccount can reject it by name: the error room is now a "rooms" entry
+	// with "role": "error", and quietly ignoring the old key would leave dropped
+	// agent replies with nowhere to go. A non-empty value here is a load error.
 	ErrorRoom string `json:"errorRoom,omitempty"`
 	// Avatar is a path to a local image (PNG/JPEG/GIF) published as the bot's
 	// XEP-0153 vCard avatar on connect. Optional; a missing/invalid file is a
@@ -150,7 +223,12 @@ type ResolvedAccount struct {
 	RoomReactions bool
 	Model         string
 	Workdir       string
-	Rooms         []string
+	// Rooms is the joined room JIDs (normal rooms only — the error room is not
+	// in here, and must never be). It is derived from RoomSpecs at resolve time.
+	Rooms []string
+	// RoomSpecs is the per-room addressing rules, in config order. A room absent
+	// from here falls back to the account-level values below.
+	RoomSpecs     []RoomSpec
 	Nick          string
 	RoomTrigger   string
 	UploadService string
@@ -167,6 +245,31 @@ type ResolvedAccount struct {
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
 func (a ResolvedAccount) RoomMode() bool { return len(a.Rooms) > 0 }
+
+// TriggerFor returns the address prefix in force in room, falling back to the
+// account-level trigger when the room carries no override (which includes the
+// error room and any account built directly in tests).
+func (a ResolvedAccount) TriggerFor(room string) string {
+	bare := bareJid(room)
+	for _, s := range a.RoomSpecs {
+		if bareJid(s.JID) == bare && s.Trigger != "" {
+			return s.Trigger
+		}
+	}
+	return a.RoomTrigger
+}
+
+// ReactionsFor returns whether XEP-0444 reactions are enabled in room, falling
+// back to the account-level setting.
+func (a ResolvedAccount) ReactionsFor(room string) bool {
+	bare := bareJid(room)
+	for _, s := range a.RoomSpecs {
+		if bareJid(s.JID) == bare {
+			return s.Reactions
+		}
+	}
+	return a.RoomReactions
+}
 
 const (
 	defaultAccount  = "default"
@@ -484,7 +587,7 @@ func loadConfig(path string) (*Config, error) {
 	}
 	var cfg Config
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("pi-msg: config at %s is not valid JSON: %w", path, err)
+		return nil, fmt.Errorf("pi-msg: config at %s is invalid: %w", path, err)
 	}
 	if cfg.Accounts == nil {
 		return nil, fmt.Errorf("pi-msg: config at %s must have an \"accounts\" object", path)
@@ -546,15 +649,19 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q is missing required field(s): %s", name, strings.Join(missing, ", "))
 	}
 
-	var rooms []string
-	seen := make(map[string]bool)
-	for _, rm := range acct.Room {
-		rm = strings.TrimSpace(rm)
-		if rm == "" || seen[rm] {
-			continue
-		}
-		seen[rm] = true
-		rooms = append(rooms, rm)
+	// The retired singular spellings are rejected explicitly rather than being
+	// ignored: with "rooms" absent, a config still using "room" would resolve to
+	// no rooms at all — a MUC account silently sitting outside its room.
+	if len(acct.Room) > 0 {
+		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q: \"room\" was replaced by \"rooms\", an array of objects — use \"rooms\": [{\"jid\": %s}]", name, string(acct.Room))
+	}
+	if len(acct.ErrorRoom) > 0 {
+		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q: \"errorRoom\" (%q) was replaced by a \"rooms\" entry with \"role\": \"error\" — use \"rooms\": [{\"jid\": %q, \"role\": \"error\"}]", name, acct.ErrorRoom, acct.ErrorRoom)
+	}
+
+	rooms, specs, errorRoom, err := resolveRooms(acct)
+	if err != nil {
+		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q: %w", name, err)
 	}
 
 	nick := acct.Nick
@@ -564,6 +671,17 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 	trigger := acct.RoomTrigger
 	if trigger == "" {
 		trigger = nick
+	}
+	// Apply the account defaults to each room's resolved rules, so callers only
+	// ever consult RoomSpecs. A room with no explicit "reactions" inherits the
+	// account-level flag; an explicit false stays false.
+	for i := range specs {
+		if specs[i].Trigger == "" {
+			specs[i].Trigger = trigger
+		}
+		if !specs[i].reactionsSet {
+			specs[i].Reactions = acct.RoomReactions
+		}
 	}
 	service := acct.Service
 	if service == "" {
@@ -595,6 +713,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		Model:         acct.Model,
 		Workdir:       acct.Workdir,
 		Rooms:         rooms,
+		RoomSpecs:     specs,
 		Nick:          nick,
 		RoomTrigger:   trigger,
 		UploadService: strings.TrimSpace(acct.UploadService),
@@ -603,10 +722,56 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		BeforeAgentStartText: strings.TrimSpace(acct.BeforeAgentStartText),
 		PingInterval:         pingInterval,
 		Avatar:               strings.TrimSpace(acct.Avatar),
-		ErrorRoom:            strings.TrimSpace(acct.ErrorRoom),
+		ErrorRoom:            errorRoom,
 		MinCreditUsd:         maxCreditUsd(acct.CreditWatch),
 		MAM:                  acct.MAM == nil || *acct.MAM,
 	}, nil
+}
+
+// resolveRooms turns the configured "rooms" entries into the joined room list
+// (normal rooms only), their resolved per-room rules, and the error room JID.
+// Validation is strict because each of these failures takes an account out of a
+// room it believes it is in: a missing jid, an unknown role, two error rooms, or
+// the same JID listed twice.
+func resolveRooms(acct Account) (rooms []string, specs []RoomSpec, errorRoom string, err error) {
+	seen := make(map[string]bool, len(acct.Rooms))
+	for i, spec := range acct.Rooms {
+		jid := strings.TrimSpace(spec.JID)
+		if jid == "" {
+			return nil, nil, "", fmt.Errorf("rooms[%d] has no \"jid\"", i)
+		}
+		if seen[jid] {
+			return nil, nil, "", fmt.Errorf("rooms[%d]: %q is listed twice", i, jid)
+		}
+		seen[jid] = true
+		switch spec.Role {
+		case roomRoleNormal, "normal":
+			if spec.Trigger != nil && strings.TrimSpace(*spec.Trigger) == "" {
+				// An empty trigger would leave the room with no way to address the
+				// agent but the owner and broadcasts — almost certainly a mistake, and
+				// silent if inherited, so say so. Omit the key to inherit the account
+				// trigger instead.
+				return nil, nil, "", fmt.Errorf("rooms[%d]: \"trigger\" is empty; omit it to inherit the account trigger, or give the word that addresses this agent in %q", i, jid)
+			}
+			rooms = append(rooms, jid)
+			rs := RoomSpec{JID: jid}
+			if spec.Trigger != nil {
+				rs.Trigger = strings.TrimSpace(*spec.Trigger)
+			}
+			if spec.Reactions != nil {
+				rs.Reactions, rs.reactionsSet = *spec.Reactions, true
+			}
+			specs = append(specs, rs)
+		case roomRoleError:
+			if errorRoom != "" {
+				return nil, nil, "", fmt.Errorf("rooms[%d]: %q is a second error room; at most one entry may have \"role\": \"error\"", i, jid)
+			}
+			errorRoom = jid
+		default:
+			return nil, nil, "", fmt.Errorf("rooms[%d]: unknown role %q (allowed: \"normal\", \"error\")", i, spec.Role)
+		}
+	}
+	return rooms, specs, errorRoom, nil
 }
 
 // maxCreditUsd extracts the remaining-credit floor from a CreditWatch config

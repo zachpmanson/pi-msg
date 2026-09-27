@@ -291,8 +291,9 @@ func TestInboxKeepsAnUnreadLivePrompt(t *testing.T) {
 	}
 }
 
-// Untriggered room chatter is buffered as context and never becomes a prompt, so
-// it must not be left waiting for a settle that will not come (#104).
+// Untriggered room chatter never becomes a prompt and is not part of the
+// agent's world at all (#106), so it must not be queued and must not be held
+// anywhere else either.
 func TestAmbientRoomChatterIsNotQueued(t *testing.T) {
 	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
 	b := newTestBridge(acct)
@@ -302,10 +303,7 @@ func TestAmbientRoomChatterIsNotQueued(t *testing.T) {
 
 	b.onInbound(InboundMessage{ID: "r1", Room: "team@muc.x", Nick: "slippy", From: "team@muc.x/slippy", Body: "roster shows peppy"})
 	if n := b.inbox.len(); n != 0 {
-		t.Errorf("ambient remark left %d entries in the durable queue, want 0", n)
-	}
-	if !strings.Contains(b.drainAmbient(), "roster shows peppy") {
-		t.Errorf("the remark was dropped instead of buffered as context")
+		t.Errorf("unaddressed remark left %d entries in the durable queue, want 0", n)
 	}
 	// An addressed message still queues: it becomes a prompt, so a settle can ack it.
 	b.onInbound(InboundMessage{ID: "r2", Room: "team@muc.x", Nick: "zach", From: "team@muc.x/zach", Body: "pi: do it", FromOwner: true})
@@ -322,8 +320,9 @@ func TestAmbientRoomChatterIsNotQueued(t *testing.T) {
 	}
 }
 
-// A room message re-delivered from the inbox is classified again, so an
-// untriggered remark cannot become a prompt just because it was recovered.
+// A room message re-delivered from the inbox is classified again, so a message
+// that no longer addresses anyone cannot become a prompt just because it was
+// recovered — and it is dropped from the queue rather than parked (#104).
 func TestInboxRedeliveryRespectsRoomRules(t *testing.T) {
 	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
 	b := newTestBridge(acct)
@@ -331,13 +330,13 @@ func TestInboxRedeliveryRespectsRoomRules(t *testing.T) {
 	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
 	b.inbox = newInbox(t.TempDir()+"/acct.inbox.jsonl", nil)
 
-	// An ambient (untriggered, non-owner) remark: buffered as context, no turn.
-	b.deliverInbox(inboxEntry{ID: "r1", Room: "team@muc.x", Nick: "slippy", Body: "roster shows peppy and slippy"})
-	if strings.Contains(buf.String(), "roster shows peppy") {
-		t.Errorf("an untriggered room remark must not be prompted on re-delivery: %q", buf.String())
+	// An unaddressed (untriggered, non-owner) remark: no turn, and dropped.
+	b.deliverInbox(inboxEntry{ID: "r1", Room: "team@muc.x", Nick: "slippy", Body: "roster shows zephyr and quill"})
+	if strings.Contains(buf.String(), "roster shows zephyr") {
+		t.Errorf("an addressee-less room remark must not be prompted on re-delivery: %q", buf.String())
 	}
-	if !strings.Contains(b.drainAmbient(), "roster shows peppy") {
-		t.Errorf("it should be buffered as ambient context instead")
+	if n := b.inbox.len(); n != 0 {
+		t.Errorf("the remark was left in the queue: %d entries, want 0", n)
 	}
 
 	// Addressed: it prompts, and the trigger still matches with the note appended.

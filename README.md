@@ -142,13 +142,12 @@ Per-account fields:
 | `resource` | no | `pi-msg` | XMPP resource (client-session label) |
 | `model` | no | Pi's default | model pattern passed to `pi --model` |
 | `workdir` | no | current dir | working directory for the agent (also where Pi discovers `AGENTS.md`/`CLAUDE.md`) |
-| `room` | no | — | a bare MUC JID (or an **array** of them) to also join for **group chat** (see below) |
+| `rooms` | no | `[]` | rooms to also join for **group chat** — an **array of objects**, each `{ "jid": …, "role": …, "trigger": …, "reactions": … }` (see [Group chat](#group-chat-muc)). The retired singular `room` (string or array of strings) and `errorRoom` are rejected at load with the replacement spelling rather than silently resolving to no rooms |
 | `nick` | no | JID localpart | occupant nickname used in the room(s) |
-| `roomTrigger` | no | `nick` | address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`) |
+| `roomTrigger` | no | `nick` | account-wide address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`); override per room |
 | `uploadService` | no | auto-probed | XEP-0363 upload component JID for file transfer (e.g. `upload.chat.example.com`) |
-| `errorRoom` | no | — | write-only MUC dumping ground for dropped/unrouteable agent replies (see below) |
 | `pingInterval` | no | `60s` | keepalive cadence (Go duration): XEP-0199 server ping + XEP-0410 MUC self-ping; `0` disables |
-| `reactions` | no | `false` | XEP-0444 emoji reactions on 1:1 owner messages: lifecycle → 👀 picked up / ✅ done / ⛔ aborted, and enables the agent-driven `send_reaction` tool (see [Agent tools](#agent-tools)) |
+| `reactions` | no | `false` | XEP-0444 emoji reactions: with `rooms`, inbound acks to a room message wake the agent while idle (a mid-run ack is dropped); on 1:1 owner messages it enables lifecycle → 👀 picked up / ✅ done / ⛔ aborted, and enables the agent-driven `send_reaction` tool (see [Agent tools](#agent-tools)). Override per room |
 | `beforeAgentStartText` | no | — | literal text injected into the agent's system prompt on **every turn** (the companion extension's `before_agent_start`), after the identity line. Re-applied each turn, so a steer holds up in a long session instead of fading — the same property the equivalent Claude Code `UserPromptSubmit` hook relies on. Empty (or whitespace) means no injection; see [Per-turn prompt text](#per-turn-prompt-text-beforeagentstarttext) |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
 | `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic "done (no reply)". e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
@@ -248,14 +247,15 @@ the run that took them in has settled:
   (issues [#96](https://github.com/zachpmanson/pi-msg/issues/96),
   [#104](https://github.com/zachpmanson/pi-msg/issues/104)).
 - **Never queued** — a message that cannot become a prompt is dropped instead of
-  waiting for a settle that will never come: buffered ambient room chatter, a
-  bridge command handled in-process, a dropped own-echo, an empty body. These
-  used to sit in the file and be announced as unacknowledged catch-up on every
-  restart ([#104](https://github.com/zachpmanson/pi-msg/issues/104)).
+  waiting for a settle that will never come: an unaddressed room message (see
+  [Group chat](#group-chat-muc)), a bridge command handled in-process, a dropped
+  own-echo, an empty body. These used to sit in the file and be announced as
+  unacknowledged catch-up on every restart
+  ([#104](https://github.com/zachpmanson/pi-msg/issues/104)).
 - **Re-delivery at start** — anything still unacknowledged is handed to the
   resumed session with the rest of the catch-up, re-classified exactly as it was
-  the first time (a room remark that never triggered a turn is buffered as
-  context, not prompted), and marked with a note saying it may repeat something
+  the first time (a room message that no longer addresses the agent is dropped
+  rather than prompted), and marked with a note saying it may repeat something
   already in context.
 
 This is what makes a **steer survivable**. pi injects a steered message at the next
@@ -271,28 +271,99 @@ never settles is bounded at 500 entries.
 
 ## Group chat (MUC)
 
-Set `room` on an account (a single MUC JID, or an array of them) and pi-msg
-**also** joins each. **The owner's 1:1 stays the primary channel** — joining a
-room is purely additive and doesn't change 1:1 behaviour (lifecycle notices, and
-unsolicited output all still go to the owner). The **typing indicator** now tails
-the reply's `to:` routing line (issue #44): it points at whichever 1:1 recipient
-the reply names — the DM, another agent — and stays dark when the reply heads
-to a room or `to: noop`. Each reply goes back to wherever its routing line
-points, including the specific
-room when several are joined. Room messages are handled on **two independent
-axes**:
+Set `rooms` on an account and pi-msg **also** joins each one. **The owner's 1:1 stays
+the primary channel** — joining a room is purely additive and doesn't change 1:1
+behaviour (lifecycle notices, and unsolicited output all still go to the owner).
+The **typing indicator** tails the reply's `to:` routing line (issue #44): it points
+at whichever 1:1 recipient the reply names — the DM, another agent — and stays dark
+when the reply heads to a room or `to: noop`. Each reply goes back to wherever its
+routing line points, including the specific room when several are joined.
 
-- **Trigger** — does the message start/steer a turn?
-  - the **owner** → always
-  - anyone else who **addresses the bot by name** (`pi: …` / `pi, …`) → always
-  - all other chatter → never (it's buffered as ambient context)
-- **Authority** — is the content trusted?
-  - the **owner** → canonical (authoritative)
-  - everyone else, even when addressing the bot → untrusted *commentary*; the agent is
-    told to use its judgment and is under no obligation to act on it
+```json
+{
+  "accounts": {
+    "default": {
+      "jid": "pi@chat.example.com",
+      "password": "super-secret",
+      "owner": "you@chat.example.com",
+      "rooms": [
+        { "jid": "team@muc.chat.example.com" },
+        { "jid": "errors@muc.chat.example.com", "role": "error" }
+      ]
+    }
+  }
+}
+```
 
-Untriggered messages are buffered and, on the next turn, prepended to the prompt as a
-clearly-labeled *"room commentary — non-canonical"* block, then the buffer clears.
+Per-room keys:
+
+| key | required | default | notes |
+| --- | --- | --- | --- |
+| `jid` | yes | — | bare MUC JID |
+| `role` | no | `normal` | `normal` (readable, replyable) or `error` (write-only dumping ground, see below) |
+| `trigger` | no | `roomTrigger` | address prefix for this room only |
+| `reactions` | no | account `reactions` | XEP-0444 acks for this room only |
+
+Unknown keys, unknown roles, a missing `jid`, a duplicate `jid`, or two `role: error`
+entries are all **load errors** — a typo fails loudly instead of quietly changing what
+the agent can see. The retired singular spellings `"room"` and `"errorRoom"` are
+also rejected, naming the replacement.
+
+### One addressing rule
+
+**A room message either addresses the agent — and is a turn — or it does not exist for
+it.** There is no third tier and no buffering: unaddressed messages are not dispatched,
+not queued, not held as context, and not mentioned in any prompt
+([#106](https://github.com/zachpmanson/pi-msg/issues/106)).
+
+A message addresses the agent when any of these hold:
+
+- it is from the **owner** — always
+- it names the **trigger** as a standalone word — `pi: …`, `@pi …`, `pi, …`, and a bare
+  `pi` (e.g. *"ask pi for the path"*)
+- it is a **broadcast** — `@everyone`, `@all`, `@here`
+- it is an **XEP-0461 reply to a message this bridge sent**
+
+Matching ignores quoted (`> …`) and fenced (``` ``` ```) content, so pasting a
+transcript does not address anyone, and it enforces word boundaries, so `api` and
+`pipeline` never match the trigger `pi`. The trigger is stripped only when it leads the
+message — `pi: fold this in` arrives as `fold this in` — while an address in the middle of
+a sentence leaves the body intact, since stripping it would discard content.
+
+Authority is unchanged: the owner is **canonical** (authoritative), everyone else is
+**untrusted commentary** even when addressing the agent, and the agent is told to use
+its judgment and is under no obligation to act.
+
+**Reading a room (`read_room`).** Because unaddressed messages never reach the agent,
+the only way to see what is happening in a room it was not named in is to ask. The
+`read_room` tool returns the room's most recent archived messages (XEP-0313 MAM **last
+page**, so a result shorter than the limit means the archive holds nothing older, not that
+the page was cut short; default 30 and at most 100 entries) as a labelled transcript with
+sender, age, and reply stamps.
+Only `normal` rooms are readable: the error room is not a joined room as far as the tool
+is concerned. The room list and this rule are seeded once per session in the agent's
+prompt, so the agent knows it must look rather than assume silence means an empty room.
+
+The room must be **non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*,
+optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous
+room real JIDs are hidden, so the owner cannot be distinguished and their messages
+arrive as untrusted commentary — and because they then do not address the agent either,
+they are dropped, which is a silent failure worth avoiding.
+
+**Errors dumping ground (`role: "error"`).** Give a room `"role": "error"` (e.g.
+`{ "jid": "errors@muc.chat.example.com", "role": "error" }`) and pi-msg uses it as a
+*write-only* dumping ground for agent replies it can't route (no `to:` line, text before
+the first `to:`, or a non-allowlisted destination). This lets you mute the room and only
+check it when you need to recover something — without the dropped content spamming your
+1:1.
+
+The bridge joins the room at the **XMPP layer** (so groupchat sends are accepted and the
+keepalive covers it), but deliberately keeps it **out of the agent-visible room set**: it is
+never dispatched to the agent, never appears in the reply/file allowlist, is not readable
+by `read_room`, and isn't tracked for occupants. So the agent can't read the room or route
+anything to it — it's write-only by construction, which keeps multiple agents from acting
+on each other's rejected output. With no error room configured, unrouteable replies fall
+back to the owner's 1:1 as before.
 
 **Reply routing (explicit `from:`/`to:`).** When an account has room access, routing is
 fully explicit — no guessing. Each prompt the agent receives leads with a header naming
@@ -376,24 +447,6 @@ joined rooms, known occupants) exactly like a `to:` reply. The upload component 
 automatically (`upload.<domain>` / `httpupload.<domain>`) or set explicitly via the
 `uploadService` config field.
 
-**The room must be non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*,
-optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous
-room real JIDs are hidden, so the owner can't be distinguished and every message falls
-through to the untrusted/ambient tiers.
-
-**Errors dumping ground (`errorRoom`).** Set `errorRoom` to a bare MUC JID (e.g.
-`errors@muc.chat.example.com`) and pi-msg uses it as a *write-only* dumping ground for
-agent replies it can't route (no `to:` line, text before the first `to:`, or a
-non-allowlisted destination). This lets you mute the room and only check it when you need
-to recover something — without the dropped content spamming your 1:1.
-
-The bridge joins the room at the **XMPP layer** (so groupchat sends are accepted and the
-keepalive covers it), but deliberately keeps it **out of the agent-visible room set**: it is
-never dispatched to the agent, never appears in the reply/file allowlist, and isn't tracked
-for occupants. So the agent can't read the room or route anything to it — it's write-only by
-construction, which keeps multiple agents from acting on each other's rejected output. If
-`errorRoom` is unset, unrouteable replies fall back to the owner's 1:1 as before.
-
 ## Agent tools
 
 Beyond reply text, the agent gets structured **tools** (registered by a small companion
@@ -404,9 +457,12 @@ perform the XMPP action):
 | --- | --- | --- |
 | `send_reaction` | React to the human's latest message with an emoji (XEP-0444) | `reactions` is on |
 | `send_file` | Upload a local file and deliver it (XEP-0363 + XEP-0066); dest defaults to the current conversation, allowlisted | always |
+| `read_room` | Read a room's recent archive (XEP-0313 MAM) as a labelled transcript — the only way to see a room the agent was not addressed in | `rooms` is set |
 
 Reply **routing** (`to:`) stays an in-band text convention (above); only these discrete
-side-effect actions are tools.
+side-effect actions are tools. Read-side tools are not incidental: with unaddressed room
+messages dropped entirely (#106), `read_room` is what keeps an agent able to follow a room
+at all.
 
 ## Run
 
