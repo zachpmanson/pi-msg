@@ -233,6 +233,77 @@ func TestMessageHistoryKeepsAuthor(t *testing.T) {
 	}
 }
 
+// Quoted or fenced text never addresses anyone, and that has to include inline
+// `code` spans: on 2026-09-28 an agent explaining the routing rules wrote "it
+// still reads a name without @ does not reach them, with no `@everyone`", and
+// the literal @everyone inside backticks woke every agent in the room.
+func TestInlineCodeDoesNotAddress(t *testing.T) {
+	b := roomBridge() // trigger "pi"
+	cases := []struct {
+		body      string
+		addressed bool
+	}{
+		{"with no `@everyone` and no owner-broadcast rule", false},
+		{"the rules changed: `@all` is explicit now", false},
+		{"inline `pi` in code", false},
+		{"`pi: quoted` but not to me", false},
+		{"`@peppy` and `@pi` both quoted", false},
+		{"a stray ` backtick then ask pi", true}, // unbalanced: kept verbatim
+		{"`@everyone` but @pi for you", true},    // outside the span
+		{"two `spans` and then @everyone", true},
+	}
+	for _, c := range cases {
+		got, _ := b.matchTrigger("team@muc.x.com", c.body)
+		if got != c.addressed {
+			t.Errorf("matchTrigger(%q) addressed=%v, want %v", c.body, got, c.addressed)
+		}
+	}
+
+	// The body the agent receives is untouched: stripping is for matching only.
+	b2 := roomBridge()
+	if _, stripped := b2.matchTrigger("team@muc.x.com", "pi: keep `the code` intact"); stripped != "keep `the code` intact" {
+		t.Errorf("trigger strip altered inline code: %q", stripped)
+	}
+}
+
+// A resumed session keeps the contract text it was seeded with, so an upgrade
+// that changes the addressing rules would otherwise leave every persona
+// enforcing the old ones from its own context (found in the field 2026-09-28).
+func TestContractReseedAfterChange(t *testing.T) {
+	t.Setenv("PI_MSG_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	b := roomBridge()
+	hash := b.contractHash()
+	if hash == "" {
+		t.Fatal("empty contract hash")
+	}
+
+	// A session seeded by an older pi-msg: no record, or a different one.
+	if loadSeededContract(b.acct.Name) != "" {
+		t.Fatal("fresh contract state should be empty")
+	}
+	logf := func(_, _ string) {}
+	saveSeededContract(logf, b.acct.Name, "deadbeef")
+	if loadSeededContract(b.acct.Name) != "deadbeef" {
+		t.Fatal("contract state did not round-trip")
+	}
+	if loadSeededContract(b.acct.Name) == b.contractHash() {
+		t.Fatal("a stale hash must not match the current contract")
+	}
+
+	// Seeded by this build: no re-seed.
+	saveSeededContract(logf, b.acct.Name, hash)
+	if loadSeededContract(b.acct.Name) != b.contractHash() {
+		t.Fatal("a current hash must match the current contract")
+	}
+
+	// The hash covers both halves of the seed: changing the rooms changes it.
+	other := roomBridge()
+	other.acct.Rooms = []string{"other@muc.x.com"}
+	if other.contractHash() == hash {
+		t.Error("contract hash ignores the room list")
+	}
+}
+
 // TestUnaddressedRoomMessageIsDropped replaces the old ambient-buffer tests
 // (#106): an unaddressed room message must produce no turn and must not stay in
 // the durable inbox. Reaching the buffer at all is now the bug.

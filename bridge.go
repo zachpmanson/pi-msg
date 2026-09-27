@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"net/http"
 	"os"
@@ -268,8 +269,15 @@ func (b *Bridge) Run(ctx context.Context) error {
 		b.log("info", fmt.Sprintf("resuming session %s (start=%s)", prev, startLabel(b.startDir)))
 		b.resumed = true
 		// A resumed session's context already contains the routing contract (it
-		// was seeded when the session began), so don't re-seed it now.
-		b.routingSeeded = true
+		// was seeded when the session began) — unless the contract text has changed
+		// since, which a pi-msg upgrade can do. Re-seed then: a session still
+		// holding the old addressing rules would enforce rules the bridge no longer
+		// applies (#106/#109, found in the field on 2026-09-28).
+		if loadSeededContract(b.acct.Name) == b.contractHash() {
+			b.routingSeeded = true
+		} else {
+			b.log("info", "routing contract changed since this session was seeded; re-seeding")
+		}
 		b.xmpp.SetStartupStatus("resumed")
 	} else {
 		if prev != "" {
@@ -1780,6 +1788,17 @@ func shortAge(d time.Duration) string {
 // conversation must read it deliberately with the read_room tool. Seeded once
 // per session alongside the routing contract, because an agent that assumes
 // silence means an empty room will miss handoffs it was not named in.
+// contractHash identifies the contract text this bridge would seed, so a
+// resumed session can tell whether the rules in its context are still current.
+// It covers both halves — the routing contract and the room contract.
+func (b *Bridge) contractHash() string {
+	h := fnv.New32a()
+	fmt.Fprint(h, b.routingContract())
+	fmt.Fprint(h, "\n\n")
+	fmt.Fprint(h, b.roomsContract())
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
 func (b *Bridge) roomsContract() string {
 	if len(b.acct.Rooms) == 0 {
 		return ""
@@ -1799,6 +1818,7 @@ func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender
 		sb.WriteString("\n\n")
 		sb.WriteString(b.roomsContract())
 		sb.WriteString("\n\n")
+		saveSeededContract(b.log, b.acct.Name, b.contractHash())
 	}
 	if b.acct.RoomMode() && origin != "" {
 		fmt.Fprintf(&sb, "from: %s\n", origin)
@@ -2020,9 +2040,40 @@ func stripUnquoted(t string) string {
 		if fenced || strings.HasPrefix(strings.TrimSpace(line), ">") {
 			continue
 		}
-		sb.WriteString(line)
+		sb.WriteString(stripCodeSpans(line))
 		sb.WriteByte('\n')
 	}
+	return sb.String()
+}
+
+// stripCodeSpans removes inline `code` spans from one line, so quoting a trigger
+// or a broadcast handle does not address anyone. Without this, the sentence
+// "it still reads a name without @ does not reach them, with no `@everyone`" is
+// a broadcast to every agent in the room — observed live on 2026-09-28, when an
+// agent discussing the routing rules woke the whole fleet.
+//
+// Only BALANCED pairs are removed: an unmatched backtick is left as literal text
+// so a typo cannot silently swallow a real mention later in the same line.
+func stripCodeSpans(line string) string {
+	first := strings.IndexByte(line, '`')
+	if first < 0 {
+		return line
+	}
+	var sb strings.Builder
+	rest := line
+	for {
+		i := strings.IndexByte(rest, '`')
+		if i < 0 {
+			break
+		}
+		j := strings.IndexByte(rest[i+1:], '`')
+		if j < 0 {
+			break // unbalanced: keep the remainder verbatim
+		}
+		sb.WriteString(rest[:i])
+		rest = rest[i+j+2:]
+	}
+	sb.WriteString(rest)
 	return sb.String()
 }
 

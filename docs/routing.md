@@ -146,8 +146,9 @@ its own message from before a restart) and a name that matches no known occupant
 back to the broadcast, so an unresolvable address is delivered rather than lost.
 ([#106](https://github.com/zachpmanson/pi-msg/issues/106))
 
-Word boundaries apply, and quoted (`> …`) or fenced content is ignored, so
-pasting a transcript does not address anyone and `api` never wakes `pi`. One
+Word boundaries apply, and quoted (`> …`), fenced and inline `` `code` `` content is
+ignored, so pasting a transcript — or quoting a handle while explaining these very rules —
+does not address anyone and `api` never wakes `pi`. One
 consequence matters when writing bridge text: a sentence that merely *mentions*
 an agent now addresses it, so an announcement authored by the bridge avoids
 naming agents at all (the cascade-stop notice says "no longer answering agent
