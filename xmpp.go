@@ -1168,7 +1168,7 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	// Record the inbound message in history so send_reaction can target it by ID,
 	// and so a later reply to it can be resolved and quoted (#95).
 	if m.id != "" {
-		b.recordMessageBody(m.id, m.from, m.body)
+		b.recordInboundMessage(m.id, m.from, m.body, true)
 	}
 	// The agent is about to take this in — acknowledge it as read/delivered.
 	b.sendReceipts(m)
@@ -1226,10 +1226,10 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	}
 	// Record the inbound room message in history so send_reaction can target it
 	// by ID, and so a later reply to it can be resolved and quoted (#95).
-	if m.id != "" {
-		b.recordMessageBody(m.id, m.from, m.body)
-	}
 	real := b.occupantRealJID(room, nick)
+	if m.id != "" {
+		b.recordInboundMessage(m.id, m.from, m.body, real != "" && real == b.ownerBare)
+	}
 	b.onMsg(InboundMessage{
 		Body:       m.body,
 		Nick:       nick,
@@ -1687,14 +1687,18 @@ func (b *XMPPBridge) encodeReceipt(to, ns, local, forID string) error {
 // history ring buffer, so the bridge can resolve a stanza ID to its source
 // JID without the agent having to remember it. Body (truncated) lets an inbound
 // XEP-0461 reply quote what it answers (#95). Self marks a stanza this bridge
-// sent: an inbound reply to it is addressed to us even when it names nobody
-// (classify, #106). It cannot be inferred from FromJID — a room send records the
-// room, which looks exactly like anyone else's message in that room.
+// sent, and Owner one the owner sent: together they tell a reply target apart —
+// a reply to someone else's message is routed to them alone, while a reply to
+// ours or the owner's own is ours to answer (#106). Self cannot be inferred from
+// FromJID: a room send records the room, which looks exactly like anyone else's
+// message in that room, and a room receive records room/nick, whose bare JID is
+// the room.
 type msgHistoryEntry struct {
 	FromJID   string
 	Timestamp time.Time
 	Body      string
 	Self      bool
+	Owner     bool
 }
 
 // msgHistoryCap is the maximum number of stanza IDs retained in history.
@@ -1720,7 +1724,20 @@ func (b *XMPPBridge) recordSelfMessage(id, toJID, body string) {
 	// two acquisitions could re-insert a zero-value entry that then wins every
 	// oldest-eviction scan.
 	if e, ok := b.msgHistory[id]; ok {
-		e.Self = true
+		e.Self, e.Owner = true, false
+		b.msgHistory[id] = e
+	}
+	b.mu.Unlock()
+}
+
+// recordInboundMessage records a stanza we received, marking whether the owner
+// sent it. The owner flag lets a later reply to it be recognised as a reply to
+// the owner's own message (ours to answer) rather than to a peer's.
+func (b *XMPPBridge) recordInboundMessage(id, fromJID, body string, owner bool) {
+	b.mu.Lock()
+	b.recordMessageBodyLocked(id, fromJID, body)
+	if e, ok := b.msgHistory[id]; ok {
+		e.Self, e.Owner = false, owner
 		b.msgHistory[id] = e
 	}
 	b.mu.Unlock()
@@ -1734,6 +1751,20 @@ func (b *XMPPBridge) isSelfMessage(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.msgHistory[id].Self
+}
+
+// replyTargetOther reports whether id belongs to a message we have seen that
+// came from neither us nor the owner — i.e. a peer's message. An unknown id
+// answers false: the sender could be anyone, including us before a restart, so
+// "not ours" cannot be concluded from silence.
+func (b *XMPPBridge) replyTargetOther(id string) bool {
+	if id == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.msgHistory[id]
+	return ok && !e.Self && !e.Owner
 }
 
 // recordMessageBody records a stanza ID -> (JID, body) mapping in the history
@@ -1753,11 +1784,11 @@ func (b *XMPPBridge) recordMessageBodyLocked(id, fromJID, body string) {
 	}
 	body = truncateLabel(strings.TrimSpace(body), msgHistoryBodyCap)
 	if prev, exists := b.msgHistory[id]; exists {
-		// Keep Self: a re-record (a MAM fetch of our own archived line, a late
-		// duplicate) must not unmark a stanza we sent, or a peer's unaddressed
-		// XEP-0461 reply to it would be classified as not ours and dropped
-		// (#106 review).
-		b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now(), Body: body, Self: prev.Self}
+		// Keep Self and Owner: a re-record (a MAM fetch of our own archived line,
+		// a late duplicate) must not unmark a stanza we sent — or one the owner
+		// sent — or an unaddressed XEP-0461 reply to it would be classified as
+		// not ours and dropped (#106 review).
+		b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now(), Body: body, Self: prev.Self, Owner: prev.Owner}
 		return
 	}
 	if len(b.msgHistory) >= msgHistoryCap {

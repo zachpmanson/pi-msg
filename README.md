@@ -318,11 +318,21 @@ not queued, not held as context, and not mentioned in any prompt
 
 A message addresses the agent when any of these hold:
 
-- it is from the **owner** — always
 - it names the **trigger** as a standalone word — `pi: …`, `@pi …`, `pi, …`, and a bare
   `pi` (e.g. *"ask pi for the path"*)
 - it is a **broadcast** — `@everyone`, `@all`, `@here`
 - it is an **XEP-0461 reply to a message this bridge sent**
+- it is from the **owner** and names nobody — an owner message is the one untargeted form
+  that reaches every agent in the room, because the owner's message has no other way to
+  address the fleet
+
+An owner room message that **does** name an agent, or that replies to an agent's stanza, is
+routed to that account alone: the tag *is* the address. So `@peppy have a look` wakes peppy
+and nobody else, and a reply to peppy's message is answered by peppy. Two limits keep that
+safe from over-reading: the name must be an occupant of the room or an `@handle` (with no
+roster yet, the message stays a broadcast), and a reply whose target this bridge has never
+seen — it may be its own, from before a restart — is delivered as a broadcast rather than
+dropped. To reach every agent deliberately, write **`@everyone`**.
 
 Matching ignores quoted (`> …`) and fenced (``` ``` ```) content, so pasting a
 transcript does not address anyone, and it enforces word boundaries, so `api` and

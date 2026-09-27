@@ -474,6 +474,29 @@ func TestInboundReactionAck(t *testing.T) {
 		t.Errorf("a dropped room reaction must not set a turn destination, got %q", b4.currentTurnDest())
 	}
 
+	// Path 4: the owner acks a room message that belongs to a peer → that peer's
+	// business, not ours (#106). An owner reaction to a message we cannot
+	// attribute (never seen) still wakes us: the owner is trusted traffic, and a
+	// reaction id we do not hold may be our own from before a restart.
+	b5 := roomBridge()
+	b5.rpc = &RPCClient{}
+	b5.xmpp = NewXMPPBridge(b5.acct, func(InboundMessage) {}, b5.log)
+	b5.xmpp.recordInboundMessage("peppys-message", "team@muc.x.com/peppy", "we shipped", false)
+	b5.onInbound(InboundMessage{
+		FromOwner: true, Room: "team@muc.x.com", Nick: "zach",
+		From: "team@muc.x.com/zach", Reactions: []string{"\u2705"}, ReactionID: "peppys-message",
+	})
+	if b5.reactionAckRun {
+		t.Error("the owner's reaction to a peer's message must not wake us")
+	}
+	b5.onInbound(InboundMessage{
+		FromOwner: true, Room: "team@muc.x.com", Nick: "zach",
+		From: "team@muc.x.com/zach", Reactions: []string{"\u2705"}, ReactionID: "never-seen-id",
+	})
+	if !b5.reactionAckRun {
+		t.Error("the owner's reaction to an unattributable message should wake (delivered, not lost)")
+	}
+
 	// Owner reacting on 1:1 renders as "owner" and turns to the owner.
 	b3 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
 	b3.rpc = &RPCClient{}

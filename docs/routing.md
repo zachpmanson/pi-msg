@@ -138,6 +138,14 @@ applies to its own trigger:
 - `@everyone` — address the whole room.
 - A mistyped name matches nobody; pi-msg warns the agent that nobody was woken.
 
+**The owner's messages follow the same names, but with the broadcast inverted.** An owner
+room message that names nobody is addressed to every agent in the room, so the owner can
+address the fleet without tagging anyone; one that tags an agent or replies to an agent's
+stanza is routed to that account alone. A reply target the bridge has never seen (it may be
+its own message from before a restart) and a name that matches no known occupant both fall
+back to the broadcast, so an unresolvable address is delivered rather than lost.
+([#106](https://github.com/zachpmanson/pi-msg/issues/106))
+
 Word boundaries apply, and quoted (`> …`) or fenced content is ignored, so
 pasting a transcript does not address anyone and `api` never wakes `pi`. One
 consequence matters when writing bridge text: a sentence that merely *mentions*
