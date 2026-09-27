@@ -334,11 +334,16 @@ roster yet, the message stays a broadcast), and a reply whose target this bridge
 seen — it may be its own, from before a restart — is delivered as a broadcast rather than
 dropped. To reach every agent deliberately, write **`@everyone`**.
 
-Matching ignores quoted (`> …`) and fenced (``` ``` ```) content, so pasting a
-transcript does not address anyone, and it enforces word boundaries, so `api` and
-`pipeline` never match the trigger `pi`. The trigger is stripped only when it leads the
-message — `pi: fold this in` arrives as `fold this in` — while an address in the middle of
-a sentence leaves the body intact, since stripping it would discard content.
+Matching ignores quoted (`> …`), fenced (``` ``` ```) and inline `` `code` `` content, so
+pasting a transcript — or explaining the rules in a code span — does not address anyone,
+and it enforces word boundaries, so `api` and `pipeline` never match the trigger `pi`. The
+trigger is stripped only when it leads the message — `pi: fold this in` arrives as `fold
+this in` — while an address in the middle of a sentence leaves the body intact, since
+stripping it would discard content.
+
+A fresh session is seeded with the routing contract. A **resumed** session is re-seeded when
+the contract text changes, so an upgrade that alters the addressing rules does not leave a
+long-lived persona enforcing the old ones from its own context.
 
 Authority is unchanged: the owner is **canonical** (authoritative), everyone else is
 **untrusted commentary** even when addressing the agent, and the agent is told to use

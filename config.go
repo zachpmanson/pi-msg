@@ -293,6 +293,40 @@ func configPath() string {
 
 // sessionStatePath returns the per-account session state file (the absolute
 // path of the pi session to resume on the next launch), stored alongside the
+// loadSeededContract reads the hash of the routing contract text that was last
+// injected into this account's session, returning "" when none is recorded.
+func loadSeededContract(acct string) string {
+	raw, err := os.ReadFile(seededContractPath(acct))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// saveSeededContract records the contract hash so a later restart can tell
+// whether the session's context still describes the rules the bridge applies.
+// Errors are logged, not fatal.
+func saveSeededContract(log func(level, msg string), acct, hash string) {
+	p := seededContractPath(acct)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		if log != nil {
+			log("warning", "contract seed state: mkdir: "+err.Error())
+		}
+		return
+	}
+	if err := os.WriteFile(p, []byte(strings.TrimSpace(hash)+"\n"), 0o600); err != nil {
+		if log != nil {
+			log("warning", "contract seed state: write: "+err.Error())
+		}
+	}
+}
+
+// seededContractPath is the file recording which contract text a session was
+// seeded with: <config-dir>/<account>.contract.
+func seededContractPath(acct string) string {
+	return filepath.Join(filepath.Dir(configPath()), acct+".contract")
+}
+
 // config file as <config-dir>/<account>.session.
 func sessionStatePath(acct string) string {
 	return filepath.Join(filepath.Dir(configPath()), acct+".session")
