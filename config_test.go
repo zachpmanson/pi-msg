@@ -92,7 +92,7 @@ func TestResolveAccountRoomMode(t *testing.T) {
 	cfg := &Config{Accounts: map[string]Account{
 		"default": {
 			JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com",
-			Room: roomList{"team@muc.chat.example.com"}, Nick: "botpi",
+			Rooms: roomList{{JID: "team@muc.chat.example.com"}}, Nick: "botpi",
 		},
 	}}
 	got, err := resolveAccount(cfg, "")
@@ -110,6 +110,10 @@ func TestResolveAccountRoomMode(t *testing.T) {
 	}
 	if got.RoomTrigger != "botpi" {
 		t.Errorf("RoomTrigger defaults to Nick: got %q, want botpi", got.RoomTrigger)
+	}
+	// The room's resolved trigger inherits that default (#106).
+	if trig := got.TriggerFor("team@muc.chat.example.com"); trig != "botpi" {
+		t.Errorf("TriggerFor(room) = %q, want botpi", trig)
 	}
 }
 
@@ -200,46 +204,131 @@ func TestLoadConfigRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRoomConfigParsing covers the #106 format: an array of objects, strictly
+// validated, with the retired spellings rejected rather than ignored.
 func TestRoomConfigParsing(t *testing.T) {
-	// "room" accepts a single string...
-	var single Config
-	if err := json.Unmarshal([]byte(`{"accounts":{"default":{"room":"a@muc.x"}}}`), &single); err != nil {
-		t.Fatalf("string form: %v", err)
+	// Per-room trigger and reactions overrides, plus the error room folded in as
+	// a typed entry.
+	var cfg Config
+	body := `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x",
+		"rooms":[
+		  {"jid":"a@muc.x"},
+		  {"jid":"b@muc.x","trigger":"bob","reactions":true},
+		  {"jid":"errors@muc.x","role":"error"}
+		]}}}`
+	if err := json.Unmarshal([]byte(body), &cfg); err != nil {
+		t.Fatalf("object form: %v", err)
 	}
-	if got := []string(single.Accounts["default"].Room); len(got) != 1 || got[0] != "a@muc.x" {
-		t.Errorf("string form Room = %v, want [a@muc.x]", got)
-	}
-	// ...or an array of strings.
-	var multi Config
-	if err := json.Unmarshal([]byte(`{"accounts":{"default":{"room":["a@muc.x","b@muc.x"]}}}`), &multi); err != nil {
-		t.Fatalf("array form: %v", err)
-	}
-	if got := []string(multi.Accounts["default"].Room); len(got) != 2 || got[1] != "b@muc.x" {
-		t.Errorf("array form Room = %v, want [a@muc.x b@muc.x]", got)
-	}
-	// resolveAccount dedupes/cleans and drives RoomMode + multiple Rooms.
-	got, err := resolveAccount(&Config{Accounts: map[string]Account{
-		"default": {JID: "pi@x", Password: "p", Owner: "o@x",
-			Room: roomList{"a@muc.x", " a@muc.x ", "b@muc.x", ""}},
-	}}, "")
+	got, err := resolveAccount(&cfg, "")
 	if err != nil {
 		t.Fatalf("resolveAccount: %v", err)
 	}
 	if len(got.Rooms) != 2 || got.Rooms[0] != "a@muc.x" || got.Rooms[1] != "b@muc.x" {
-		t.Errorf("resolved Rooms = %v, want [a@muc.x b@muc.x]", got.Rooms)
+		t.Errorf("Rooms = %v, want [a@muc.x b@muc.x]", got.Rooms)
+	}
+	if got.ErrorRoom != "errors@muc.x" {
+		t.Errorf("ErrorRoom = %q, want errors@muc.x", got.ErrorRoom)
+	}
+	// The default trigger (the nick, here the JID localpart) applies only to the
+	// room that did not override it.
+	if trig := got.TriggerFor("a@muc.x"); trig != "pi" {
+		t.Errorf("TriggerFor(a@muc.x) = %q, want pi (account default)", trig)
+	}
+	if trig := got.TriggerFor("b@muc.x"); trig != "bob" {
+		t.Errorf("TriggerFor(b@muc.x) = %q, want bob (room override)", trig)
+	}
+	if !got.ReactionsFor("b@muc.x") {
+		t.Error("ReactionsFor(b@muc.x) = false, want the room override true")
+	}
+	if got.ReactionsFor("a@muc.x") {
+		t.Error("ReactionsFor(a@muc.x) = true, want the account default false")
+	}
+	// An explicit false is distinguishable from unset.
+	cfg2 := Config{Accounts: map[string]Account{"default": {JID: "pi@x", Password: "p", Owner: "o@x",
+		RoomReactions: true, Rooms: roomList{{JID: "a@muc.x", Reactions: boolPtr(false)}}}}}
+	got2, err := resolveAccount(&cfg2, "")
+	if err != nil {
+		t.Fatalf("resolveAccount: %v", err)
+	}
+	if got2.ReactionsFor("a@muc.x") {
+		t.Error("explicit reactions:false did not override the account default of true")
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+// TestRoomConfigRejectsRetiredFormats pins the loud-failure contract: silently
+// resolving these to no rooms would leave a MUC account outside its room.
+func TestRoomConfigRejectsRetiredFormats(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"singular string", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","room":"a@muc.x"}}}`},
+		{"singular errorRoom", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","errorRoom":"errors@muc.x"}}}`},
+		{"array of strings", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","rooms":["a@muc.x"]}}}`},
+		{"object instead of array", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","rooms":{"jid":"a@muc.x"}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			err := json.Unmarshal([]byte(tc.body), &cfg)
+			if err == nil {
+				_, err = resolveAccount(&cfg, "")
+			}
+			if err == nil {
+				t.Fatalf("%s resolved without error", tc.name)
+			}
+		})
+	}
+}
+
+// TestRoomConfigValidation covers the per-entry rules that each take an account
+// out of a room it believes it is in.
+func TestRoomConfigValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing jid", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","rooms":[{},{"jid":"a@muc.x"}]}}}`},
+		{"unknown key", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","rooms":[{"jid":"a@muc.x","ambient":"none"}]}}}`},
+		{"unknown role", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","rooms":[{"jid":"a@muc.x","role":"readonly"}]}}}`},
+		{"two error rooms", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","rooms":[{"jid":"a@muc.x","role":"error"},{"jid":"b@muc.x","role":"error"}]}}}`},
+		{"duplicate jid", `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x","rooms":[{"jid":"a@muc.x"},{"jid":"a@muc.x"}]}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			err := json.Unmarshal([]byte(tc.body), &cfg)
+			if err == nil {
+				_, err = resolveAccount(&cfg, "")
+			}
+			if err == nil {
+				t.Fatalf("%s resolved without error", tc.name)
+			}
+		})
 	}
 }
 
 func TestResolveAccountErrorRoom(t *testing.T) {
 	got, err := resolveAccount(&Config{Accounts: map[string]Account{
 		"default": {JID: "pi@x", Password: "p", Owner: "o@x",
-			ErrorRoom: " errors@muc.x "},
+			Rooms: roomList{{JID: " errors@muc.x ", Role: "error"}}},
 	}}, "")
 	if err != nil {
 		t.Fatalf("resolveAccount: %v", err)
 	}
 	if got.ErrorRoom != "errors@muc.x" {
 		t.Errorf("ErrorRoom = %q, want %q", got.ErrorRoom, "errors@muc.x")
+	}
+	// The error room is write-only: it must not appear in the joined/readable set.
+	if got.RoomMode() {
+		t.Error("an error room must not put the account in room mode")
+	}
+	for _, r := range got.Rooms {
+		if r == got.ErrorRoom {
+			t.Fatal("error room leaked into Rooms")
+		}
 	}
 }
 
@@ -507,8 +596,6 @@ func TestResolveAccountMAM(t *testing.T) {
 		}
 	}
 }
-
-func boolPtr(v bool) *bool { return &v }
 
 // An explicit false must survive through JSON too (the config is the only place
 // the opt-out is expressed).

@@ -126,13 +126,24 @@ XEP-0359. The model knows which message it answers, so it names one.
 
 ### Addressing other agents in a room
 
-Addressed via inline mention, not the `to:` line:
+Two forms reach another agent, and they are the same rule the receiving bridge
+applies to its own trigger:
 
 - `@name` — wake that agent (handoff), anywhere in the message.
+- `name` with no sigil — also reaches it. A bare name counts as addressing the
+  agent, so *"ask peppy for the path"* and *"beltino handed over to fox"* wake
+  those agents. This is deliberate: an unaddressed room message does not exist
+  for an agent, so prose that names one is the only signal it will get
+  ([#106](https://github.com/zachpmanson/pi-msg/issues/106)).
 - `@everyone` — address the whole room.
-- A name mentioned **without** `@` does not reach that agent.
-- A mistyped/self `@name` matches nobody; pi-msg warns the agent that nobody
-  was woken.
+- A mistyped name matches nobody; pi-msg warns the agent that nobody was woken.
+
+Word boundaries apply, and quoted (`> …`) or fenced content is ignored, so
+pasting a transcript does not address anyone and `api` never wakes `pi`. One
+consequence matters when writing bridge text: a sentence that merely *mentions*
+an agent now addresses it, so an announcement authored by the bridge avoids
+naming agents at all (the cascade-stop notice says "no longer answering agent
+handoffs" rather than naming itself).
 
 ## Failure handling / on-failure nudge
 
@@ -140,8 +151,8 @@ Routing failures are handled by rejection + a bounded corrective:
 
 - Text with no `to:` line, text before the first `to:`, a non-allowlisted
   destination, or an **unknown stanza id** is **not dropped silently**: it is
-  forwarded to the write-only `errorRoom` (`routeDropped`) and a corrective is
-  staged.
+  forwarded to the write-only error room — the `rooms` entry with
+  `"role": "error"` (`routeDropped`) — and a corrective is staged.
 - Intermediate/mid-run commentary that fails to route only fills the error
   room and is **not** nudged; the agent is only corrected if the run's
   **FINAL** message was malformed (issue #16).
@@ -185,10 +196,12 @@ and labelled, so the agent can always tell bridge text from a person's words:
 
 ```
 [pi-msg: routing: …]      the session seed, the routing nudge, the mention warning
-[pi-msg: muc: …]          the ambient buffer, the untrusted-commentary label
+[pi-msg: rooms: …]        the room list and the one-addressing rule (#106)
+[pi-msg: muc: …]          the untrusted-commentary label
 [pi-msg: unanswered: …]   the unanswered-message hint
 [pi-msg: recovery: …]     the empty-tail recovery prompt
 [pi-msg: reaction: …]     an inbound XEP-0444 reaction
+[pi-msg: read_room: …]    a read_room result (XEP-0313 transcript)
 [pi-msg: startup: …]      the resume volunteer turn
 ```
 

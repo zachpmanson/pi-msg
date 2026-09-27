@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
@@ -26,6 +27,12 @@ func run() error {
 	// is never resumed and the text fires once at startup.
 	promptFlag := flag.String("prompt", "", "initial task prompt for a fresh on-demand spawn (delivered as the persona's first prompt; forces a fresh session)")
 	commandFlag := flag.String("command", "", "alias for --prompt")
+	// --check validates and reports, and never connects. It exists because the
+	// config format is strict and the failure mode is a fleet-wide one: every
+	// bridge restarts together, and a rejected config takes all of them down.
+	// Being able to run the parser against the real config first turns that into
+	// a pre-flight check instead of an outage.
+	checkFlag := flag.Bool("check", false, "validate the config, print the resolved account and its room rules, then exit without connecting")
 	flag.Parse()
 
 	cfg, err := loadConfig(configPath())
@@ -38,6 +45,10 @@ func run() error {
 	acct, err := resolveAccount(cfg, os.Getenv("PI_MSG_ACCOUNT"))
 	if err != nil {
 		return err
+	}
+	if *checkFlag {
+		printAccountSummary(acct)
+		return nil
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -53,4 +64,38 @@ func run() error {
 		b.log("info", "initial prompt set via CLI (--prompt/--command)")
 	}
 	return b.Run(ctx)
+}
+
+// printAccountSummary is the --check report: the resolved account and, room by
+// room, the addressing rules that will actually be in force. Room rules are the
+// part worth printing — a room silently missing, or carrying an unexpected
+// trigger, is the whole reason to run a pre-flight check.
+func printAccountSummary(a ResolvedAccount) {
+	out := os.Stdout
+	fmt.Fprintf(out, "config: %s\n", configPath())
+	fmt.Fprintf(out, "account: %s\n", a.Name)
+	fmt.Fprintf(out, "jid: %s\n", a.JID)
+	fmt.Fprintf(out, "owner: %s\n", a.Owner)
+	fmt.Fprintf(out, "service: %s\n", a.Service)
+	fmt.Fprintf(out, "resource: %s\n", a.Resource)
+	if a.Workdir != "" {
+		fmt.Fprintf(out, "workdir: %s\n", a.Workdir)
+	}
+	if a.Model != "" {
+		fmt.Fprintf(out, "model: %s\n", a.Model)
+	}
+	fmt.Fprintf(out, "nick: %s\n", a.Nick)
+	fmt.Fprintf(out, "mam backfill: %t\n", a.MAM)
+	if len(a.Rooms) == 0 {
+		fmt.Fprintf(out, "rooms: none (1:1 mode)\n")
+	} else {
+		fmt.Fprintf(out, "rooms: %d\n", len(a.Rooms))
+		for _, r := range a.Rooms {
+			fmt.Fprintf(out, "  %s  trigger=%q reactions=%t\n", r, a.TriggerFor(r), a.ReactionsFor(r))
+		}
+	}
+	if a.ErrorRoom != "" {
+		fmt.Fprintf(out, "error room (write-only): %s\n", a.ErrorRoom)
+	}
+	fmt.Fprintf(out, "tools: %s\n", strings.Join(toolNames(a), ", "))
 }

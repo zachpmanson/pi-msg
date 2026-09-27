@@ -1602,7 +1602,7 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, reply *
 	msg := chatStanza(id, toJID, typ, body, reply)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	b.recordMessageBody(id, to, body)
+	b.recordSelfMessage(id, to, body)
 	return id, b.encode(ctx, session, msg)
 }
 
@@ -1679,11 +1679,15 @@ func (b *XMPPBridge) encodeReceipt(to, ns, local, forID string) error {
 // msgHistoryEntry records an inbound or outbound message stanza in the
 // history ring buffer, so the bridge can resolve a stanza ID to its source
 // JID without the agent having to remember it. Body (truncated) lets an inbound
-// XEP-0461 reply quote what it answers (#95).
+// XEP-0461 reply quote what it answers (#95). Self marks a stanza this bridge
+// sent: an inbound reply to it is addressed to us even when it names nobody
+// (classify, #106). It cannot be inferred from FromJID — a room send records the
+// room, which looks exactly like anyone else's message in that room.
 type msgHistoryEntry struct {
 	FromJID   string
 	Timestamp time.Time
 	Body      string
+	Self      bool
 }
 
 // msgHistoryCap is the maximum number of stanza IDs retained in history.
@@ -1698,6 +1702,27 @@ const msgHistoryBodyCap = 200
 // worth retaining (outbound sends).
 func (b *XMPPBridge) recordMessage(id, fromJID string) {
 	b.recordMessageBody(id, fromJID, "")
+}
+
+// recordSelfMessage records a stanza WE sent, so a later inbound XEP-0461 reply
+// to it can be recognised as addressing us (see classify, #106).
+func (b *XMPPBridge) recordSelfMessage(id, toJID, body string) {
+	b.recordMessageBody(id, toJID, body)
+	b.mu.Lock()
+	e := b.msgHistory[id]
+	e.Self = true
+	b.msgHistory[id] = e
+	b.mu.Unlock()
+}
+
+// isSelfMessage reports whether id is a stanza this bridge sent.
+func (b *XMPPBridge) isSelfMessage(id string) bool {
+	if id == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.msgHistory[id].Self
 }
 
 // recordMessageBody records a stanza ID -> (JID, body) mapping in the history

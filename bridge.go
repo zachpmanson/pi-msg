@@ -134,7 +134,6 @@ type Bridge struct {
 	typingRoutingDone bool   // routing decision for the streaming reply already made
 
 	ambientMu sync.Mutex
-	ambient   []ambientMsg
 
 	// cascadeMu guards cascade, the count of consecutive agent-to-agent turns
 	// taken with no owner message in between (#23), and cascadeNotified, which
@@ -148,19 +147,13 @@ type Bridge struct {
 	handleWarnedRun bool
 }
 
-// ambientMsg is one buffered non-triggering room message.
-type ambientMsg struct {
-	nick, body string
-}
-
-// ambientCap bounds the in-memory ambient buffer; oldest entries are dropped.
-const ambientCap = 50
-
 // cascadeCap bounds consecutive commentary-triggered turns with no intervening
 // owner (canonical) message, so two agents addressing each other cannot loop
 // indefinitely with no human in the path. Beyond the cap a commentary trigger
-// degrades to ambient: the content is still buffered as context for the next
-// real turn, it just doesn't fire one. Any canonical message resets the count.
+// degrades to no-turn: the message is not handed to the agent at all (the
+// ambient buffer was removed in #106), so the cap is now a hard stop rather
+// than a demotion, and the room is told once (announceCascadeStop) instead of
+// the handoff failing silently. Any canonical message resets the count.
 //
 // This is a runaway backstop, NOT a pacing mechanism. It was originally 3,
 // which silently stalled real multi-agent work twice in one session: the budget
@@ -173,17 +166,30 @@ const ambientCap = 50
 const cascadeCap = 25
 
 // rpcEnv is the environment the pi child process is launched with: the
-// companion extension's tool set (both tools are always available — lifecycle
-// auto-reactions (👀✅⛔) are gated in the bridge, not here), plus the
-// prompt-level opt-ins. beforeAgentStartText is not a tool but travels the same
-// way: the extension reads PI_MSG_BEFORE_AGENT_START_TEXT on before_agent_start
-// and appends it to the system prompt on every turn.
+// companion extension's tool set (file and reaction are always available —
+// lifecycle auto-reactions (👀✅⛔) are gated in the bridge, not here; room is
+// offered only in room mode, since read_room has nothing to read otherwise),
+// plus the prompt-level opt-ins. beforeAgentStartText is not a tool but travels
+// the same way: the extension reads PI_MSG_BEFORE_AGENT_START_TEXT on
+// before_agent_start and appends it to the system prompt on every turn.
 func rpcEnv(acct ResolvedAccount) []string {
-	env := []string{"PI_MSG_TOOLS=" + strings.Join([]string{"file", "reaction"}, ",")}
+	env := []string{"PI_MSG_TOOLS=" + strings.Join(toolNames(acct), ",")}
 	if acct.BeforeAgentStartText != "" {
 		env = append(env, "PI_MSG_BEFORE_AGENT_START_TEXT="+acct.BeforeAgentStartText)
 	}
 	return env
+}
+
+// toolNames is the companion-extension tool set for an account, mirroring the
+// config: file and reaction are always registered (lifecycle auto-reactions are
+// gated in the bridge, not by the tool's presence), and room is offered only in
+// room mode — read_room has nothing to read otherwise (#106).
+func toolNames(acct ResolvedAccount) []string {
+	tools := []string{"file", "reaction"}
+	if acct.RoomMode() {
+		tools = append(tools, "room")
+	}
+	return tools
 }
 
 // NewBridge constructs a bridge for the resolved account.
@@ -597,6 +603,101 @@ func (b *Bridge) handleUIRequest(ev Event) {
 	}
 }
 
+// read_room limits. The default is what an agent usually wants — roughly the
+// recent conversation — and the maximum bounds the token cost of one tool call,
+// since the whole result lands in the model's context.
+const (
+	roomReadDefaultLimit = 30
+	roomReadMaxLimit     = 100
+)
+
+// handleReadRoomRelay answers the `read_room` tool: it fetches the most recent
+// messages from a joined room's XEP-0313 archive and returns them as text. With
+// the ambient buffer gone (#106) this is the only way an agent learns what
+// happened in a room it was not addressed in, so the read is deliberately
+// explicit and on demand rather than pushed.
+//
+// Deliberately stateless: the last N messages, no cursor. A cursor would skip
+// messages whenever a fetch failed or the agent wanted to re-read, and the
+// archived window is bounded by the limit anyway.
+func (b *Bridge) handleReadRoomRelay(id, room string, limit int) {
+	if b.xmpp == nil {
+		b.rpc.RespondUIRelay(id, "read_room is unavailable: the bridge has no XMPP connection")
+		return
+	}
+	// Default to the only room when no room is named, so a single-room account
+	// never has to spell its own room out.
+	if strings.TrimSpace(room) == "" && len(b.acct.Rooms) == 1 {
+		room = b.acct.Rooms[0]
+	}
+	bare := bareJid(room)
+	if bare == "" {
+		b.rpc.RespondUIRelay(id, "read_room needs a room: no room was named and this account joins more than one ("+strings.Join(b.acct.Rooms, ", ")+")")
+		return
+	}
+	// Only joined rooms are readable. The error room is not in this set by
+	// construction, so rejected agent output stays unreadable.
+	if !b.xmpp.isRoomJID(bare) {
+		b.rpc.RespondUIRelay(id, fmt.Sprintf("read_room: %q is not a room this bridge has joined (readable: %s)", room, strings.Join(b.acct.Rooms, ", ")))
+		return
+	}
+	if limit <= 0 {
+		limit = roomReadDefaultLimit
+	}
+	if limit > roomReadMaxLimit {
+		limit = roomReadMaxLimit
+	}
+	b.log("notice", fmt.Sprintf("tool-relay read_room: room=%q limit=%d", bare, limit))
+	// The MAM query is a network round trip, so run it off the RPC event loop and
+	// answer the blocked tool when it settles (same shape as the file upload).
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), mamTimeout)
+		defer cancel()
+		msgs, complete, err := b.xmpp.FetchMAM(ctx, bare, "", time.Time{}, limit)
+		if err != nil {
+			reason := fmt.Sprintf("read_room %s failed: %v", bare, err)
+			b.log("warning", reason)
+			b.rpc.RespondUIRelay(id, reason)
+			return
+		}
+		b.rpc.RespondUIRelay(id, formatRoomRead(bare, msgs, limit, complete))
+	}()
+}
+
+// formatRoomRead renders archived room messages for the model: oldest first, one
+// line each, with the sender, age and the stanza id it can be replied to. An
+// empty or bodyless window says so explicitly rather than returning an empty
+// string, which the extension would report as a failed read.
+func formatRoomRead(room string, msgs []InboundMessage, limit int, complete bool) string {
+	var sb strings.Builder
+	if len(msgs) == 0 {
+		return fmt.Sprintf("read_room: no archived messages in %s.", room)
+	}
+	fmt.Fprintf(&sb, "[pi-msg: read_room: last %d archived message(s) in %s, oldest first — read on demand, not a prompt; nothing here needs a reply unless you choose to send one.]", len(msgs), room)
+	for _, m := range msgs {
+		who := m.Nick
+		if who == "" {
+			who = bareJid(m.From)
+		}
+		if m.FromOwner {
+			who = "owner"
+		}
+		when := "time unknown"
+		if !m.Stamp.IsZero() {
+			when = shortAge(time.Since(m.Stamp))
+		}
+		reply := ""
+		if m.ReplyToID != "" {
+			reply = fmt.Sprintf(" [in reply to %s]", m.ReplyToID)
+		}
+		fmt.Fprintf(&sb, "\n  %s (%s)%s: %s", who, when, reply, strings.Join(strings.Fields(m.Body), " "))
+	}
+	if !complete || len(msgs) >= limit {
+		fmt.Fprintf(&sb, "\n  … window may be truncated at %d message(s); older history exists in the archive.", limit)
+	}
+	return sb.String()
+}
+
 // handleToolRelay performs an XMPP-side action requested by an agent tool call
 // in the companion extension, then answers the blocking relay with a string
 // result — "ok", or a failure reason the extension surfaces to the model as
@@ -613,6 +714,8 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		To           string             `json:"to"`
 		MessageID    string             `json:"messageId"`
 		From         string             `json:"from"`
+		Room         string             `json:"room"`
+		Limit        int                `json:"limit"`
 		ProcessCount int                `json:"count"`
 		Processes    []HeartbeatProcess `json:"processes"`
 	}
@@ -680,6 +783,8 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 			}
 			b.rpc.RespondUIRelay(id, url)
 		}()
+	case "read_room":
+		b.handleReadRoomRelay(id, cmd.Room, cmd.Limit)
 	case "process_count":
 		// Absolute count of background processes pi has running (relayed by the
 		// pi-processes companion extension). While any run — or any background
@@ -738,26 +843,37 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	// idle-away timer from now (a run still in flight keeps dnd — leave its
 	// presence alone).
 	//
-	// We re-arm the clock (markIdle) rather than leaving markActive's cleared
-	// state, because many inbound messages are ambient room chatter that never
-	// becomes a run — there's no agent_settled to re-arm it later. With only
-	// markActive, idleSince stays zero forever and the watcher can never drift
-	// the agent back to "away": a bot in a busy room is pinned to "listening"
-	// with no path back. markActive first resets awayAnnounced/lastAwayStatus so
-	// the next idle period announces a fresh away, then markIdle restarts the
-	// timer; if the message does start a run, that run's own agent_start/
-	// agent_settled lifecycle takes over the clock as usual.
+	// This runs before the room-address filter below, so an unaddressed room
+	// message still counts as activity — the bridge is in the room and heard it.
+	// The clock is re-armed with markIdle rather than left in markActive's cleared
+	// state, because many inbound messages never become a run (#106 dropped the
+	// rest), so there is no agent_settled to re-arm it later: with only markActive,
+	// idleSince stays zero forever and the watcher can never drift the agent back
+	// to "away". markActive first resets awayAnnounced/lastAwayStatus so the next
+	// idle period announces a fresh away, then markIdle restarts the timer; if the
+	// message does start a run, that run's own agent_start/agent_settled lifecycle
+	// takes over the clock as usual.
 	b.markActive()
 	b.markIdle()
 	if !b.streaming() && b.xmpp != nil {
 		b.announceSettledPresence()
 	}
 	// An inbound XEP-0444 reaction is an acknowledgment signal, not a
-	// conversation turn: surface it as ambient context for the agent's next
-	// prompt rather than triggering a run (issue #27).
+	// conversation turn: it wakes the agent only when idle (issue #27).
 	if len(m.Reactions) > 0 {
 		b.handleReaction(m)
 		return
+	}
+	// Room chatter that does not address this agent is not part of its world at
+	// all (#106): no turn, no durable record, no context. Classify BEFORE the
+	// inbox append so such a message never enters the durable queue — the same
+	// property the "drop an unactioned ambient entry" path used to buy after the
+	// fact, now by construction.
+	if !m.Direct {
+		if action, _ := b.classify(m); action == actionNotOurs {
+			b.log("info", fmt.Sprintf("room message in %s from %q does not address us; ignored", m.Room, m.Nick))
+			return
+		}
 	}
 	// Durably record the message BEFORE any prompt goes out (#96): a run that
 	// dies before its next tool yield would otherwise take the instruction with
@@ -775,7 +891,8 @@ func (b *Bridge) onInbound(m InboundMessage) {
 // handleReaction records an inbound XEP-0444 reaction (an ack from a peer or
 // the owner). Idle, it surfaces immediately so the reacted-to agent can read
 // the ack without the owner sending anything; if a run is in flight it is
-// buffered to ambient so the active turn isn't interrupted (issue #27).
+// dropped with a log line (issue #106 removed the ambient buffer that used to
+// hold it), so an ack never interrupts a run and never queues behind it.
 func (b *Bridge) handleReaction(m InboundMessage) {
 	render := m.Nick
 	if m.FromOwner {
@@ -786,9 +903,11 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	}
 	joint := strings.Join(m.Reactions, " ")
 	b.log("notice", fmt.Sprintf("inbound reaction from %s: %s (target %q)", render, joint, m.ReactionID))
-	// A run already in flight must not be interrupted by a steering prompt.
+	// A run already in flight must not be interrupted by a steering prompt, and
+	// there is no longer a buffer to hold the ack for later. An ack carries no
+	// obligation, so dropping it is the honest choice — say so in the log.
 	if b.streaming() {
-		b.bufferAmbient(render, "reacted "+joint+" to your message (XEP-0444 ack)")
+		b.log("info", fmt.Sprintf("reaction from %s dropped: a run is in flight and there is no ambient buffer (#106)", render))
 		return
 	}
 	// Idle: wake the agent so the ack is readable now. It may acknowledge, act,
@@ -807,19 +926,22 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	}
 }
 
-// roomAction is how a room message is treated under the two-axis model.
+// roomAction is how a room message is treated.
 type roomAction int
 
 const (
 	actionCanonical  roomAction = iota // owner: trusted, triggers a turn
 	actionCommentary                   // non-owner addressed: untrusted, triggers a turn
-	actionAmbient                      // untriggered: buffered, no turn
+	actionNotOurs                      // not addressed to us: no turn, nothing recorded
 )
 
-// classify applies the two-axis model, returning the action and the message
-// body with any trigger prefix stripped.
+// classify decides whether a room message is part of this agent's world, and
+// under what authority. There are two outcomes that matter: it addresses us (the
+// owner, a handle, a broadcast, or a reply to one of our own messages) and so
+// takes a turn, or it does not and is dropped entirely (#106). There is no third
+// tier — the ambient buffer that used to hold unaddressed chatter is gone.
 func (b *Bridge) classify(m InboundMessage) (roomAction, string) {
-	addressed, stripped := b.matchTrigger(m.Body)
+	addressed, stripped := b.matchTrigger(m.Room, m.Body)
 	switch {
 	case m.FromOwner:
 		if addressed {
@@ -828,14 +950,32 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string) {
 		return actionCanonical, m.Body
 	case addressed:
 		return actionCommentary, stripped
+	case b.replyToOwnMessage(m):
+		// Someone answered something we said, without naming us. Treat it as
+		// addressing us (XEP-0461, #95) rather than dropping it: a reply to our
+		// own message is the one form of non-named traffic that is unambiguously
+		// meant for us.
+		return actionCommentary, m.Body
 	default:
-		return actionAmbient, m.Body
+		return actionNotOurs, m.Body
 	}
 }
 
+// replyToOwnMessage reports whether m is a XEP-0461 reply to a stanza this
+// bridge sent. The stanza history records the id for both directions, so the
+// outbound case is marked as ours at send time (recordSelfMessage) rather than
+// being inferred from the recorded JID — a room send records the room, which is
+// indistinguishable from someone else's message in the same room.
+func (b *Bridge) replyToOwnMessage(m InboundMessage) bool {
+	if m.ReplyToID == "" || b.xmpp == nil {
+		return false
+	}
+	return b.xmpp.isSelfMessage(m.ReplyToID)
+}
+
 // handleRoom routes a room message per its classification: owner → canonical
-// trigger; a non-owner addressing the bot by name → untrusted-commentary
-// trigger; anything else → buffered ambient (no turn).
+// trigger; a non-owner addressing the bot → untrusted-commentary trigger;
+// anything else → dropped, with no turn and no context.
 func (b *Bridge) handleRoom(m InboundMessage) {
 	// Defence in depth (#29): the transport echo filter in dispatchRoom should
 	// already have dropped our own echo (case-insensitively). If one still
@@ -849,18 +989,18 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	}
 	action, body := b.classify(m)
 	// Cascade bound (#23): an owner message resets the budget; agent-to-agent
-	// turns spend it. When exhausted, the trigger degrades to ambient so the
-	// content is kept as context but takes no turn.
+	// turns spend it. When exhausted the trigger is dropped rather than demoted
+	// to a buffered turn, so the count is a hard stop.
 	switch action {
 	case actionCanonical:
 		b.resetCascade()
 	case actionCommentary:
 		if ok, announce := b.spendCascade(); !ok {
-			b.log("warning", fmt.Sprintf("cascade cap (%d) reached; buffering %q as ambient instead of taking a turn", cascadeCap, m.Nick))
+			b.log("warning", fmt.Sprintf("cascade cap (%d) reached; dropping a message from %q instead of taking another turn", cascadeCap, m.Nick))
 			if announce {
 				b.announceCascadeStop(m.Room)
 			}
-			action = actionAmbient
+			action = actionNotOurs
 		}
 	}
 	switch action {
@@ -872,21 +1012,23 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 		// path needs BOTH a target jid and an id, so an id with no jid reacts to
 		// nothing.
 		reactTo := ""
-		if b.acct.RoomReactions {
+		if b.acct.ReactionsFor(m.Room) {
 			reactTo = m.Room
 		}
 		b.handleCanonical(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID, b.replyContext(m))
 	case actionCommentary:
 		reactTo := ""
-		if b.acct.RoomReactions {
+		if b.acct.ReactionsFor(m.Room) {
 			reactTo = m.Room
 		}
 		b.dispatchCommentary(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID, b.replyContext(m))
-	case actionAmbient:
-		// Buffered as context, no turn: no run will ever settle for it, so it
-		// must not stay in the durable queue (#104).
+	case actionNotOurs:
+		// Nothing is handed to the agent, so nothing may stay in the durable
+		// queue: a run will never settle for it (#104). The live path already
+		// filtered before appending, so this branch only sees a message that
+		// arrived as addressed and then hit the cascade cap above, or one
+		// replayed from the inbox — both of which were appended.
 		b.inboxDrop(m.ID, m.From, m.Body)
-		b.bufferAmbient(m.Nick, m.Body)
 	}
 }
 
@@ -1416,10 +1558,9 @@ func (b *Bridge) routingContract() string {
 
 // composePrompt assembles the text sent to pi. When the account has room
 // access it leads with a "from:"/"sender:" header naming the message's origin;
-// buffered ambient commentary is prepended as a non-canonical block, and
-// non-owner messages are wrapped as untrusted commentary. origin is the
-// channel jid (owner or room); sender is the individual's real jid (room only,
-// when known).
+// non-owner messages are wrapped as untrusted commentary. origin is the channel
+// jid (owner or room); sender is the individual's real jid (room only, when
+// known).
 //
 // No per-message routing hint is appended here (see issue #33): the routing
 // rules live persistently in the fleet AGENTS.md/project context (the
@@ -1487,6 +1628,20 @@ func shortAge(d time.Duration) string {
 	}
 }
 
+// roomsContract names the rooms this bridge has joined and states the delivery
+// rule in force in them (#106): a room message either addresses this agent — and
+// arrives as a normal prompt with a `from:` header — or it is not delivered at
+// all. There is no buffered room chatter, so an agent that wants the wider
+// conversation must read it deliberately with the read_room tool. Seeded once
+// per session alongside the routing contract, because an agent that assumes
+// silence means an empty room will miss handoffs it was not named in.
+func (b *Bridge) roomsContract() string {
+	if len(b.acct.Rooms) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[pi-msg: rooms: you are in %s. A room message that addresses you arrives as a normal prompt with a `from:` header naming that room — reply there with `to: <that room jid>`. Messages that do not address you are NOT delivered and are NOT buffered; silence means nobody addressed you, not that nothing was said. Use the read_room tool to read a room's recent history on demand.]", strings.Join(b.acct.Rooms, ", "))
+}
+
 func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender, reactID, reactTo, replyTo string) string {
 	var sb strings.Builder
 	// Seed the pi-msg routing contract once per session (fresh session or after
@@ -1497,9 +1652,7 @@ func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender
 		b.routingSeeded = true
 		sb.WriteString(b.routingContract())
 		sb.WriteString("\n\n")
-	}
-	if ambient := b.drainAmbient(); ambient != "" {
-		sb.WriteString(ambient)
+		sb.WriteString(b.roomsContract())
 		sb.WriteString("\n\n")
 	}
 	if b.acct.RoomMode() && origin != "" {
@@ -1532,23 +1685,27 @@ func (b *Bridge) composePrompt(body string, canonical bool, nick, origin, sender
 	return sb.String()
 }
 
-// matchTrigger reports whether body addresses the bot by its room trigger and
-// returns the text to prompt with. Three forms are accepted:
+// matchTrigger reports whether body addresses the bot in room, and returns the
+// text to prompt with. Four forms are accepted:
 //
 //	"pi: …" / "pi, …"  at the start   → addressed; the prefix is stripped
 //	"… pi: …"          anywhere       → addressed; body kept intact
 //	"… @pi …"          anywhere       → addressed; body kept intact
+//	"… pi …"           anywhere       → addressed; body kept intact (bare mention)
 //
 // Agents address each other mid-message far more often than at position 0, so
-// restricting to the leading form drops most handoffs on the floor (#21). Only
-// the colon form is honoured away from the start: "name," occurs constantly in
-// ordinary prose ("roster shows peppy and slippy") and matching it
-// anywhere produces false triggers, whereas "name:" does not.
+// restricting to the leading form drops most handoffs on the floor (#21). The
+// colon form is honoured anywhere for the same reason.
 //
-// Fenced code blocks and quoted lines are excluded before scanning, so a pasted
-// transcript or log containing "beltino: …" cannot trigger an agent.
-func (b *Bridge) matchTrigger(body string) (bool, string) {
-	trig := b.acct.RoomTrigger
+// The bare mention (no sigil, no colon) was added in #106, when the ambient
+// buffer was removed: with no buffer, a missed address means the message does
+// not exist for the agent at all. It costs false positives — prose about an
+// agent ("beltino handed over to fox") now wakes that agent — which is the
+// deliberate trade for not losing handoffs, and why the old code restricted
+// inline matching to the colon form. Matching is word-boundary and excludes
+// code fences and quoted lines, so a pasted transcript cannot trigger an agent.
+func (b *Bridge) matchTrigger(room, body string) (bool, string) {
+	trig := b.acct.TriggerFor(room)
 	if trig == "" {
 		return false, ""
 	}
@@ -1563,7 +1720,7 @@ func (b *Bridge) matchTrigger(body string) (bool, string) {
 	// Inline forms: the address is part of the sentence, so the body is passed
 	// through unchanged — stripping would discard content.
 	if scan := stripUnquoted(t); scan != "" {
-		if containsAddress(scan, trig) || containsBroadcast(scan) {
+		if containsAddress(scan, trig) || containsBroadcast(scan) || containsMention(scan, trig) {
 			return true, t
 		}
 	}
@@ -1638,6 +1795,44 @@ func isWordByte(c byte) bool {
 	return c == '_' || c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
+// containsMention reports whether scan names the trigger as a standalone word,
+// with no "@" sigil and no trailing ":" required. That is the form the older
+// containsAddress deliberately ignored, and it is the whole point of #106:
+// "ask peppy", "peppy should own this" and "beltino handed over to fox" are
+// addressed messages in every sense that matters, and with the ambient buffer
+// gone nothing else would catch them.
+//
+// Word boundaries are enforced on both sides, so "peppy" does not match inside
+// "peppytest" and "pi" does not match inside "api". scan is expected to have
+// had code fences and quoted lines removed (see stripUnquoted) — a pasted
+// transcript must not address anyone.
+func containsMention(scan, trig string) bool {
+	lower := strings.ToLower(scan)
+	lt := strings.ToLower(trig)
+	if lt == "" {
+		return false
+	}
+	for i := 0; ; {
+		j := strings.Index(lower[i:], lt)
+		if j < 0 {
+			return false
+		}
+		at := i + j
+		i = at + len(lt)
+		// Word boundary before: start of string, or a non-word character.
+		if at > 0 && isWordByte(lower[at-1]) {
+			continue
+		}
+		// Word boundary after: end of string, or a non-word character. This is
+		// what keeps "peppy" out of "peppytest" while still matching "peppy,"
+		// and "peppy.".
+		if i < len(lower) && isWordByte(lower[i]) {
+			continue
+		}
+		return true
+	}
+}
+
 // stripUnquoted removes fenced code blocks and "> " quoted lines so that
 // pasted transcripts and command output cannot address an agent.
 func stripUnquoted(t string) string {
@@ -1686,19 +1881,23 @@ func (b *Bridge) spendCascade() (ok, announce bool) {
 
 // announceCascadeStop posts a visible notice in the room when this agent stops
 // answering peer handoffs, so a stall is diagnosable from the chat itself. The
-// notice deliberately contains no "@name", so it cannot trigger another agent
-// and extend the cascade it is reporting.
+// notice names neither an @handle nor the agent's own nick: with bare-name
+// mentions addressing agents (#106), even "pi is no longer answering" would
+// address every agent called pi and extend the cascade it is reporting. The
+// room already shows who posted it.
 func (b *Bridge) announceCascadeStop(room string) {
 	if b.xmpp == nil || room == "" {
 		return
 	}
-	who := b.acct.Nick
-	if who == "" {
-		who = b.acct.RoomTrigger
-	}
-	b.xmpp.SendRoomTo(bareJid(room), fmt.Sprintf(
-		"⚠️ %s is no longer answering agent handoffs — %d consecutive agent-to-agent turns with no message from the owner. Further handoffs are being kept as context but not acted on. A message from the owner resumes normal operation.",
-		who, cascadeCap))
+	b.xmpp.SendRoomTo(bareJid(room), cascadeStopNotice())
+}
+
+// cascadeStopNotice is the text announceCascadeStop posts. Split out so the
+// wording can be asserted without an XMPP session: it must not address anyone.
+func cascadeStopNotice() string {
+	return fmt.Sprintf(
+		"⚠️ No longer answering agent handoffs — %d consecutive agent-to-agent turns with no message from the owner. Further handoffs are dropped rather than kept as context. A message from the owner resumes normal operation.",
+		cascadeCap)
 }
 
 // handleRe matches an "@handle" mention. A trailing "." or "@" is excluded so
@@ -1857,36 +2056,8 @@ func (b *Bridge) handleWarned() bool {
 	return b.handleWarnedRun
 }
 
-// bufferAmbient records a non-triggering room message for later context.
-func (b *Bridge) bufferAmbient(nick, body string) {
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return
-	}
-	b.ambientMu.Lock()
-	defer b.ambientMu.Unlock()
-	b.ambient = append(b.ambient, ambientMsg{nick: nick, body: body})
-	if len(b.ambient) > ambientCap {
-		b.ambient = b.ambient[len(b.ambient)-ambientCap:]
-	}
-}
-
-// drainAmbient returns the buffered ambient messages as a labeled block and
-// clears the buffer, or "" if empty.
-func (b *Bridge) drainAmbient() string {
-	b.ambientMu.Lock()
-	defer b.ambientMu.Unlock()
-	if len(b.ambient) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteString("[pi-msg: muc: room commentary since your last turn — non-canonical. You need not reply, but if any claim here looks wrong, say so.]")
-	for _, a := range b.ambient {
-		fmt.Fprintf(&sb, "\n  %s: %s", a.nick, a.body)
-	}
-	b.ambient = nil
-	return sb.String()
-}
+// ambient buffer removed (#106): unaddressed room messages are dropped at
+// dispatch instead of being held for a later turn. See handleRoom.
 
 // reply sends a bridge-generated notice (banner, command results, shutdown,
 // errors) to the owner's 1:1 — the primary channel. Agent replies go through
@@ -3701,7 +3872,7 @@ const inboxNote = "[pi-msg: re-delivered after a restart — this was queued to 
 
 // deliverInbox re-delivers one unacknowledged message after a restart. It goes
 // through the normal dispatch path, so room rules (trigger, non-owner
-// commentary, ambient buffering) are applied again exactly as they were the
+// commentary rules) are applied again exactly as they were the
 // first time. The entry stays in the inbox until the run that consumes it
 // settles, so a repeated stop cannot lose it; the note is appended rather than
 // prepended so a room trigger at the start of the body still matches.
@@ -3745,8 +3916,8 @@ func (b *Bridge) inboxMarkDelivered(id string) {
 	b.inbox.markDelivered(id, "", "", time.Now())
 }
 
-// inboxDrop removes a message that will never become a prompt — buffered
-// ambient chatter, a bridge command, a dropped own-echo. No run will settle for
+// inboxDrop removes a message that will never become a prompt — an unaddressed
+// room message, a bridge command, a dropped own-echo. No run will settle for
 // it, so waiting for an ack would strand it until the next restart re-delivered
 // it as "unacknowledged" (#104).
 func (b *Bridge) inboxDrop(id, from, body string) {
