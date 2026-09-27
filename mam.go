@@ -298,11 +298,17 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 			ownLine = true
 		}
 	}
+	owner := false
+	if col.room == "" {
+		owner = bareJid(from) == b.ownerBare
+	} else if real := b.occupantRealJID(col.room, nick); real != "" {
+		owner = real == b.ownerBare
+	}
 	if id != "" && col.record {
 		if ownLine {
 			b.recordSelfMessage(id, from, body)
 		} else {
-			b.recordMessageBody(id, from, body)
+			b.recordInboundMessage(id, from, body, owner)
 		}
 	}
 	if ownLine {

@@ -911,14 +911,22 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	}
 	joint := strings.Join(m.Reactions, " ")
 	b.log("notice", fmt.Sprintf("inbound reaction from %s: %s (target %q)", render, joint, m.ReactionID))
-	// A room reaction only addresses us when it is acking something WE said (or
-	// when it comes from the owner, who is trusted traffic). A reaction to
+	// A room reaction only addresses us when it is acking something WE said, or
+	// when the owner acks a message we cannot attribute to a peer. A reaction to
 	// another occupant's message is somebody else's conversation: with no ambient
 	// buffer and no passive awareness (#106), waking on it would be the last
-	// surviving room path where a non-addressing message costs a turn.
-	if !m.Direct && !m.FromOwner && !b.xmppIsSelfMessage(m.ReactionID) {
-		b.log("info", fmt.Sprintf("reaction from %s dropped: it targets a message that is not ours (#106)", render))
-		return
+	// surviving room path where a non-addressing message costs a turn — and an
+	// owner's reaction to a peer's message is that peer's business, exactly as an
+	// owner reply to it is (ownerDirectedElsewhere).
+	if !m.Direct {
+		if b.xmpp != nil && b.xmpp.replyTargetOther(m.ReactionID) {
+			b.log("info", fmt.Sprintf("reaction from %s dropped: it targets another agent's message (#106)", render))
+			return
+		}
+		if !m.FromOwner && !b.xmppIsSelfMessage(m.ReactionID) {
+			b.log("info", fmt.Sprintf("reaction from %s dropped: it targets a message that is not ours (#106)", render))
+			return
+		}
 	}
 	// A run already in flight must not be interrupted by a steering prompt, and
 	// there is no longer a buffer to hold the ack for later. An ack carries no
@@ -980,8 +988,19 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 	}
 	switch {
 	case m.FromOwner:
+		// The owner is trusted traffic, so an owner room message needs no
+		// mention to reach us — but only an owner message that names nobody is
+		// a broadcast. A tag or a stanza reply picks out an account, and the
+		// message belongs to that account alone (#106).
 		if addressed {
 			return actionCanonical, stripped, ""
+		}
+		if b.replyToOwnMessage(m) {
+			return actionCanonical, m.Body, ""
+		}
+		if who, why := b.ownerDirectedElsewhere(m); who != "" {
+			b.log("notice", fmt.Sprintf("owner message in %s is directed at %s (%s), not us — not delivering", m.Room, who, why))
+			return actionNotOurs, m.Body, ""
 		}
 		return actionCanonical, m.Body, ""
 	case addressed:
@@ -1013,6 +1032,90 @@ func (b *Bridge) replyToOwnMessage(m InboundMessage) bool {
 		return false
 	}
 	return b.xmpp.isSelfMessage(m.ReplyToID)
+}
+
+// ownerDirectedElsewhere reports which other account an owner message is meant
+// for, and why, or ("", "") when it is an unaddressed broadcast. It is only
+// consulted for owner messages that do not address us at all, and it is
+// deliberately about the owner: a peer's unaddressed room message is dropped
+// either way, so the extra work only exists where silence would otherwise mean
+// every agent answering a message written for one of them.
+//
+// Two forms count as directed, in this order:
+//
+//   - a XEP-0461 reply to a stanza we have seen from a peer — the reply answers
+//     that peer. A reply to the owner's own message, or to an id we do not know
+//     (it may be ours, from before a restart), is not evidence of a handoff and
+//     falls through to the untagged broadcast case, so an unresolvable reply is
+//     delivered rather than lost.
+//   - a name: an @handle, a leading "nick:" / "nick,", or a bare nick of
+//     another occupant. Occupants come from presence, so with a roster that has
+//     not populated yet there is no evidence and the message stays a broadcast.
+func (b *Bridge) ownerDirectedElsewhere(m InboundMessage) (who, why string) {
+	if b.xmpp == nil {
+		return "", ""
+	}
+	if m.ReplyToID != "" && b.xmpp.replyTargetOther(m.ReplyToID) {
+		return "another agent", fmt.Sprintf("reply to stanza %s", m.ReplyToID)
+	}
+	if who := b.addressesOtherOccupant(m.Room, m.Body); who != "" {
+		return who, "named in the body"
+	}
+	return "", ""
+}
+
+// addressesOtherOccupant reports the nick of another occupant this room message
+// names, or "" if it names nobody but us. It shares the addressing vocabulary
+// the rest of the bridge uses (see matchTrigger), so an owner message is read
+// the same way a peer's message is.
+func (b *Bridge) addressesOtherOccupant(room, body string) string {
+	if b.xmpp == nil || room == "" {
+		return ""
+	}
+	occupants := b.xmpp.OccupantNicks(room)
+	if len(occupants) == 0 {
+		return ""
+	}
+	me := b.xmpp.ownNick(room)
+	if me == "" {
+		me = b.acct.Nick
+	}
+	trig := b.acct.TriggerFor(room)
+	ours := func(name string) bool {
+		return (me != "" && strings.EqualFold(name, me)) || (trig != "" && strings.EqualFold(name, trig))
+	}
+	scan := stripUnquoted(body)
+	if scan == "" {
+		return ""
+	}
+	for _, match := range handleRe.FindAllStringSubmatch(scan, -1) {
+		name := match[1]
+		if ours(name) {
+			continue
+		}
+		for _, occ := range occupants {
+			if strings.EqualFold(name, occ) {
+				return occ
+			}
+		}
+	}
+	// A leading "nick:" / "nick," is the colon form matchTrigger accepts, and a
+	// bare nick anywhere in an unquoted line is the bare-name form.
+	trimmed := strings.TrimSpace(body)
+	for _, occ := range occupants {
+		if ours(occ) {
+			continue
+		}
+		if len(trimmed) > len(occ) && strings.EqualFold(trimmed[:len(occ)], occ) {
+			if c := trimmed[len(occ)]; c == ':' || c == ',' {
+				return occ
+			}
+		}
+		if containsMention(scan, occ) {
+			return occ
+		}
+	}
+	return ""
 }
 
 // handleRoom routes a room message per its classification: owner → canonical
@@ -1595,7 +1698,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. The owner's own rule differs: an owner room message that names nobody is addressed to every agent in the room, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. When the account has room

@@ -140,6 +140,99 @@ func TestClassifyReplyToOwnMessage(t *testing.T) {
 	}
 }
 
+// An owner room message is trusted traffic: naming nobody means it is for every
+// agent in the room, the same fan-out as @everyone. A tag or a stanza reply
+// picks out one account, and the message belongs to that account alone (#106) —
+// without this, every agent answers a note the owner wrote to one of them.
+func TestOwnerMessageRouting(t *testing.T) {
+	b := roomBridge() // owner zach@x.com, nick pi, trigger pi, room team@muc.x.com
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	x.occupants["team@muc.x.com"] = map[string]string{
+		"pi":      "pi@x.com",
+		"beltino": "beltino@x.com",
+		"peppy":   "peppy@x.com",
+	}
+	b.xmpp = x
+	x.recordInboundMessage("peppy-id", "team@muc.x.com/peppy", "we shipped", false)
+	x.recordInboundMessage("owner-id", "team@muc.x.com/zach", "status?", true)
+	x.recordSelfMessage("our-id", "team@muc.x.com", "on it")
+
+	const room = "team@muc.x.com"
+	cases := []struct {
+		name   string
+		body   string
+		reply  string
+		owner  bool
+		action roomAction
+	}{
+		{"untagged owner message is a broadcast", "status update please", "", true, actionCanonical},
+		{"owner @handle picks one account", "@peppy have a look", "", true, actionNotOurs},
+		{"owner colon form picks one account", "peppy: have a look", "", true, actionNotOurs},
+		{"owner bare name picks one account", "peppy have a look at the parser", "", true, actionNotOurs},
+		{"owner naming us is ours", "@pi take this one", "", true, actionCanonical},
+		{"owner naming us among others is ours", "@peppy and @pi sort it out", "", true, actionCanonical},
+		{"owner @everyone is ours", "@everyone standup in 5", "", true, actionCanonical},
+		{"a fenced name is not a tag", "```\npeppy: do it\n```", "", true, actionCanonical},
+		{"a quoted name is not a tag", "> peppy: do it", "", true, actionCanonical},
+		{"owner reply to a peer belongs to the peer", "", "peppy-id", true, actionNotOurs},
+		{"owner reply to the owner's own is a broadcast", "", "owner-id", true, actionCanonical},
+		{"owner reply to us is ours", "", "our-id", true, actionCanonical},
+		{"an unresolvable reply is delivered, not lost", "", "unknown-id", true, actionCanonical},
+		{"a peer naming another peer is still not ours", "@beltino yours", "", false, actionNotOurs},
+		{"a peer naming nobody is still dropped", "no name here", "", false, actionNotOurs},
+	}
+	for _, c := range cases {
+		m := InboundMessage{Body: c.body, Nick: "zach", Room: room, FromOwner: c.owner, ReplyToID: c.reply}
+		action, _, _ := b.classify(m)
+		if action != c.action {
+			t.Errorf("%s: classify(%q, reply=%q, owner=%v) = %d, want %d", c.name, c.body, c.reply, c.owner, action, c.action)
+		}
+	}
+
+	// With no occupant roster there is nothing to check a name against, so the
+	// message stays a broadcast rather than silently reaching nobody.
+	empty := roomBridge()
+	empty.xmpp = NewXMPPBridge(empty.acct, func(InboundMessage) {}, empty.log)
+	if action, _, _ := empty.classify(InboundMessage{Body: "@peppy look", Room: room, FromOwner: true}); action != actionCanonical {
+		t.Errorf("owner message with an empty roster = %d, want actionCanonical", action)
+	}
+}
+
+// The reply-target verdict depends on knowing who wrote the stanza, so the
+// history entry keeps that across a re-record (#106 review): a MAM re-fetch or a
+// late duplicate must not turn our own message — or the owner's — into a peer's,
+// which would drop an unaddressed reply to it.
+func TestMessageHistoryKeepsAuthor(t *testing.T) {
+	b := roomBridge()
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	x.recordSelfMessage("ours", "team@muc.x.com", "on it")
+	x.recordInboundMessage("owners", "team@muc.x.com/zach", "thanks", true)
+	x.recordInboundMessage("peers", "team@muc.x.com/peppy", "ack", false)
+	// Re-record every one of them the way a MAM fetch or a duplicate would.
+	for _, id := range []string{"ours", "owners", "peers"} {
+		x.recordMessageBody(id, "team@muc.x.com", "re-recorded")
+	}
+	if !x.isSelfMessage("ours") {
+		t.Error("re-record unmarked our own stanza")
+	}
+	if x.replyTargetOther("ours") {
+		t.Error("our own stanza is treated as a peer's after re-record")
+	}
+	if x.replyTargetOther("owners") {
+		t.Error("the owner's stanza is treated as a peer's after re-record")
+	}
+	if !x.replyTargetOther("peers") {
+		t.Error("a peer's stanza is not recognised after re-record")
+	}
+	if x.replyTargetOther("never-seen") {
+		t.Error("an unknown stanza id is treated as a peer's")
+	}
+	x.recordInboundMessage("fresh", "team@muc.x.com/beltino", "hi", false)
+	if !x.replyTargetOther("fresh") {
+		t.Error("a recorded peer stanza is not recognised")
+	}
+}
+
 // TestUnaddressedRoomMessageIsDropped replaces the old ambient-buffer tests
 // (#106): an unaddressed room message must produce no turn and must not stay in
 // the durable inbox. Reaching the buffer at all is now the bug.
