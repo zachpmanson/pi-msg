@@ -777,6 +777,12 @@ func formatRoomRead(room string, msgs []InboundMessage, complete bool, window st
 		if m.FromOwner {
 			who = "owner"
 		}
+		// Our own archived lines are part of the room's history, so a read that
+		// hid them would misrepresent the conversation. They are marked instead:
+		// the reader sent them, and an unmarked line of its own looks like a peer.
+		if m.Own {
+			who = who + " [we sent]"
+		}
 		when := "time unknown"
 		if !m.Stamp.IsZero() {
 			when = shortAge(time.Since(m.Stamp))

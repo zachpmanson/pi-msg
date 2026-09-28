@@ -412,12 +412,12 @@ ${systemPrompt}`;
 			name: "read_room",
 			label: "Read room history (XMPP)",
 			description:
-				"Read messages from a group chat this bridge has joined, via the server's XEP-0313 archive. Defaults to the NEWEST 30 (max 100) messages; `since` and `before` narrow the window. The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns messages oldest first, with sender, age and stanza ID. Reading does not reply to anything.",
+				"Read messages from a group chat this bridge has joined, via the server's XEP-0313 archive. Defaults to the NEWEST 30 (max 100) messages; `since` and `before` narrow the window. The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns messages oldest first, each with sender, age and its archive id — the `[id …]` value `before` takes — and reports the room as it happened, including the lines this account sent, marked `[we sent]`. Reading does not reply to anything.",
 			promptSnippet: "Read recent history from a joined group chat",
 			promptGuidelines: [
 				"Use read_room when you need the wider room conversation — a handoff you were not named in, or context behind a message that addressed you.",
 				"Omit `room` when the account joins a single room; pass it when it joins several.",
-				"Pass `since` (an RFC 3339 stamp or a relative age like 2h) to bound the read, and `before` (the oldest stanza ID from a previous read) to page further back than the newest window.",
+				"Pass `since` (an RFC 3339 stamp or a relative age like 2h) to bound the read, and `before` (an archive id printed as `[id …]` on a previous read) to page further back than the newest window.",
 				"read_room only reads. Send anything you want to say with a normal reply (a `to: <room jid>` line).",
 			],
 			parameters: Type.Object({
