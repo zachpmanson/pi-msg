@@ -152,7 +152,7 @@ func (b *XMPPBridge) FetchMAMRoomWindow(ctx context.Context, room string, since 
 // immediately before the cursor — never the room's newest. The substitution
 // always ends at the room's newest, which makes that equality the signature.
 func cursorFallbackPage(page, newest []InboundMessage) bool {
-	return len(page) > 0 && len(newest) > 0 && page[len(page)-1].ID == newest[len(newest)-1].ID
+	return len(page) > 0 && len(newest) > 0 && page[len(page)-1].ArchiveID == newest[len(newest)-1].ArchiveID
 }
 
 // fetchMAM is the shared XEP-0313 query. `before` is an optional stanza id
@@ -384,7 +384,11 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 			stamp = t
 		}
 	}
-	m := InboundMessage{Body: body, ID: id, From: from, Stamp: stamp}
+	// The <result> element's own id is the ARCHIVE id (what RSM cursors address);
+	// the message's id attribute is the sender's. Keeping both lets read_room
+	// print a usable cursor without changing routing, which keys off the message
+	// id (#117).
+	m := InboundMessage{Body: body, ID: id, ArchiveID: attr(res.Attr, "id"), From: from, Stamp: stamp}
 	// A recovered message can itself be a XEP-0461 reply; keep the stamp so the
 	// prompt names what it answers (#95).
 	if re, ok := element(rest, replyNS, "reply"); ok {

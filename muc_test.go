@@ -829,18 +829,18 @@ func TestFormatRoomRead(t *testing.T) {
 
 	stamp := time.Now().Add(-3 * time.Minute)
 	msgs := []InboundMessage{
-		{ID: "s1", Nick: "slippy", Body: "the parser   is flaky", Stamp: stamp},
-		{ID: "p1", Nick: "peppy", Body: "on it", Stamp: stamp, ReplyToID: "abc123"},
-		{ID: "z1", Nick: "zach", Body: "thanks", Stamp: stamp, FromOwner: true},
+		{ID: "s1", ArchiveID: "9811", Nick: "slippy", Body: "the parser   is flaky", Stamp: stamp},
+		{ID: "p1", ArchiveID: "9812", Nick: "peppy", Body: "on it", Stamp: stamp, ReplyToID: "abc123"},
+		{ID: "z1", ArchiveID: "9813", Nick: "zach", Body: "thanks", Stamp: stamp, FromOwner: true},
 	}
 	got = formatRoomRead("team@muc.x", msgs, true, "newest 30")
 	if !strings.HasPrefix(got, "[pi-msg: read_room:") {
 		t.Errorf("read_room block must carry its header (the tool keys off it): %q", got)
 	}
-	if !strings.Contains(got, "slippy (3m ago) [id s1]: the parser is flaky") {
+	if !strings.Contains(got, "slippy (3m ago) [id 9811]: the parser is flaky") {
 		t.Errorf("sender/age/id/body line wrong: %q", got)
 	}
-	if !strings.Contains(got, "owner (3m ago) [id z1]: thanks") {
+	if !strings.Contains(got, "owner (3m ago) [id 9813]: thanks") {
 		t.Errorf("the owner should render as owner: %q", got)
 	}
 	if !strings.Contains(got, "[in reply to abc123]") {
@@ -848,7 +848,7 @@ func TestFormatRoomRead(t *testing.T) {
 	}
 	// The stanza id is what makes `before` usable: it must be printed, next to the
 	// reply stamp when there is one (#117).
-	if !strings.Contains(got, "peppy (3m ago) [id p1] [in reply to abc123]: on it") {
+	if !strings.Contains(got, "peppy (3m ago) [id 9812] [in reply to abc123]: on it") {
 		t.Errorf("stanza id must be printed alongside the reply stamp: %q", got)
 	}
 	if strings.Contains(got, "older history") {
@@ -907,14 +907,14 @@ func TestRoomReadCursor(t *testing.T) {
 // this check catches: a genuine cursor page ends strictly before the cursor, so
 // it can never end at the room's newest message (#117).
 func TestCursorFallbackPage(t *testing.T) {
-	page := []InboundMessage{{ID: "p1"}, {ID: "p2"}, {ID: "p3"}}
-	newest := []InboundMessage{{ID: "p4"}}
+	page := []InboundMessage{{ArchiveID: "9811"}, {ArchiveID: "9812"}, {ArchiveID: "9813"}}
+	newest := []InboundMessage{{ArchiveID: "9814"}}
 	if cursorFallbackPage(page, newest) {
 		t.Error("a page ending before the newest message is a genuine cursor page")
 	}
 	// The substitution: the page handed back for an unknown cursor ends at the
 	// room's newest message.
-	if !cursorFallbackPage([]InboundMessage{{ID: "p2"}, {ID: "p4"}}, newest) {
+	if !cursorFallbackPage([]InboundMessage{{ArchiveID: "9812"}, {ArchiveID: "9814"}}, newest) {
 		t.Error("a page ending at the newest message is the unknown-cursor substitution")
 	}
 	if cursorFallbackPage(nil, newest) || cursorFallbackPage(page, nil) {
