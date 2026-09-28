@@ -901,6 +901,21 @@ func TestRoomReadCursor(t *testing.T) {
 	}
 }
 
+// The empty cursor page is ambiguous — an archive beginning or an id the archive
+// does not hold — and only the room's oldest archive id tells them apart (#117).
+func TestCursorEmptyPageUnknown(t *testing.T) {
+	oldest := []InboundMessage{{ArchiveID: "1790591198278479"}}
+	if cursorEmptyPageUnknown(oldest, "1790591198278479") {
+		t.Error("the archive's oldest message as cursor is a genuine empty window")
+	}
+	if !cursorEmptyPageUnknown(oldest, "23d0a58749d0e711") {
+		t.Error("an id that is not the oldest message cannot explain an empty page")
+	}
+	if cursorEmptyPageUnknown(nil, "1790591198278479") {
+		t.Error("an empty archive has nothing to compare, so it is not an unknown cursor")
+	}
+}
+
 // An unrecognised cursor is answered by the server with the NEWEST page rather
 // than an error, which is how a stale cursor once came back with the 27 newest
 // messages under a `before stanza <garbage>` label. That substitution is what
