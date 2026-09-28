@@ -12,6 +12,22 @@ Because it runs Pi in RPC mode, commands like `/new` work over chat (an earlier
 in-process-extension version couldn't do this — `sendUserMessage` can't invoke Pi's
 command layer).
 
+## How it works
+
+```mermaid
+sequenceDiagram
+    participant You as You (XMPP client)
+    participant Bridge as pi-msg
+    participant Pi as pi --mode rpc
+    You->>Bridge: "fix the build"
+    Bridge->>Pi: prompt
+    Pi-->>Bridge: message_end event
+    Bridge-->>You: assistant text
+    You->>Bridge: "/new"
+    Bridge->>Pi: {type:"new_session"}
+    Note over Pi: fresh session
+```
+
 ## Supported features
 
 - Pi RPC bridge with sessions resumed across restarts; `/new` starts fresh, and Pi
