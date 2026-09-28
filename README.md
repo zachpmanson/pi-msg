@@ -350,14 +350,8 @@ even when they address the agent. Room prompts identify the sender and whether t
 was a tag, owner broadcast, or reply, so the agent can judge the content without treating
 it as an instruction.
 
-**Reading a room (`read_room`).** Unaddressed messages are not delivered, so use this tool
-to inspect room history. It returns the latest XEP-0313 MAM page (default 30, max 100),
-oldest first, with sender, age, archive and stanza IDs, and this account's own messages
-marked `[we sent]`. A short unbounded read means there is no older archive history.
-`since` accepts an RFC 3339 timestamp or relative duration; `before` takes a printed
-archive `[id …]` and returns strictly older messages. The `[stanza …]` ID is for replies
-and reactions, not pagination; unknown archive cursors return an error. Only normal rooms
-are readable.
+**Room history.** XEP-0313 MAM is supported through `read_room`; only normal rooms are
+readable.
 
 Rooms must be **non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*;
 optionally *members-only*). Semi-anonymous rooms hide real JIDs, so pi-msg cannot identify
@@ -477,7 +471,7 @@ perform the XMPP action):
 | --- | --- | --- |
 | `send_reaction` | React to the human's latest message with an emoji (XEP-0444) | `reactions` is on |
 | `send_file` | Upload a local file and deliver it (XEP-0363 + XEP-0066); dest defaults to the current conversation, allowlisted | always |
-| `read_room` | Read a room's recent archive (XEP-0313 MAM) as a labelled transcript — the only way to see a room the agent was not addressed in. Optional `since` bound and `before` archive-id cursor; lines include both archive `[id …]` and message `[stanza …]` IDs | `rooms` is set |
+| `read_room` | Read recent room history via MAM (XEP-0313) | `rooms` is set |
 
 Reply **routing** (`to:`) stays an in-band text convention (above); only these discrete
 side-effect actions are tools. Read-side tools are not incidental: with unaddressed room
