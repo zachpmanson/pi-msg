@@ -1223,17 +1223,22 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 		b.inboxDrop(reactID, "", "")
 		return
 	}
+	// Point the default reply/file destination at the message that arrived, BEFORE
+	// any dispatch. A control command produces no prompt of its own, so setting this
+	// only on the prompt path below would make a command inherit the destination of
+	// the previous turn: /export or /dump typed in the owner's 1:1 would upload the
+	// session file to whatever room the agent spoke in last (issue #113).
+	b.setTurnDest(origin, false) // the owner wrote it, so no tag is expected
 	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!")) && b.handleCommand(t) {
 		// Handled in-process: it never becomes a prompt, so nothing will ever
 		// settle for it (#104).
 		b.inboxDrop(reactID, "", "")
 		return
 	}
-	// A real prompt: point lifecycle/agent reactions at the message that drove it,
-	// and remember where a reply (or tool-driven file) should go by default.
+	// A real prompt: point lifecycle/agent reactions at the message that drove it.
+	// The reply/file destination was already set above, before the command check.
 	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
-	b.setTurnDest(origin, false) // the owner wrote it, so no tag is expected
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
 	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo, replyTo), b.steerBehavior())
 	b.busyPresence("thinking…")

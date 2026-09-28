@@ -1582,3 +1582,32 @@ func TestRPCEnv(t *testing.T) {
 		t.Errorf("rpcEnv(text) = %v, want PI_MSG_TOOLS + PI_MSG_BEFORE_AGENT_START_TEXT", withText)
 	}
 }
+
+// A control command produces no prompt, so it must set its own reply/file
+// destination rather than inheriting the previous turn's. Before this, a
+// /export or /dump typed in the owner's 1:1 uploaded the session file to
+// whichever room the agent last spoke in (issue #113).
+func TestCommandReplyUsesItsOwnOrigin(t *testing.T) {
+	b := roomBridge()
+	b.rpc = &RPCClient{} // fire-and-forget writes fail harmlessly ("pi not running")
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	// The agent's last turn was in the room...
+	b.setTurnDest("team@muc.x.com", true)
+
+	// ...then an owner command arrives in the 1:1. The destination must move to
+	// the owner, not stay in the room.
+	b.handleCanonical("/interrupt", "", b.acct.Owner, "", "", "", "")
+	if got := b.currentTurnDest(); got != b.acct.Owner {
+		t.Errorf("1:1 command turnDest = %q, want owner %q", got, b.acct.Owner)
+	}
+	if b.peerTriggered() {
+		t.Error("an owner command must not be marked as a peer-triggered run")
+	}
+
+	// And the reverse: a command typed in a room replies in that room.
+	b.setTurnDest(b.acct.Owner, false)
+	b.handleCanonical("/interrupt", "zach", "team@muc.x.com", "", "", "", "")
+	if got := b.currentTurnDest(); got != "team@muc.x.com" {
+		t.Errorf("room command turnDest = %q, want room", got)
+	}
+}
