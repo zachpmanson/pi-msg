@@ -384,6 +384,44 @@ func startDirectivePath(acct string) string {
 	return filepath.Join(filepath.Dir(configPath()), acct+".start")
 }
 
+// busyMarkerPath returns the per-account busy marker, stored alongside the
+// session state as <config-dir>/<account>.busy. The file exists only while the
+// account has work in flight (a run streaming, or a background process
+// running). It is how `deploy-service pi-msg --proactive` tells which agents
+// were busy at deploy time: the operator CLI reprompts those and leaves the
+// idle rest silent.
+func busyMarkerPath(acct string) string {
+	return filepath.Join(filepath.Dir(configPath()), acct+".busy")
+}
+
+// markBusy creates or removes the per-account busy marker. Best-effort like the
+// other state writers: errors are logged, never fatal.
+func markBusy(log func(level, msg string), acct string, busy bool) {
+	p := busyMarkerPath(acct)
+	if !busy {
+		_ = os.Remove(p)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		if log != nil {
+			log("warning", "busy marker: mkdir: "+err.Error())
+		}
+		return
+	}
+	if err := os.WriteFile(p, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+		if log != nil {
+			log("warning", "busy marker: write: "+err.Error())
+		}
+	}
+}
+
+// clearBusyMarker removes a stale busy marker at startup. A bridge killed
+// mid-run leaves one behind, and the account is idle until its next run starts,
+// so an uncleared marker would claim it was busy to a later deploy.
+func clearBusyMarker(acct string) {
+	_ = os.Remove(busyMarkerPath(acct))
+}
+
 // loadStartDirective reads and consumes the per-account restart directive,
 // returning the directive kind ("", "proactive", "idle", "prompt") and, for
 // the prompt kind, its payload (the invocation-time initial prompt). The

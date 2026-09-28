@@ -563,6 +563,19 @@ Either way the directive file is consumed (one-shot); an explicit `--prompt`
 flag overrides a file-delivered payload. Routine restarts that carry no prompt
 keep the existing resume + proactive/idle behavior unchanged.
 
+### Busy marker: which agents a proactive fleet restart reprompts
+
+While an account has work in flight — a run streaming, or a background process
+running — the bridge keeps a marker at `<config-dir>/<account>.busy`; it is
+removed the moment the account goes idle, and cleared at startup so a process
+killed mid-run cannot leave a stale one behind.
+
+The file is the operator CLI's only snapshot of who was busy: `deploy-service
+pi-msg --proactive` (see the nix config) writes a `proactive` start directive
+only for the accounts carrying it and `idle` for the rest, so an idle agent is
+not woken to say nothing. A single-persona `persona-ctl restart <name>
+--proactive` is unchanged and always reprompts.
+
 Requirements: Go ≥ 1.26 (to build), and a `pi` on `PATH` that's logged into a provider
 (`pi` → `/login`).
 
