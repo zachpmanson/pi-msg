@@ -122,7 +122,7 @@ func TestCollectMAMResultUnknownAndEmpty(t *testing.T) {
 // the server return the whole archive instead of the offline window.
 func TestMAMQueryPayloadMarshal(t *testing.T) {
 	since := time.Date(2026, 9, 15, 8, 15, 58, 0, time.UTC)
-	p := newMAMQueryPayload("qid-1", "zach@chat.zachmanson.com", since, mamPageMax, false)
+	p := newMAMQueryPayload("qid-1", "zach@chat.zachmanson.com", since, mamPageMax, "", false)
 
 	raw, err := xml.Marshal(p)
 	if err != nil {
@@ -144,7 +144,7 @@ func TestMAMQueryPayloadMarshal(t *testing.T) {
 
 	// A room query omits `with` (the room archive is addressed by JID) but still
 	// carries the time bound.
-	room := string(mustMarshal(t, newMAMQueryPayload("qid-2", "", since, 0, false)))
+	room := string(mustMarshal(t, newMAMQueryPayload("qid-2", "", since, 0, "", false)))
 	if strings.Contains(room, `var="with"`) {
 		t.Errorf("room payload should not carry a with filter:\n%s", room)
 	}
@@ -275,7 +275,7 @@ func TestReconnectSince(t *testing.T) {
 // (#106 review): <before/> with no <after> and no start bound is what selects
 // the final page (XEP-0313 §4.3.3).
 func TestMAMLastPagePayload(t *testing.T) {
-	last := string(mustMarshal(t, newMAMQueryPayload("qid-3", "", time.Time{}, 30, true)))
+	last := string(mustMarshal(t, newMAMQueryPayload("qid-3", "", time.Time{}, 30, "", true)))
 	if !strings.Contains(last, `<set xmlns="http://jabber.org/protocol/rsm"><max>30</max><before></before></set>`) {
 		t.Errorf("last-page payload must cap the page and ask for the final one:\n%s", last)
 	}
@@ -285,9 +285,34 @@ func TestMAMLastPagePayload(t *testing.T) {
 	}
 
 	// The backfill (first-page) query keeps its start bound and no cursor.
-	first := string(mustMarshal(t, newMAMQueryPayload("qid-4", "", time.Now(), 200, false)))
+	first := string(mustMarshal(t, newMAMQueryPayload("qid-4", "", time.Now(), 200, "", false)))
 	if strings.Contains(first, "<before>") || !strings.Contains(first, `var="start"`) {
 		t.Errorf("the backfill query must stay start-bounded with no cursor:\n%s", first)
+	}
+}
+
+// read_room's `before` argument pages BACKWARDS from a stanza id: the query must
+// carry <before>id</before>, not the empty <before/> that means "the newest
+// page". An explicit cursor also overrides lastPage, and can be combined with a
+// `since` lower bound.
+func TestMAMBeforeCursorPayload(t *testing.T) {
+	cursor := string(mustMarshal(t, newMAMQueryPayload("qid-5", "", time.Time{}, 30, "stanza-abc", true)))
+	want := `<set xmlns="http://jabber.org/protocol/rsm"><max>30</max><before>stanza-abc</before></set>`
+	if !strings.Contains(cursor, want) {
+		t.Errorf("cursor payload must page back from the stanza id, want %q in:\n%s", want, cursor)
+	}
+	if strings.Contains(cursor, "<before></before>") {
+		t.Errorf("an explicit cursor must not degrade to the newest-page cursor:\n%s", cursor)
+	}
+	if strings.Contains(cursor, `var="start"`) {
+		t.Errorf("a bare cursor must not invent a start bound:\n%s", cursor)
+	}
+
+	since := time.Date(2026, 9, 28, 9, 30, 0, 0, time.UTC)
+	both := string(mustMarshal(t, newMAMQueryPayload("qid-6", "", since, 50, "stanza-abc", false)))
+	if !strings.Contains(both, `<field var="start"><value>2026-09-28T09:30:00Z</value></field>`) ||
+		!strings.Contains(both, `<before>stanza-abc</before>`) {
+		t.Errorf("a cursor read may also carry a since bound:\n%s", both)
 	}
 }
 

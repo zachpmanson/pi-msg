@@ -822,7 +822,7 @@ func TestReadRoomRelayRejectsUnjoinedRoom(t *testing.T) {
 }
 
 func TestFormatRoomRead(t *testing.T) {
-	got := formatRoomRead("team@muc.x", nil, 30, true)
+	got := formatRoomRead("team@muc.x", nil, true, "newest 30")
 	// The extension rejects any result without this prefix, so an empty archive
 	// (a successful read of nothing) must still carry it — otherwise a working
 	// read is reported to the model as a failed tool call.
@@ -836,7 +836,7 @@ func TestFormatRoomRead(t *testing.T) {
 		{Nick: "peppy", Body: "on it", Stamp: stamp, ReplyToID: "abc123"},
 		{Nick: "zach", Body: "thanks", Stamp: stamp, FromOwner: true},
 	}
-	got = formatRoomRead("team@muc.x", msgs, 30, true)
+	got = formatRoomRead("team@muc.x", msgs, true, "newest 30")
 	if !strings.HasPrefix(got, "[pi-msg: read_room:") {
 		t.Errorf("read_room block must carry its header (the tool keys off it): %q", got)
 	}
@@ -854,9 +854,95 @@ func TestFormatRoomRead(t *testing.T) {
 	}
 
 	// An incomplete result set means the server has more behind this page.
-	got = formatRoomRead("team@muc.x", msgs, 3, false)
+	got = formatRoomRead("team@muc.x", msgs, false, "newest 3")
 	if !strings.Contains(got, "older history exists") {
 		t.Errorf("an incomplete window should warn: %q", got)
+	}
+}
+
+// read_room's `since` accepts both an absolute stamp and a relative age, and a
+// malformed value is an error rather than a silently dropped bound. A dropped
+// bound would return older messages than asked for while looking successful.
+func TestRoomReadSince(t *testing.T) {
+	now := time.Date(2026, 9, 28, 19, 30, 0, 0, time.UTC)
+	if got, err := roomReadSince("", now); err != nil || !got.IsZero() {
+		t.Errorf("unset since: got (%v,%v), want zero time and no error", got, err)
+	}
+	got, err := roomReadSince("2026-09-28T08:15:58+10:00", now)
+	if err != nil || !got.Equal(time.Date(2026, 9, 27, 22, 15, 58, 0, time.UTC)) {
+		t.Errorf("absolute stamp: got (%v,%v)", got, err)
+	}
+	got, err = roomReadSince("2h", now)
+	if err != nil || !got.Equal(now.Add(-2*time.Hour)) {
+		t.Errorf("relative age: got (%v,%v), want %v", got, err, now.Add(-2*time.Hour))
+	}
+	for _, bad := range []string{"yesterday", "2 hours", "-1h", "2026-13-40"} {
+		if _, err := roomReadSince(bad, now); err == nil {
+			t.Errorf("since %q should be rejected", bad)
+		}
+	}
+}
+
+// A cursor must be an opaque stanza id: empty means the newest page, and a value
+// with whitespace cannot be one. Whether the id exists is the server's answer.
+func TestRoomReadCursor(t *testing.T) {
+	if got, err := roomReadCursor("  "); err != nil || got != "" {
+		t.Errorf("blank cursor: got (%q,%v), want unset", got, err)
+	}
+	if got, err := roomReadCursor(" stanza-1 "); err != nil || got != "stanza-1" {
+		t.Errorf("cursor should be trimmed: got (%q,%v)", got, err)
+	}
+	for _, bad := range []string{"two ids", "a\tb", strings.Repeat("x", 257)} {
+		if _, err := roomReadCursor(bad); err == nil {
+			t.Errorf("cursor %q should be rejected", bad)
+		}
+	}
+}
+
+// The result must name the window it read, so a narrowed page is not mistaken
+// for the whole recent conversation.
+func TestRoomReadWindowLabel(t *testing.T) {
+	since := time.Date(2026, 9, 28, 9, 30, 0, 0, time.UTC)
+	if got := roomReadWindowLabel(30, time.Time{}, ""); got != "newest 30" {
+		t.Errorf("default label = %q", got)
+	}
+	if got := roomReadWindowLabel(30, since, ""); !strings.Contains(got, "since 2026-09-28T09:30:00Z") {
+		t.Errorf("since label = %q", got)
+	}
+	if got := roomReadWindowLabel(30, time.Time{}, "c1"); !strings.Contains(got, "before stanza c1") {
+		t.Errorf("cursor label = %q", got)
+	}
+	both := roomReadWindowLabel(30, since, "c1")
+	if !strings.Contains(both, "before stanza c1") || !strings.Contains(both, "since 2026-09-28T09:30:00Z") {
+		t.Errorf("combined label = %q", both)
+	}
+	// A narrowed window is described even when the fetch found nothing.
+	empty := formatRoomRead("team@muc.x", nil, true, roomReadWindowLabel(30, since, ""))
+	if !strings.HasPrefix(empty, "[pi-msg: read_room:") || !strings.Contains(empty, "no archived messages") || !strings.Contains(empty, "since ") {
+		t.Errorf("empty narrowed read = %q", empty)
+	}
+}
+
+// A malformed argument must fail loudly in the tool result: the extension treats
+// any result without the read_room header as a failed tool call, so these must
+// NOT carry the header (the same loud-failure shape as an unjoined room).
+func TestReadRoomRelayRejectsBadWindowArgs(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	for _, args := range []string{
+		`{"action":"read_room","room":"team@muc.x","since":"yesterday"}`,
+		`{"action":"read_room","room":"team@muc.x","before":"two ids"}`,
+	} {
+		b := newTestBridge(acct)
+		var buf bytes.Buffer
+		b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+		b.handleToolRelay("r1", args)
+		out := buf.String()
+		if !strings.Contains(out, "read_room:") {
+			t.Errorf("args %s: no failure message: %q", args, out)
+		}
+		if strings.Contains(out, "[pi-msg: read_room:") {
+			t.Errorf("args %s: a malformed window must not look like a successful read: %q", args, out)
+		}
 	}
 }
 

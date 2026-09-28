@@ -56,13 +56,15 @@ type mamQueryPayload struct {
 	Set *mamRSMSet `xml:"http://jabber.org/protocol/rsm set,omitempty"`
 }
 
-// mamRSMSet is the RSM element of a MAM query: a page size, and optionally the
-// empty <before/> that selects the LAST page of the result set (XEP-0313
-// §4.3.3). With no cursor at all the server returns the first page, which is the
-// opposite of what an on-demand read wants.
+// mamRSMSet is the RSM element of a MAM query: a page size and an optional
+// cursor. The pointer distinguishes the three states XEP-0313 needs: nil omits
+// <before> entirely (first page / backfill), a pointer to "" selects the LAST
+// page (§4.3.3), and a pointer to a stanza id pages BACKWARDS from that id
+// (§4.3.2) — read_room's `before` argument. With no cursor at all the server
+// returns the first page, which is the opposite of what an on-demand read wants.
 type mamRSMSet struct {
-	Max    int       `xml:"max"`
-	Before *struct{} `xml:"before,omitempty"`
+	Max    int     `xml:"max"`
+	Before *string `xml:"before,omitempty"`
 }
 
 // mamCollector gathers the archived messages for one in-flight query. The
@@ -90,7 +92,7 @@ type mamCollector struct {
 // precedes the IQ result), so by the time EncodeIQElement returns the collector
 // holds them all.
 func (b *XMPPBridge) FetchMAM(ctx context.Context, room, with string, since time.Time, max int) ([]InboundMessage, bool, error) {
-	return b.fetchMAM(ctx, room, with, since, max, false, true)
+	return b.fetchMAM(ctx, room, with, since, max, "", false, true)
 }
 
 // FetchMAMLastPage queries the most recent `max` archived messages of a room —
@@ -102,12 +104,23 @@ func (b *XMPPBridge) FetchMAM(ctx context.Context, room, with string, since time
 // Fetched stanzas are deliberately NOT recorded in the stanza history: a read
 // must not perturb routing state (see mamCollector.record).
 func (b *XMPPBridge) FetchMAMLastPage(ctx context.Context, room string, max int) ([]InboundMessage, bool, error) {
-	return b.fetchMAM(ctx, room, "", time.Time{}, max, true, false)
+	return b.FetchMAMRoomWindow(ctx, room, time.Time{}, "", max)
 }
 
-// fetchMAM is the shared XEP-0313 query. lastPage selects the final page via RSM
+// FetchMAMRoomWindow queries a room's archive for an explicit window: `since`
+// (zero means no lower bound) and `before` (a stanza id cursor; "" means the
+// newest page). It is read_room's paging path — a cursor walks the archive
+// backwards, so repeated calls reach history older than the newest-N window.
+// Fetched stanzas are deliberately NOT recorded in the stanza history: a read
+// must not perturb routing state (see mamCollector.record).
+func (b *XMPPBridge) FetchMAMRoomWindow(ctx context.Context, room string, since time.Time, before string, max int) ([]InboundMessage, bool, error) {
+	return b.fetchMAM(ctx, room, "", since, max, before, before == "", false)
+}
+
+// fetchMAM is the shared XEP-0313 query. `before` is an optional stanza id
+// cursor ("" = none) and lastPage selects the final page via an empty RSM
 // <before/>; record controls whether the fetched ids enter the stanza history.
-func (b *XMPPBridge) fetchMAM(ctx context.Context, room, with string, since time.Time, max int, lastPage, record bool) ([]InboundMessage, bool, error) {
+func (b *XMPPBridge) fetchMAM(ctx context.Context, room, with string, since time.Time, max int, before string, lastPage, record bool) ([]InboundMessage, bool, error) {
 	session := b.currentSession()
 	if session == nil {
 		return nil, false, errors.New("not online")
@@ -126,11 +139,17 @@ func (b *XMPPBridge) fetchMAM(ctx context.Context, room, with string, since time
 		b.mamMu.Unlock()
 	}()
 
-	payload := newMAMQueryPayload(qid, with, since, max, lastPage)
+	payload := newMAMQueryPayload(qid, with, since, max, before, lastPage)
 	if payload.Set == nil {
-		// The last-page cursor lives inside <set>; ask for a page even when the
-		// caller passed no max, so the request still means "the newest N".
-		payload.Set = &mamRSMSet{Max: mamPageMax, Before: &struct{}{}}
+		// The cursor lives inside <set>; ask for a page even when the caller
+		// passed no max, so the request still means "the newest N" — or, with an
+		// explicit cursor, "the N before this id".
+		payload.Set = &mamRSMSet{Max: mamPageMax}
+		if before != "" {
+			payload.Set.Before = &before
+		} else {
+			payload.Set.Before = new(string)
+		}
 	}
 
 	iq := stanza.IQ{ID: qid, Type: stanza.SetIQ}
@@ -179,9 +198,10 @@ func (b *XMPPBridge) fetchMAM(ctx context.Context, room, with string, since time
 // newMAMQueryPayload builds the XEP-0313 query. The time bound is a data-form
 // `start` field, NOT RSM: without it the query returns the whole archive from the
 // beginning, so a backfill would replay ancient history instead of the offline
-// window. RSM's <set> caps the page size, and (with Before set to an empty
-// element) selects the last page rather than the first.
-func newMAMQueryPayload(qid, with string, since time.Time, max int, lastPage bool) mamQueryPayload {
+// window. RSM's <set> caps the page size and carries the cursor: an empty
+// <before/> selects the last page rather than the first, while a
+// <before>id</before> pages backwards from that archived stanza.
+func newMAMQueryPayload(qid, with string, since time.Time, max int, before string, lastPage bool) mamQueryPayload {
 	p := mamQueryPayload{QueryID: qid}
 	p.X.Type = "submit"
 	p.X.Field = []mamFormField{{Var: "FORM_TYPE", Value: mamNS}}
@@ -193,9 +213,15 @@ func newMAMQueryPayload(qid, with string, since time.Time, max int, lastPage boo
 	}
 	if max > 0 {
 		p.Set = &mamRSMSet{Max: max}
-		if lastPage {
+		switch {
+		case before != "":
+			// An explicit cursor wins over the last-page flag: page backwards
+			// from this stanza id rather than asking for the newest page
+			// (XEP-0313 §4.3.2).
+			p.Set.Before = &before
+		case lastPage:
 			// No cursor plus <before/> = the final page (XEP-0313 §4.3.3).
-			p.Set.Before = &struct{}{}
+			p.Set.Before = new(string)
 		}
 	}
 	return p

@@ -627,16 +627,19 @@ const (
 	roomReadMaxLimit     = 100
 )
 
-// handleReadRoomRelay answers the `read_room` tool: it fetches the most recent
+// handleReadRoomRelay answers the `read_room` tool: it fetches archived
 // messages from a joined room's XEP-0313 archive and returns them as text. With
 // the ambient buffer gone (#106) this is the only way an agent learns what
 // happened in a room it was not addressed in, so the read is deliberately
 // explicit and on demand rather than pushed.
 //
-// Deliberately stateless: the last N messages, no cursor. A cursor would skip
-// messages whenever a fetch failed or the agent wanted to re-read, and the
-// archived window is bounded by the limit anyway.
-func (b *Bridge) handleReadRoomRelay(id, room string, limit int) {
+// By default it reads the newest `limit` messages, which stays stateless and is
+// what an agent usually wants. Two optional arguments add a window (#57):
+// `since` bounds the archive below (RFC 3339 stamp or relative age), and
+// `before` is a stanza id cursor that pages backwards past the newest-N window.
+// Both are validated here so a bad argument fails loudly in the tool result
+// instead of silently reading the newest page.
+func (b *Bridge) handleReadRoomRelay(id, room string, limit int, sinceArg, beforeArg string) {
 	if b.xmpp == nil {
 		b.rpc.RespondUIRelay(id, "read_room is unavailable: the bridge has no XMPP connection")
 		return
@@ -667,21 +670,95 @@ func (b *Bridge) handleReadRoomRelay(id, room string, limit int) {
 	if limit > roomReadMaxLimit {
 		limit = roomReadMaxLimit
 	}
-	b.log("notice", fmt.Sprintf("tool-relay read_room: room=%q limit=%d", bare, limit))
+	since, err := roomReadSince(sinceArg, time.Now())
+	if err != nil {
+		b.rpc.RespondUIRelay(id, "read_room: "+err.Error())
+		return
+	}
+	cursor, err := roomReadCursor(beforeArg)
+	if err != nil {
+		b.rpc.RespondUIRelay(id, "read_room: "+err.Error())
+		return
+	}
+	b.log("notice", fmt.Sprintf("tool-relay read_room: room=%q limit=%d since=%q before=%q", bare, limit, sinceArg, cursor))
 	// The MAM query is a network round trip, so run it off the RPC event loop and
 	// answer the blocked tool when it settles (same shape as the file upload).
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), mamTimeout)
 		defer cancel()
-		msgs, complete, err := b.xmpp.FetchMAMLastPage(ctx, bare, limit)
+		msgs, complete, err := b.xmpp.FetchMAMRoomWindow(ctx, bare, since, cursor, limit)
 		if err != nil {
 			reason := fmt.Sprintf("read_room %s failed: %v", bare, err)
 			b.log("warning", reason)
 			b.rpc.RespondUIRelay(id, reason)
 			return
 		}
-		b.rpc.RespondUIRelay(id, formatRoomRead(bare, msgs, limit, complete))
+		// An empty page for a cursor read means the server did not recognise the
+		// stanza id (or it has aged out of the archive), not that the room is
+		// quiet. Say so loudly: rendering "no messages" would look like a valid
+		// newest page and silently end the walk backwards.
+		if cursor != "" && len(msgs) == 0 {
+			reason := fmt.Sprintf("read_room %s failed: no archived messages before cursor %q (unknown or expired stanza id)", bare, cursor)
+			b.log("warning", reason)
+			b.rpc.RespondUIRelay(id, reason)
+			return
+		}
+		b.rpc.RespondUIRelay(id, formatRoomRead(bare, msgs, complete, roomReadWindowLabel(limit, since, cursor)))
 	}()
+}
+
+// roomReadSince resolves read_room's `since` argument to an archive lower
+// bound. Both forms are accepted: an absolute RFC 3339 stamp, and a relative
+// age (a Go duration such as "2h", meaning that long before now). An empty
+// argument means "no lower bound" (the zero time); anything unparseable is an
+// error the caller reports rather than silently dropping the bound — a read
+// that quietly ignored `since` would return older messages than asked for.
+func roomReadSince(arg string, now time.Time) (time.Time, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339, arg); err == nil {
+		return t, nil
+	}
+	if d, err := time.ParseDuration(arg); err == nil {
+		if d < 0 {
+			return time.Time{}, fmt.Errorf("since %q is a negative age", arg)
+		}
+		return now.Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf("since %q is neither an RFC 3339 timestamp nor a relative age (e.g. 2h, 90m)", arg)
+}
+
+// roomReadCursor validates read_room's `before` argument: a stanza id from a
+// previous read, or "" for the newest page. Stanza ids are opaque, so only the
+// shape is checked — a non-empty token with no whitespace. Whether the id still
+// exists in the archive is the server's answer, reported by the fetch.
+func roomReadCursor(arg string) (string, error) {
+	cursor := strings.TrimSpace(arg)
+	if cursor == "" {
+		return "", nil
+	}
+	if len(cursor) > 256 || strings.ContainsAny(cursor, " \t\r\n") {
+		return "", fmt.Errorf("before %q is not a usable stanza id", arg)
+	}
+	return cursor, nil
+}
+
+// roomReadWindowLabel describes which slice of the archive a read covered, so
+// the result is self-describing: the default newest-N page, a `since` bound, a
+// `before` cursor, or both.
+func roomReadWindowLabel(limit int, since time.Time, cursor string) string {
+	switch {
+	case cursor != "" && !since.IsZero():
+		return fmt.Sprintf("before stanza %s and since %s", cursor, since.UTC().Format(time.RFC3339))
+	case cursor != "":
+		return fmt.Sprintf("before stanza %s", cursor)
+	case !since.IsZero():
+		return fmt.Sprintf("since %s", since.UTC().Format(time.RFC3339))
+	default:
+		return fmt.Sprintf("newest %d", limit)
+	}
 }
 
 // formatRoomRead renders archived room messages for the model: oldest first, one
@@ -689,13 +766,14 @@ func (b *Bridge) handleReadRoomRelay(id, room string, limit int) {
 // return value starts with the `[pi-msg: read_room:` header — including the
 // empty case, which is a successful read of an empty window — because the
 // companion extension treats any other result as a failed tool call (#106
-// review).
-func formatRoomRead(room string, msgs []InboundMessage, limit int, complete bool) string {
+// review). `window` names the slice read (newest N, since …, before …), so a
+// narrowed read is not mistaken for the whole recent conversation.
+func formatRoomRead(room string, msgs []InboundMessage, complete bool, window string) string {
 	if len(msgs) == 0 {
-		return fmt.Sprintf("[pi-msg: read_room: no archived messages in %s (the room has archived nothing for this window).]", room)
+		return fmt.Sprintf("[pi-msg: read_room: no archived messages in %s (%s archive window).]", room, window)
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "[pi-msg: read_room: last %d archived message(s) in %s, oldest first — read on demand, not a prompt; nothing here needs a reply unless you choose to send one.]", len(msgs), room)
+	fmt.Fprintf(&sb, "[pi-msg: read_room: %d archived message(s) in %s (%s), oldest first — read on demand, not a prompt; nothing here needs a reply unless you choose to send one.]", len(msgs), room, window)
 	for _, m := range msgs {
 		who := m.Nick
 		if who == "" {
@@ -741,6 +819,8 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		From         string             `json:"from"`
 		Room         string             `json:"room"`
 		Limit        int                `json:"limit"`
+		Since        string             `json:"since"`
+		Before       string             `json:"before"`
 		ProcessCount int                `json:"count"`
 		Processes    []HeartbeatProcess `json:"processes"`
 	}
@@ -809,7 +889,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 			b.rpc.RespondUIRelay(id, url)
 		}()
 	case "read_room":
-		b.handleReadRoomRelay(id, cmd.Room, cmd.Limit)
+		b.handleReadRoomRelay(id, cmd.Room, cmd.Limit, cmd.Since, cmd.Before)
 	case "process_count":
 		// Absolute count of background processes pi has running (relayed by the
 		// pi-processes companion extension). While any run — or any background
