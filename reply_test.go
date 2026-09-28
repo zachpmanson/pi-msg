@@ -287,7 +287,7 @@ func TestStanzaIDSurfacedWithoutRoomReactions(t *testing.T) {
 	const id = "3e2597d4-a470-4cdb-b972-431043bce34f"
 	acct := ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x", RoomTrigger: "pi"}
 	b := newTestBridge(acct) // RoomReactions is off
-	prompt := b.composePrompt("do it", true, "", "team@muc.x", "zach@x", id, "", "")
+	prompt := b.composePrompt("do it", "team@muc.x", "zach@x", id, "", "", &roomNotice{kind: noticeTag})
 	if !strings.Contains(prompt, "stanza-id: "+id) {
 		t.Errorf("prompt is missing the stanza id:\n%s", prompt)
 	}
@@ -339,13 +339,15 @@ func TestInboundReplyContextResolves(t *testing.T) {
 }
 
 // The rendered header sits with the other metadata lines, above the message.
+// This is the 1:1 path (#95): a room reply to our own message is pointer case E
+// and carries the parent id only (#58).
 func TestComposePromptSurfacesInReplyTo(t *testing.T) {
 	acct := ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
 	b := newTestBridge(acct)
 	const orig = "6e7c6ed8-5485-4c01-be7a-07750c59ed27"
 	b.xmpp.recordMessageBody(orig, "zach@x/phone", "merge to master")
 	m := InboundMessage{ReplyToID: orig, ReplyToJID: "pi@x"}
-	prompt := b.composePrompt("?", true, "", "team@muc.x", "zach@x", "id-123", "team@muc.x", b.replyContext(m))
+	prompt := b.composePrompt("?", "zach@x", "", "id-123", "", b.replyContext(m), nil)
 	lines := strings.Split(prompt, "\n")
 	fromIdx, idx := -1, -1
 	for i, l := range lines {
