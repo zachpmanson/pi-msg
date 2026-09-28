@@ -361,12 +361,12 @@ including the lines this account sent, each marked `[we sent]` so the reader doe
 its own words as a peer's. Two optional arguments narrow or page the read:
 `since` bounds the window from below (an RFC 3339 stamp or a relative age such as `2h`),
 and `before` takes an **archive id** — the `[id …]` value printed on a previous read — as an
-RSM cursor that walks the archive backwards past the newest-N window. A `before` read
-returns the messages **strictly older** than the cursor, so chaining on a printed id never
-repeats the cursor message; a cursor the archive does not recognise is reported as an
-error, never as an empty or newest page. The archive id is deliberately *not* a
-`stanza-id:`: that is the message's own id, a different value the archive does not index,
-so a cursor built from one pages to nothing.
+RSM cursor that walks the archive backwards past the newest-N window. Each transcript line
+also prints `[stanza …]`, the message's own stanza id for reaction targets and stanza-specific
+`to:` reply routing. Do not use that stanza id as a `before` cursor: the archive
+does not index it. A `before` read returns the messages **strictly older** than the cursor,
+so chaining on a printed `[id …]` never repeats the cursor message; a cursor the archive
+does not recognise is reported as an error, never as an empty or newest page.
 Only `normal` rooms are readable: the error room is not a joined room as far as the tool
 is concerned. The room list and this rule are seeded once per session in the agent's
 prompt, so the agent knows it must look rather than assume silence means an empty room.
@@ -502,7 +502,7 @@ perform the XMPP action):
 | --- | --- | --- |
 | `send_reaction` | React to the human's latest message with an emoji (XEP-0444) | `reactions` is on |
 | `send_file` | Upload a local file and deliver it (XEP-0363 + XEP-0066); dest defaults to the current conversation, allowlisted | always |
-| `read_room` | Read a room's recent archive (XEP-0313 MAM) as a labelled transcript — the only way to see a room the agent was not addressed in. Optional `since` bound and `before` stanza-id cursor | `rooms` is set |
+| `read_room` | Read a room's recent archive (XEP-0313 MAM) as a labelled transcript — the only way to see a room the agent was not addressed in. Optional `since` bound and `before` archive-id cursor; lines include both archive `[id …]` and message `[stanza …]` IDs | `rooms` is set |
 
 Reply **routing** (`to:`) stays an in-band text convention (above); only these discrete
 side-effect actions are tools. Read-side tools are not incidental: with unaddressed room

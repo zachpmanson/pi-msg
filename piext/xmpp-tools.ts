@@ -412,7 +412,7 @@ ${systemPrompt}`;
 			name: "read_room",
 			label: "Read room history (XMPP)",
 			description:
-				"Read messages from a group chat this bridge has joined, via the server's XEP-0313 archive. Defaults to the NEWEST 30 (max 100) messages; `since` and `before` narrow the window. The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns messages oldest first, each with sender, age and its archive id — the `[id …]` value `before` takes — and reports the room as it happened, including the lines this account sent, marked `[we sent]`. Reading does not reply to anything.",
+				"Read messages from a group chat this bridge has joined, via the server's XEP-0313 archive. Defaults to the NEWEST 30 (max 100) messages; `since` and `before` narrow the window. The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns messages oldest first with sender, age, and distinct IDs: `[id …]` is the MAM archive ID for `before` pagination; `[stanza …]` is the message stanza ID for reactions and `to: <stanza-id>` replies. It also reports the room as it happened, including the lines this account sent, marked `[we sent]`. Reading does not reply to anything.",
 			promptSnippet: "Read recent history from a joined group chat",
 			promptGuidelines: [
 				"Use read_room when you need the wider room conversation — a handoff you were not named in, or context behind a message that addressed you.",
@@ -432,7 +432,7 @@ ${systemPrompt}`;
 				before: Type.Optional(
 					Type.String({
 						description:
-							"Pagination cursor: an archive id, printed as `[id …]` on a previous read. This is not the prompt's `stanza-id:` — that is the message's own id, which addresses nothing in the archive. Returns the messages strictly older than the archive id given. An unknown or expired id is reported as an error rather than silently returning the newest page.",
+							"Pagination cursor: an archive id, printed as `[id …]` on a previous read. Do not use the separate `[stanza …]` id here: it is the message's own stanza ID, for reactions and reply routing, and the archive does not index it. Returns the messages strictly older than the archive id given. An unknown or expired id is reported as an error rather than silently returning the newest page.",
 					}),
 				),
 			}),

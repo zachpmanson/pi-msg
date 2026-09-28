@@ -760,8 +760,8 @@ func roomReadWindowLabel(limit int, since time.Time, cursor string) string {
 }
 
 // formatRoomRead renders archived room messages for the model: oldest first, one
-// line each, with the sender, age and the stanza id it can be replied to (or
-// paged from — `before` takes any printed id). Every return value starts with
+// line each, with the sender, age, MAM archive id for pagination, and stanza id
+// for replies and reactions. Every return value starts with
 // the `[pi-msg: read_room:` header — including the empty case, which is a
 // successful read of an empty window — because the companion extension treats
 // any other result as a failed tool call (#106 review). `window` names the slice
@@ -795,16 +795,16 @@ func formatRoomRead(room string, msgs []InboundMessage, complete bool, window st
 		if m.ReplyToID != "" {
 			reply = fmt.Sprintf(" [in reply to %s]", m.ReplyToID)
 		}
-		// The id printed is the MAM ARCHIVE id, because that is the only id a
-		// `before` cursor addresses (measured live 2026-09-28: the archive id is
-		// numeric while the message's `stanza-id` is a hex token, and a cursor built
-		// from the stanza id pages to nothing). Without it the documented cursor —
-		// "the id of a previous read" — has no source at all (#117).
-		id := ""
+		// MAM archive ids address `before` pagination; stanza ids address
+		// reactions and reply routing. They are distinct identifiers (#125).
+		ids := ""
 		if m.ArchiveID != "" {
-			id = fmt.Sprintf(" [id %s]", m.ArchiveID)
+			ids += fmt.Sprintf(" [id %s]", m.ArchiveID)
 		}
-		fmt.Fprintf(&sb, "\n  %s (%s)%s%s: %s", who, when, id, reply, strings.Join(strings.Fields(m.Body), " "))
+		if m.ID != "" {
+			ids += fmt.Sprintf(" [stanza %s]", m.ID)
+		}
+		fmt.Fprintf(&sb, "\n  %s (%s)%s%s: %s", who, when, ids, reply, strings.Join(strings.Fields(m.Body), " "))
 	}
 	// The page is the newest `limit` messages, so a short result means the archive
 	// has nothing older to give, not that the page was cut short. `complete=false`

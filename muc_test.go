@@ -837,19 +837,19 @@ func TestFormatRoomRead(t *testing.T) {
 	if !strings.HasPrefix(got, "[pi-msg: read_room:") {
 		t.Errorf("read_room block must carry its header (the tool keys off it): %q", got)
 	}
-	if !strings.Contains(got, "slippy (3m ago) [id 9811]: the parser is flaky") {
-		t.Errorf("sender/age/id/body line wrong: %q", got)
+	if !strings.Contains(got, "slippy (3m ago) [id 9811] [stanza s1]: the parser is flaky") {
+		t.Errorf("sender/age/ids/body line wrong: %q", got)
 	}
-	if !strings.Contains(got, "owner (3m ago) [id 9813]: thanks") {
+	if !strings.Contains(got, "owner (3m ago) [id 9813] [stanza z1]: thanks") {
 		t.Errorf("the owner should render as owner: %q", got)
 	}
 	if !strings.Contains(got, "[in reply to abc123]") {
 		t.Errorf("XEP-0461 stamp not surfaced: %q", got)
 	}
-	// The stanza id is what makes `before` usable: it must be printed, next to the
-	// reply stamp when there is one (#117).
-	if !strings.Contains(got, "peppy (3m ago) [id 9812] [in reply to abc123]: on it") {
-		t.Errorf("stanza id must be printed alongside the reply stamp: %q", got)
+	// The archive id pages with `before`; the stanza id targets reactions and
+	// reply routing. Both must appear next to any reply stamp (#125).
+	if !strings.Contains(got, "peppy (3m ago) [id 9812] [stanza p1] [in reply to abc123]: on it") {
+		t.Errorf("both ids must be printed alongside the reply stamp: %q", got)
 	}
 	if strings.Contains(got, "older history") {
 		t.Errorf("a complete window should not claim older history: %q", got)
