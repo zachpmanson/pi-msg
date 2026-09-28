@@ -916,6 +916,24 @@ func TestCursorEmptyPageUnknown(t *testing.T) {
 	}
 }
 
+// A read reports the room as it happened, our own lines included and marked:
+// the reader wrote them, and an unmarked line of its own would read as a peer's.
+func TestFormatRoomReadMarksOwnMessages(t *testing.T) {
+	out := formatRoomRead("r@muc", []InboundMessage{
+		{Nick: "b2-1", ArchiveID: "1001", Body: "theirs"},
+		{Nick: "beltino", ArchiveID: "1002", Body: "ours", Own: true},
+	}, true, "newest 2")
+	if !strings.Contains(out, "beltino [we sent] (") {
+		t.Errorf("our own archived line must be marked as ours, got:\n%s", out)
+	}
+	if strings.Contains(out, "b2-1 [we sent]") {
+		t.Errorf("a peer's line must not be marked as ours, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[id 1002]: ours") {
+		t.Errorf("an own line must still carry its archive id, got:\n%s", out)
+	}
+}
+
 // An unrecognised cursor is answered by the server with the NEWEST page rather
 // than an error, which is how a stale cursor once came back with the 27 newest
 // messages under a `before stanza <garbage>` label. That substitution is what

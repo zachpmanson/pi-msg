@@ -301,7 +301,11 @@ type InboundMessage struct {
 	// cursor built from the message id is an archive id the server does not know,
 	// so it pages to nothing.
 	ArchiveID string
-	From      string // full from-JID, so a reaction routes back to that resource
+	// Own marks an archived line this account sent itself. A read reports the
+	// room as it happened, so our own lines appear too — marked, because the
+	// reader is the sender and must not read its own words as a peer's.
+	Own  bool
+	From string // full from-JID, so a reaction routes back to that resource
 	// Stamp is the message's own timestamp (XEP-0203 delay, or the archive
 	// stamp for a MAM backfill). Zero for a live message, which has no stamp of
 	// its own. Used to order the restart-replay buffer, where delay-pushed and

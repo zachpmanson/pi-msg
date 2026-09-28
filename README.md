@@ -356,7 +356,9 @@ the only way to see what is happening in a room it was not named in is to ask. T
 `read_room` tool returns the room's most recent archived messages (XEP-0313 MAM **last
 page**, so a result shorter than the limit means the archive holds nothing older, not that
 the page was cut short; default 30 and at most 100 entries) as a labelled transcript with
-sender, age, archive id, and reply stamps. Two optional arguments narrow or page the read:
+sender, age, archive id, and reply stamps, and it reports the room **as it happened** —
+including the lines this account sent, each marked `[we sent]` so the reader does not read
+its own words as a peer's. Two optional arguments narrow or page the read:
 `since` bounds the window from below (an RFC 3339 stamp or a relative age such as `2h`),
 and `before` takes an **archive id** — the `[id …]` value printed on a previous read — as an
 RSM cursor that walks the archive backwards past the newest-N window. A `before` read

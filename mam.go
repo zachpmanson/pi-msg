@@ -398,9 +398,16 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 			b.recordInboundMessage(id, from, body, owner)
 		}
 	}
-	if ownLine {
-		return // our own message, archived against the other side's stream
+	if ownLine && col.record {
+		// Backfill must not treat our own archived line as an inbound stanza: it
+		// is recorded as ours above, and recording it twice would clear the
+		// "we sent this" flag a peer's reply resolves through (#106 review).
+		return
 	}
+	// Past here the line is collected, including our own when the collector is a
+	// read (record == false): a read reports the room as it happened, and the
+	// archive holds our own lines too, so hiding them misrepresents the
+	// conversation to the reader.
 	var stamp time.Time
 	if d, ok := element(toks, delayNS, "delay"); ok {
 		if t, err := time.Parse(time.RFC3339, attr(d.Attr, "stamp")); err == nil {
@@ -411,7 +418,7 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	// the message's id attribute is the sender's. Keeping both lets read_room
 	// print a usable cursor without changing routing, which keys off the message
 	// id (#117).
-	m := InboundMessage{Body: body, ID: id, ArchiveID: attr(res.Attr, "id"), From: from, Stamp: stamp}
+	m := InboundMessage{Body: body, ID: id, ArchiveID: attr(res.Attr, "id"), From: from, Stamp: stamp, Own: ownLine}
 	// A recovered message can itself be a XEP-0461 reply; keep the stamp so the
 	// prompt names what it answers (#95).
 	if re, ok := element(rest, replyNS, "reply"); ok {
