@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func roomBridge() *Bridge {
@@ -24,16 +28,67 @@ func TestMatchTrigger(t *testing.T) {
 		{"pi: do the thing", true, "do the thing"},
 		{"pi, do the thing", true, "do the thing"},
 		{"PI: caps", true, "caps"},
-		{"pilot the ship", false, ""}, // no colon/comma → not addressing
-		{"hey pi can you", false, ""}, // trigger not at start
-		{"pi", false, ""},             // bare trigger, nothing after
+		{"pilot the ship", false, ""},              // "pi" inside a word is not a mention
+		{"hey pi can you", true, "hey pi can you"}, // bare mention (#106)
+		{"pi", true, "pi"},                         // a lone trigger is still a mention
 		{"  pi: leading space", true, "leading space"},
+
+		// Inline "trig:" anywhere — addressed, body kept intact (#21).
+		{"here's the draft\n\npi: fold this in", true, "here's the draft\n\npi: fold this in"},
+		// The bracket form used to be a known miss; the bare mention (#106) now
+		// catches it, since "pi" appears as a standalone word.
+		{"worth a PRAGMA first (pi): adjust your query", true, "worth a PRAGMA first (pi): adjust your query"},
+
+		// Inline "@trig" anywhere — addressed, body kept intact.
+		{"@pi how do I pull the logs", true, "@pi how do I pull the logs"},
+		{"over to @pi for the exact path", true, "over to @pi for the exact path"},
+
+		// Bare mentions, the form added in #106. With no ambient buffer a missed
+		// address means the message does not exist for the agent, so prose that
+		// names it is deliberately accepted as addressing it.
+		{"ask pi for the path", true, "ask pi for the path"},
+		{"pi should own this one", true, "pi should own this one"},
+		{"handing to pi, then", true, "handing to pi, then"},
+		// Word boundaries hold for bare mentions too.
+		{"the pilot: reported in", false, ""},
+		{"a pi-rate ship", false, ""},
+
+		// Quoted/fenced content must not address anyone.
+		{"saved the log:\n```\npi: do the thing\n```", false, ""},
+		{"they said:\n> pi: do the thing", false, ""},
+		{"saved the log:\n```\nask pi for the path\n```", false, ""},
 	}
 	for _, c := range cases {
-		addressed, stripped := b.matchTrigger(c.in)
+		addressed, stripped := b.matchTrigger("team@muc.x.com", c.in)
 		if addressed != c.addressed || (addressed && stripped != c.stripped) {
 			t.Errorf("matchTrigger(%q) = (%v,%q), want (%v,%q)", c.in, addressed, stripped, c.addressed, c.stripped)
 		}
+	}
+}
+
+// TestMatchTriggerPerRoom pins the per-room trigger override (#106): the same
+// body addresses the agent in one room and not in another.
+func TestMatchTriggerPerRoom(t *testing.T) {
+	b := NewBridge(ResolvedAccount{
+		Owner: "zach@x.com", Nick: "pi", RoomTrigger: "pi",
+		Rooms:     []string{"team@muc.x.com", "other@muc.x.com"},
+		RoomSpecs: []RoomSpec{{JID: "other@muc.x.com", Trigger: "robot", Reactions: true}},
+	}, false)
+	if got := b.acct.TriggerFor("team@muc.x.com"); got != "pi" {
+		t.Errorf("TriggerFor(team) = %q, want pi", got)
+	}
+	if got := b.acct.TriggerFor("other@muc.x.com"); got != "robot" {
+		t.Errorf("TriggerFor(other) = %q, want robot", got)
+	}
+	if addressed, _ := b.matchTrigger("other@muc.x.com", "robot: go"); !addressed {
+		t.Error("the room override should be the trigger in that room")
+	}
+	if addressed, _ := b.matchTrigger("other@muc.x.com", "pi: go"); addressed {
+		t.Error("the account trigger must not apply where the room overrides it")
+	}
+	// An unknown room (e.g. the error room) falls back to the account trigger.
+	if got := b.acct.TriggerFor("errors@muc.x.com"); got != "pi" {
+		t.Errorf("TriggerFor(unknown room) = %q, want the account default pi", got)
 	}
 }
 
@@ -44,97 +99,984 @@ func TestClassify(t *testing.T) {
 		action roomAction
 		body   string
 	}{
-		{InboundMessage{Body: "just chatting", Nick: "alice", FromOwner: false}, actionAmbient, "just chatting"},
+		{InboundMessage{Body: "just chatting", Nick: "alice", FromOwner: false}, actionNotOurs, "just chatting"},
 		{InboundMessage{Body: "pi: help alice", Nick: "alice", FromOwner: false}, actionCommentary, "help alice"},
+		{InboundMessage{Body: "ask pi about it", Nick: "alice", FromOwner: false}, actionCommentary, "ask pi about it"},
 		{InboundMessage{Body: "do it", Nick: "zach", FromOwner: true}, actionCanonical, "do it"},
 		{InboundMessage{Body: "pi: do it", Nick: "zach", FromOwner: true}, actionCanonical, "do it"},
 	}
 	for _, c := range cases {
-		action, body := b.classify(c.m)
+		action, body, _ := b.classify(c.m)
 		if action != c.action || body != c.body {
 			t.Errorf("classify(%+v) = (%d,%q), want (%d,%q)", c.m, action, body, c.action, c.body)
 		}
 	}
 }
 
-func TestAmbientBufferAndDrain(t *testing.T) {
+// TestClassifyReplyToOwnMessage pins the anchored-reply rule (#106): an inbound
+// XEP-0461 reply to a stanza we sent addresses us even when it names nobody.
+// The id must be one WE sent — the history records both directions, and a room
+// send records the room, so "ours" is a flag rather than an inferred JID.
+func TestClassifyReplyToOwnMessage(t *testing.T) {
 	b := roomBridge()
-	if got := b.drainAmbient(); got != "" {
-		t.Errorf("empty drain = %q, want empty", got)
-	}
-	b.bufferAmbient("alice", "the parser is flaky")
-	b.bufferAmbient("bob", "+1")
-	b.bufferAmbient("carol", "   ") // whitespace-only, ignored
+	b.xmpp = NewXMPPBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, func(InboundMessage) {}, b.log)
 
-	block := b.drainAmbient()
-	if !strings.Contains(block, "non-canonical") {
-		t.Errorf("block missing non-canonical label: %q", block)
+	// Not ours (nobody's, or someone else's): still dropped.
+	m := InboundMessage{Body: "and another thing", Nick: "alice", Room: "team@muc.x.com", ReplyToID: "someone-elses-id"}
+	if action, _, _ := b.classify(m); action != actionNotOurs {
+		t.Errorf("reply to an unknown/foreign stanza = %d, want actionNotOurs", action)
 	}
-	if !strings.Contains(block, "alice: the parser is flaky") || !strings.Contains(block, "bob: +1") {
-		t.Errorf("block missing buffered messages: %q", block)
+
+	// Ours: addressed.
+	b.xmpp.recordSelfMessage("our-stanza-id", "team@muc.x.com", "the earlier thing")
+	m.ReplyToID = "our-stanza-id"
+	if action, _, _ := b.classify(m); action != actionCommentary {
+		t.Errorf("reply to our own stanza = %d, want actionCommentary", action)
 	}
-	if strings.Contains(block, "carol") {
-		t.Errorf("whitespace-only message should have been ignored: %q", block)
-	}
-	// Drain clears the buffer.
-	if got := b.drainAmbient(); got != "" {
-		t.Errorf("second drain = %q, want empty (buffer should be cleared)", got)
+	// The owner replying to our stanza stays canonical.
+	m.FromOwner = true
+	if action, _, _ := b.classify(m); action != actionCanonical {
+		t.Errorf("owner reply to our own stanza = %d, want actionCanonical", action)
 	}
 }
 
-func TestAmbientCap(t *testing.T) {
-	b := roomBridge()
-	for i := 0; i < ambientCap+20; i++ {
-		b.bufferAmbient("n", "m")
+// An owner room message is trusted traffic: naming nobody means it is for every
+// agent in the room, the same fan-out as @everyone. A tag or a stanza reply
+// picks out one account, and the message belongs to that account alone (#106) —
+// without this, every agent answers a note the owner wrote to one of them.
+func TestOwnerMessageRouting(t *testing.T) {
+	b := roomBridge() // owner zach@x.com, nick pi, trigger pi, room team@muc.x.com
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	x.occupants["team@muc.x.com"] = map[string]string{
+		"pi":      "pi@x.com",
+		"beltino": "beltino@x.com",
+		"peppy":   "peppy@x.com",
 	}
-	b.ambientMu.Lock()
-	n := len(b.ambient)
-	b.ambientMu.Unlock()
-	if n != ambientCap {
-		t.Errorf("ambient buffer len = %d, want capped at %d", n, ambientCap)
+	b.xmpp = x
+	x.recordInboundMessage("peppy-id", "team@muc.x.com/peppy", "we shipped", false)
+	x.recordInboundMessage("owner-id", "team@muc.x.com/zach", "status?", true)
+	x.recordSelfMessage("our-id", "team@muc.x.com", "on it")
+
+	const room = "team@muc.x.com"
+	cases := []struct {
+		name   string
+		body   string
+		reply  string
+		owner  bool
+		action roomAction
+	}{
+		{"untagged owner message is a broadcast", "status update please", "", true, actionCanonical},
+		{"owner @handle picks one account", "@peppy have a look", "", true, actionNotOurs},
+		{"owner colon form picks one account", "peppy: have a look", "", true, actionNotOurs},
+		{"owner bare name picks one account", "peppy have a look at the parser", "", true, actionNotOurs},
+		{"owner naming us is ours", "@pi take this one", "", true, actionCanonical},
+		{"owner naming us among others is ours", "@peppy and @pi sort it out", "", true, actionCanonical},
+		{"owner @everyone is ours", "@everyone standup in 5", "", true, actionCanonical},
+		{"a fenced name is not a tag", "```\npeppy: do it\n```", "", true, actionCanonical},
+		{"a quoted name is not a tag", "> peppy: do it", "", true, actionCanonical},
+		{"owner reply to a peer belongs to the peer", "", "peppy-id", true, actionNotOurs},
+		{"owner reply to the owner's own is a broadcast", "", "owner-id", true, actionCanonical},
+		{"owner reply to us is ours", "", "our-id", true, actionCanonical},
+		{"an unresolvable reply is delivered, not lost", "", "unknown-id", true, actionCanonical},
+		{"a peer naming another peer is still not ours", "@beltino yours", "", false, actionNotOurs},
+		{"a peer naming nobody is still dropped", "no name here", "", false, actionNotOurs},
+	}
+	for _, c := range cases {
+		m := InboundMessage{Body: c.body, Nick: "zach", Room: room, FromOwner: c.owner, ReplyToID: c.reply}
+		action, _, _ := b.classify(m)
+		if action != c.action {
+			t.Errorf("%s: classify(%q, reply=%q, owner=%v) = %d, want %d", c.name, c.body, c.reply, c.owner, action, c.action)
+		}
+	}
+
+	// With no occupant roster there is nothing to check a name against, so the
+	// message stays a broadcast rather than silently reaching nobody.
+	empty := roomBridge()
+	empty.xmpp = NewXMPPBridge(empty.acct, func(InboundMessage) {}, empty.log)
+	if action, _, _ := empty.classify(InboundMessage{Body: "@peppy look", Room: room, FromOwner: true}); action != actionCanonical {
+		t.Errorf("owner message with an empty roster = %d, want actionCanonical", action)
+	}
+}
+
+// The reply-target verdict depends on knowing who wrote the stanza, so the
+// history entry keeps that across a re-record (#106 review): a MAM re-fetch or a
+// late duplicate must not turn our own message — or the owner's — into a peer's,
+// which would drop an unaddressed reply to it.
+func TestMessageHistoryKeepsAuthor(t *testing.T) {
+	b := roomBridge()
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	x.recordSelfMessage("ours", "team@muc.x.com", "on it")
+	x.recordInboundMessage("owners", "team@muc.x.com/zach", "thanks", true)
+	x.recordInboundMessage("peers", "team@muc.x.com/peppy", "ack", false)
+	// Re-record every one of them the way a MAM fetch or a duplicate would.
+	for _, id := range []string{"ours", "owners", "peers"} {
+		x.recordMessageBody(id, "team@muc.x.com", "re-recorded")
+	}
+	if !x.isSelfMessage("ours") {
+		t.Error("re-record unmarked our own stanza")
+	}
+	if x.replyTargetOther("ours") {
+		t.Error("our own stanza is treated as a peer's after re-record")
+	}
+	if x.replyTargetOther("owners") {
+		t.Error("the owner's stanza is treated as a peer's after re-record")
+	}
+	if !x.replyTargetOther("peers") {
+		t.Error("a peer's stanza is not recognised after re-record")
+	}
+	if x.replyTargetOther("never-seen") {
+		t.Error("an unknown stanza id is treated as a peer's")
+	}
+	x.recordInboundMessage("fresh", "team@muc.x.com/beltino", "hi", false)
+	if !x.replyTargetOther("fresh") {
+		t.Error("a recorded peer stanza is not recognised")
+	}
+}
+
+// Quoted or fenced text never addresses anyone, and that has to include inline
+// `code` spans: on 2026-09-28 an agent explaining the routing rules wrote "it
+// still reads a name without @ does not reach them, with no `@everyone`", and
+// the literal @everyone inside backticks woke every agent in the room.
+func TestInlineCodeDoesNotAddress(t *testing.T) {
+	b := roomBridge() // trigger "pi"
+	cases := []struct {
+		body      string
+		addressed bool
+	}{
+		{"with no `@everyone` and no owner-broadcast rule", false},
+		{"the rules changed: `@all` is explicit now", false},
+		{"inline `pi` in code", false},
+		{"`pi: quoted` but not to me", false},
+		{"`@peppy` and `@pi` both quoted", false},
+		{"a stray ` backtick then ask pi", true}, // unbalanced: kept verbatim
+		{"`@everyone` but @pi for you", true},    // outside the span
+		{"two `spans` and then @everyone", true},
+	}
+	for _, c := range cases {
+		got, _ := b.matchTrigger("team@muc.x.com", c.body)
+		if got != c.addressed {
+			t.Errorf("matchTrigger(%q) addressed=%v, want %v", c.body, got, c.addressed)
+		}
+	}
+
+	// The body the agent receives is untouched: stripping is for matching only.
+	b2 := roomBridge()
+	if _, stripped := b2.matchTrigger("team@muc.x.com", "pi: keep `the code` intact"); stripped != "keep `the code` intact" {
+		t.Errorf("trigger strip altered inline code: %q", stripped)
+	}
+}
+
+// A resumed session keeps the contract text it was seeded with, so an upgrade
+// that changes the addressing rules would otherwise leave every persona
+// enforcing the old ones from its own context (found in the field 2026-09-28).
+func TestContractReseedAfterChange(t *testing.T) {
+	t.Setenv("PI_MSG_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	b := roomBridge()
+	hash := b.contractHash()
+	if hash == "" {
+		t.Fatal("empty contract hash")
+	}
+
+	// A session seeded by an older pi-msg: no record, or a different one.
+	if loadSeededContract(b.acct.Name) != "" {
+		t.Fatal("fresh contract state should be empty")
+	}
+	logf := func(_, _ string) {}
+	saveSeededContract(logf, b.acct.Name, "deadbeef")
+	if loadSeededContract(b.acct.Name) != "deadbeef" {
+		t.Fatal("contract state did not round-trip")
+	}
+	if loadSeededContract(b.acct.Name) == b.contractHash() {
+		t.Fatal("a stale hash must not match the current contract")
+	}
+
+	// Seeded by this build: no re-seed.
+	saveSeededContract(logf, b.acct.Name, hash)
+	if loadSeededContract(b.acct.Name) != b.contractHash() {
+		t.Fatal("a current hash must match the current contract")
+	}
+
+	// The hash covers both halves of the seed: changing the rooms changes it.
+	other := roomBridge()
+	other.acct.Rooms = []string{"other@muc.x.com"}
+	if other.contractHash() == hash {
+		t.Error("contract hash ignores the room list")
+	}
+}
+
+// TestUnaddressedRoomMessageIsDropped replaces the old ambient-buffer tests
+// (#106): an unaddressed room message must produce no turn and must not stay in
+// the durable inbox. Reaching the buffer at all is now the bug.
+func TestUnaddressedRoomMessageIsDropped(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	b := newTestBridge(acct)
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &bytes.Buffer{}}, mu: sync.Mutex{}}
+	b.inbox = newInbox(filepath.Join(t.TempDir(), "t.inbox.jsonl"), b.log)
+
+	b.onInbound(InboundMessage{
+		ID: "unaddressed-1", Nick: "alice", Room: "team@muc.x",
+		From: "alice@x.com/alice", Body: "the parser is flaky",
+	})
+
+	if n := b.inbox.len(); n != 0 {
+		t.Errorf("unaddressed room message left %d entr(y/ies) in the durable inbox, want 0", n)
+	}
+}
+
+// TestAddressedRoomMessageIsRecorded is the other half: an addressed message is
+// still durably recorded before it reaches pi (#96), so a run that dies first
+// does not take the instruction with it.
+func TestAddressedRoomMessageIsRecorded(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	b := newTestBridge(acct)
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &bytes.Buffer{}}, mu: sync.Mutex{}}
+	b.inbox = newInbox(filepath.Join(t.TempDir(), "t.inbox.jsonl"), b.log)
+
+	b.onInbound(InboundMessage{
+		ID: "addressed-1", Nick: "alice", Room: "team@muc.x",
+		From: "alice@x.com/alice", Body: "pi: fold this in",
+	})
+
+	if n := b.inbox.len(); n != 1 {
+		t.Errorf("addressed message left %d inbox entries, want 1", n)
 	}
 }
 
 func TestComposePrompt(t *testing.T) {
-	b := roomBridge() // owner zach@x.com, room team@muc.x.com
-	hint := b.routingHint()
+	b := roomBridge()      // owner zach@x.com, room team@muc.x.com
+	b.routingSeeded = true // this test exercises the non-seeding path
 
 	// Owner DM turn: "from:" is the owner, body follows directly (no sender
-	// line), hint appended.
-	got := b.composePrompt("hello", true, "", "zach@x.com", "")
+	// line). No routing hint is appended (removed per issue #33).
+	got := b.composePrompt("hello", "zach@x.com", "", "", "", "", nil)
 	if !strings.HasPrefix(got, "from: zach@x.com\nhello") {
 		t.Errorf("dm header wrong: %q", got)
 	}
-	if !strings.HasSuffix(got, hint) {
-		t.Errorf("dm turn missing hint: %q", got)
+	if strings.Contains(got, "to: ") {
+		t.Errorf("dm turn should not contain a routing hint: %q", got)
 	}
 
-	// Room turn from the owner: from: is the room, sender: is the owner's jid.
-	got = b.composePrompt("hi", true, "", "team@muc.x.com", "zach@x.com")
+	// A room turn is a pointer block (#58): the body is dropped and the
+	// addressing meta lives inside the block. The old untrusted-commentary
+	// wrapper is retired.
+	got = b.composePrompt("PINEAPPLE", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
+	if !strings.Contains(got, "[pi-msg: room: You were tagged in a room.") {
+		t.Errorf("room turn should be a pointer block: %q", got)
+	}
 	if !strings.Contains(got, "from: team@muc.x.com\n") || !strings.Contains(got, "sender: zach@x.com\n") {
-		t.Errorf("room header wrong: %q", got)
+		t.Errorf("room block header wrong: %q", got)
 	}
-	if !strings.HasSuffix(got, hint) {
-		t.Errorf("room turn missing hint: %q", got)
+	if strings.Contains(got, "PINEAPPLE") {
+		t.Errorf("room body must not enter the prompt: %q", got)
 	}
-
-	// Commentary: wrapped as untrusted, includes nick + sender header.
-	got = b.composePrompt("help", false, "alice", "team@muc.x.com", "alice@x.com")
-	if !strings.Contains(got, "NON-OWNER") || !strings.Contains(got, "alice") ||
-		!strings.Contains(got, "help") || !strings.Contains(got, "sender: alice@x.com") {
-		t.Errorf("commentary framing wrong: %q", got)
+	if strings.Contains(got, "NON-OWNER") {
+		t.Errorf("the untrusted-commentary wrapper is retired: %q", got)
 	}
-
-	// Ambient is prepended; the hint is still last.
-	b.bufferAmbient("bob", "fyi")
-	got = b.composePrompt("do it", true, "", "team@muc.x.com", "zach@x.com")
-	if !strings.Contains(got, "room commentary") || !strings.Contains(got, "do it") || !strings.HasSuffix(got, hint) {
-		t.Errorf("canonical+ambient wrong: %q", got)
+	if !strings.HasSuffix(got, `Check message using read_room(room="team@muc.x.com", limit=15).]`) {
+		t.Errorf("room block should end with the read_room call: %q", got)
 	}
 }
 
-func TestRoutingHintNamesOwner(t *testing.T) {
-	if h := roomBridge().routingHint(); !strings.Contains(h, "to:") || !strings.Contains(h, "zach@x.com") {
-		t.Errorf("routingHint = %q, want it to mention to: and the owner jid", h)
+// TestRoomsSeedOnce: the room list and its delivery rule are seeded with the
+// routing contract, once per session (#106). An agent that assumes silence
+// means an empty room will miss handoffs it was not named in, so this is not
+// optional context.
+func TestRoomsSeedOnce(t *testing.T) {
+	b := roomBridge()
+	got1 := b.composePrompt("go", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
+	if !strings.Contains(got1, "[pi-msg: rooms:") || !strings.Contains(got1, "team@muc.x.com") {
+		t.Errorf("first prompt should seed the room list: %q", got1)
+	}
+	if !strings.Contains(got1, "read_room") {
+		t.Errorf("the room seed should point at read_room: %q", got1)
+	}
+	got2 := b.composePrompt("again", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
+	if strings.Contains(got2, "[pi-msg: rooms:") {
+		t.Errorf("second prompt re-seeded the room list: %q", got2)
+	}
+	// A 1:1 account has no rooms to describe.
+	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	if got := b1.composePrompt("hi", "zach@x.com", "", "", "", "", nil); strings.Contains(got, "[pi-msg: rooms:") {
+		t.Errorf("1:1 account should not seed a room list: %q", got)
+	}
+}
+
+func TestRoutingSeedOnce(t *testing.T) {
+	b := roomBridge() // room-mode account
+	// First prompt seeds the contract (once); room-mode only.
+	got1 := b.composePrompt("go", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
+	if !strings.Contains(got1, "[pi-msg: routing:") {
+		t.Errorf("first prompt should seed the routing contract: %q", got1)
+	}
+	// Subsequent prompts must NOT re-seed.
+	got2 := b.composePrompt("again", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
+	if strings.Contains(got2, "[pi-msg: routing:") {
+		t.Errorf("second prompt re-seeded the contract: %q", got2)
+	}
+
+	// A non-room (1:1) account never seeds.
+	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	got := b1.composePrompt("hi", "zach@x.com", "", "", "", "", nil)
+	if strings.Contains(got, "[pi-msg: routing:") {
+		t.Errorf("1:1 account should not seed the routing contract: %q", got)
+	}
+}
+
+// TestInitialPromptCompose verifies the invocation-time initial prompt path
+// (pi-msg#35): the task text is composed through the normal prompt path, so a
+// fresh room-mode on-demand spawn receives the routing contract seed followed
+// by the task as a canonical owner message (its reply therefore routes `to:`
+// the owner per the contract), while a 1:1 account gets the task verbatim.
+func TestInitialPromptCompose(t *testing.T) {
+	task := "resolve zachpmanson/pi-msg#35 and open a PR"
+
+	// Fresh room-mode spawn: routingSeeded is false (an initial prompt forces a
+	// fresh session), so the first prompt seeds the routing contract once.
+	b := roomBridge()
+	got := b.composePrompt(task, b.acct.Owner, "", "", "", "", nil)
+	if !strings.Contains(got, "[pi-msg: routing:") {
+		t.Errorf("fresh room-mode initial prompt should seed the routing contract: %q", got)
+	}
+	if !strings.Contains(got, "from: zach@x.com") {
+		t.Errorf("initial prompt should carry the from: owner header: %q", got)
+	}
+	if !strings.HasSuffix(got, task) {
+		t.Errorf("initial prompt should end with the task text: %q", got)
+	}
+
+	// 1:1 account: the task is delivered verbatim, no routing contract.
+	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	if got := b1.composePrompt(task, "zach@x.com", "", "", "", "", nil); got != task {
+		t.Errorf("1:1 initial prompt = %q, want plain %q", got, task)
+	}
+}
+
+func TestRouteLineNoop(t *testing.T) {
+	cases := []struct {
+		in     string
+		dest   string
+		inline string
+		ok     bool
+	}{
+		{"to: noop", "noop", "", true},
+		{"to: NOOP", "noop", "", true},
+		{"  to: noop", "noop", "", true},
+		{"to: noop nothing to add", "noop", "nothing to add", true},
+		{"to: zach@x.com", "zach@x.com", "", true},
+		{"to: be fair, that's prose", "", "", false}, // no @ and not "noop"
+		{"to: nooperator", "", "", false},            // must be exactly "noop"
+	}
+	for _, c := range cases {
+		dest, replyTo, inline, ok := routeLine(c.in)
+		if ok != c.ok || dest != c.dest || inline != c.inline {
+			t.Errorf("routeLine(%q) = (%q,%q,%v), want (%q,%q,%v)", c.in, dest, inline, ok, c.dest, c.inline, c.ok)
+		}
+		if replyTo != "" {
+			t.Errorf("routeLine(%q) set replyTo = %q, want empty", c.in, replyTo)
+		}
+	}
+}
+
+// A noop reply must parse as a real segment, not fall through to the reject
+// path — otherwise an attempt at silence is dumped to the error room and the
+// agent is nudged to resend, producing the very turn it tried to avoid (#20).
+func TestNoopIsNotRejected(t *testing.T) {
+	segs, leading := splitReplySegments("to: noop")
+	if leading != "" {
+		t.Errorf("leading = %q, want empty", leading)
+	}
+	if len(segs) != 1 {
+		t.Fatalf("got %d segments, want 1", len(segs))
+	}
+	if segs[0].dest != "noop" {
+		t.Errorf("dest = %q, want noop", segs[0].dest)
+	}
+}
+
+func TestCascadeCap(t *testing.T) {
+	b := roomBridge()
+	for i := 0; i < cascadeCap; i++ {
+		ok, announce := b.spendCascade()
+		if !ok {
+			t.Fatalf("turn %d denied, want allowed (cap is %d)", i+1, cascadeCap)
+		}
+		if announce {
+			t.Errorf("turn %d announced, want silent while under cap", i+1)
+		}
+	}
+	// First refusal announces; later ones stay quiet so one stall produces one
+	// notice rather than a stream of them.
+	ok, announce := b.spendCascade()
+	if ok || !announce {
+		t.Errorf("first refusal = (ok %v, announce %v), want (false, true)", ok, announce)
+	}
+	ok, announce = b.spendCascade()
+	if ok || announce {
+		t.Errorf("second refusal = (ok %v, announce %v), want (false, false)", ok, announce)
+	}
+	// An owner message puts a human back in the loop and restores the budget,
+	// including the right to announce again on a later episode.
+	b.resetCascade()
+	if ok, _ := b.spendCascade(); !ok {
+		t.Errorf("turn denied after reset, want allowed")
+	}
+	for i := 1; i < cascadeCap; i++ {
+		b.spendCascade()
+	}
+	if ok, announce := b.spendCascade(); ok || !announce {
+		t.Errorf("post-reset refusal = (ok %v, announce %v), want (false, true)", ok, announce)
+	}
+}
+
+// The cascade notice must name neither an @handle nor the agent's own nick, or
+// reporting a cascade would itself address an agent (#106 widened addressing to
+// bare names) and extend the cascade.
+func TestCascadeNoticeDoesNotAddress(t *testing.T) {
+	b := roomBridge()
+	notice := cascadeStopNotice()
+	if strings.Contains(notice, "@") {
+		t.Errorf("cascade notice contains an @mention: %q", notice)
+	}
+	if addressed, _ := b.matchTrigger("team@muc.x.com", notice); addressed {
+		t.Errorf("cascade notice addresses an agent: %q", notice)
+	}
+	// And under every nick the fleet actually uses, since bare-name mentions
+	// (#106) mean any of them appearing as a word would re-address an agent.
+	for _, trig := range []string{"peppy", "fox", "falco", "slippy", "beltino", "r2d2"} {
+		if containsMention(notice, trig) {
+			t.Errorf("cascade notice addresses %q: %q", trig, notice)
+		}
+	}
+}
+
+// A mistyped mention is inert -- it addresses nobody and reports nothing -- so
+// the bridge has to spot it. Live evidence: "@zbeltino" was written 8 times
+// against "@beltino" 5, i.e. most attempts to address that agent went nowhere.
+func TestUnknownHandles(t *testing.T) {
+	b := roomBridge()
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	x.occupants["team@muc.x.com"] = map[string]string{
+		"beltino": "beltino@x.com",
+		"peppy":   "peppy@x.com",
+	}
+	b.xmpp = x
+	const room = "team@muc.x.com"
+
+	cases := []struct {
+		body string
+		want []string
+	}{
+		{"@zbeltino picking Philippines", []string{"zbeltino"}},
+		{"@beltino ok, yours", nil},
+		{"@peppy and @zbeltino, sort it out", []string{"zbeltino"}},
+		{"@zbeltino @zbeltino @zbeltino", []string{"zbeltino"}}, // deduped
+		{"thanks @zach", nil},                                   // owner localpart
+		{"mail me at bob@example.com", nil},                     // domain, not a mention
+		{"ping beltino@x.com directly", nil},                    // bare JID
+		{"```\n@nobody: do it\n```", nil},                       // fenced
+		{"> @nobody said so", nil},                              // quoted
+		{"no mentions at all", nil},
+	}
+	for _, c := range cases {
+		got, valid := b.unknownHandles(room, c.body)
+		if len(got) != len(c.want) {
+			t.Errorf("unknownHandles(%q) = %v, want %v", c.body, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("unknownHandles(%q) = %v, want %v", c.body, got, c.want)
+			}
+		}
+		if len(got) > 0 && len(valid) == 0 {
+			t.Errorf("unknownHandles(%q) reported unknowns with no valid list to suggest", c.body)
+		}
+	}
+
+	// With no occupant roster we cannot tell a typo from a valid absent user, so
+	// nothing is reported -- a wrong warning is worse than none.
+	b2 := roomBridge()
+	b2.xmpp = NewXMPPBridge(b2.acct, func(InboundMessage) {}, func(_, _ string) {})
+	if got, _ := b2.unknownHandles(room, "@zbeltino hello"); got != nil {
+		t.Errorf("empty roster produced warnings: %v", got)
+	}
+}
+
+// Tagging yourself is inert: the bridge drops our own room echo before
+// dispatch, so "@pi" written by pi notifies nobody. Observed live: slippy wrote
+// "@slippy — good, Japan confirmed for you" twice where it meant another agent,
+// so that agent never heard about the work handed to it. The unknown-handle
+// check can't catch this, since our own nick IS a valid occupant handle.
+func TestSelfTagHandle(t *testing.T) {
+	b := roomBridge() // nick "pi", owner zach@x.com
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	x.occupants["team@muc.x.com"] = map[string]string{
+		"pi":      "pi@x.com",
+		"beltino": "beltino@x.com",
+		"peppy":   "peppy@x.com",
+	}
+	b.xmpp = x
+	const room = "team@muc.x.com"
+
+	cases := []struct {
+		body        string
+		wantUnknown []string
+		wantSelf    string
+	}{
+		{"@pi — good, Japan confirmed for you", nil, "pi"},
+		{"@PI case-insensitive", nil, "PI"},
+		{"@beltino ok, yours", nil, ""},
+		{"@pi and @zbeltino both", []string{"zbeltino"}, "pi"},
+		{"no mentions at all", nil, ""},
+		{"```\n@pi do it\n```", nil, ""}, // fenced, not a real mention
+	}
+	for _, c := range cases {
+		unknown, self, valid := b.handleIssues(room, c.body)
+		if self != c.wantSelf {
+			t.Errorf("handleIssues(%q) selfTag = %q, want %q", c.body, self, c.wantSelf)
+		}
+		if len(unknown) != len(c.wantUnknown) {
+			t.Errorf("handleIssues(%q) unknown = %v, want %v", c.body, unknown, c.wantUnknown)
+			continue
+		}
+		for i := range unknown {
+			if unknown[i] != c.wantUnknown[i] {
+				t.Errorf("handleIssues(%q) unknown = %v, want %v", c.body, unknown, c.wantUnknown)
+			}
+		}
+		// Suggesting our own handle back to ourselves would re-teach the bug.
+		for _, v := range valid {
+			if strings.EqualFold(v, "pi") {
+				t.Errorf("handleIssues(%q) offered our own handle %q as addressable", c.body, v)
+			}
+		}
+		if len(valid) != 2 {
+			t.Errorf("handleIssues(%q) valid = %v, want the two peers", c.body, valid)
+		}
+	}
+
+	// A self-tag must never be reported as an unknown handle: it is a real
+	// occupant handle, just an inert one to use on yourself.
+	if got, _ := b.unknownHandles(room, "@pi hello"); got != nil {
+		t.Errorf("self-tag reported as unknown handle: %v", got)
+	}
+
+	// No roster → no information, so neither problem is reported.
+	b2 := roomBridge()
+	b2.xmpp = NewXMPPBridge(b2.acct, func(InboundMessage) {}, func(_, _ string) {})
+	unknown, self, valid := b2.handleIssues(room, "@pi and @zbeltino hello")
+	if unknown != nil || self != "" || valid != nil {
+		t.Errorf("empty roster produced %v / %q / %v, want nothing at all", unknown, self, valid)
+	}
+}
+
+// The warning fires at most once per run, so a stubbornly-misspelling agent
+// can't be nudged in a loop.
+func TestHandleWarnOncePerRun(t *testing.T) {
+	b := roomBridge()
+	if b.handleWarned() {
+		t.Fatal("fresh run already marked warned")
+	}
+	b.setHandleWarned(true)
+	if !b.handleWarned() {
+		t.Error("warned flag did not stick")
+	}
+	b.setHandleWarned(false)
+	if b.handleWarned() {
+		t.Error("warned flag did not clear at run start")
+	}
+}
+
+// "@everyone" must wake the room. Agents reach for it unprompted, and without
+// support the attempt is inert: a fleet leader opened an election with "Here's
+// the structure I'll run, @everyone:", woke nobody, and the room sat silent for
+// six minutes.
+func TestBroadcastHandles(t *testing.T) {
+	b := roomBridge() // trigger "pi"
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"@everyone stage 1 is open", true},
+		{"here's the structure I'll run, @everyone:", true},
+		{"@all please report", true},
+		{"@here quick sync", true},
+		{"@EVERYONE caps still counts", true},
+		{"everyone should report in", false},  // no sigil — ordinary prose
+		{"that's all from me", false},         // ditto
+		{"we're all here", false},             // ditto
+		{"@everyones opinion differs", false}, // handle must end at the word
+		{"@allocate the budget", false},       // ditto
+		{"```\n@everyone in a fence\n```", false},
+		{"> @everyone in a quote", false},
+	}
+	for _, c := range cases {
+		if got, _ := b.matchTrigger("team@muc.x.com", c.in); got != c.want {
+			t.Errorf("matchTrigger(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// A broadcast handle is a real address, not a typo, so it must not be reported
+// as unknown. And a self-mention only counts as a mis-addressed handoff when it
+// is the FIRST mention: later ones are enumerations ("Tally board: @peppy ✅ ·
+// @beltino ✅"), which are correct writing and must not burn a warning turn.
+func TestHandleIssuesBroadcastAndEnumeration(t *testing.T) {
+	b := roomBridge()
+	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	x.occupants["team@muc.x.com"] = map[string]string{
+		"pi": "pi@x.com", "peppy": "peppy@x.com", "slippy": "slippy@x.com",
+	}
+	b.xmpp = x
+	const room = "team@muc.x.com"
+
+	if unknown, self, _ := b.handleIssues(room, "@everyone stage 1 is open"); len(unknown) != 0 || self != "" {
+		t.Errorf("broadcast flagged: unknown=%v self=%q", unknown, self)
+	}
+	// Self first → a real mis-address.
+	if _, self, _ := b.handleIssues(room, "@pi — good, Japan confirmed for you"); self != "pi" {
+		t.Errorf("leading self-tag not caught: %q", self)
+	}
+	// Self later → an enumeration, not a handoff.
+	if _, self, _ := b.handleIssues(room, "Tally board: @peppy ✅ · @slippy ✅ · @pi ✅ (officer)"); self != "" {
+		t.Errorf("enumerated self-mention warned: %q", self)
+	}
+	// A genuine unknown handle is still caught alongside an enumeration.
+	if unknown, self, _ := b.handleIssues(room, "@peppy and @zbeltino, sort it out"); len(unknown) != 1 || unknown[0] != "zbeltino" || self != "" {
+		t.Errorf("unknown=%v self=%q, want [zbeltino] and no self-tag", unknown, self)
+	}
+}
+
+// TestHandleRoomDropsOwnEcho is defence in depth (#29): even if the transport
+// echo filter in dispatchRoom misses, a room message whose sender nick matches
+// our own must be dropped at dispatch — not re-enter classify (where a
+// self-addressed body would dispatch as commentary and prompt ourselves).
+func TestHandleRoomDropsOwnEcho(t *testing.T) {
+	b := roomBridge()
+	b.rpc = &RPCClient{}
+	b.inbox = newInbox(filepath.Join(t.TempDir(), "t.inbox.jsonl"), b.log)
+	b.xmpp = &XMPPBridge{acct: ResolvedAccount{Nick: "pi"}, selfNick: map[string]string{"team@muc.x.com": "pi"}}
+
+	// Own-echo with a body that would otherwise be unaddressed: dropped, and
+	// nothing is recorded for it.
+	b.handleRoom(InboundMessage{ID: "echo-1", Body: "just chatting", Nick: "PI", Room: "team@muc.x.com"})
+	if n := b.inbox.len(); n != 0 {
+		t.Fatalf("own-echo left %d inbox entries, want 0", n)
+	}
+	// Own-echo addressed to our own trigger: must not dispatch as commentary
+	// (without the guard this hits dispatchCommentary and prompts ourselves).
+	b.handleRoom(InboundMessage{ID: "echo-2", Body: "pi: status?", Nick: "pI", Room: "team@muc.x.com"})
+	if n := b.inbox.len(); n != 0 {
+		t.Fatalf("addressed own-echo left %d inbox entries, want 0", n)
+	}
+	if b.streaming() {
+		t.Fatal("own-echo must not start a run")
+	}
+}
+
+// TestUnaddressedMessageDropsNothingButItself: the durable queue must not be
+// used as a parking space for messages that will never become a prompt (#104),
+// including one that arrives addressed and then hits the cascade cap.
+func TestCascadeCapDropsRatherThanBuffers(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	b := newTestBridge(acct)
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &bytes.Buffer{}}, mu: sync.Mutex{}}
+	b.inbox = newInbox(filepath.Join(t.TempDir(), "t.inbox.jsonl"), b.log)
+	for i := 0; i < cascadeCap; i++ {
+		b.spendCascade()
+	}
+	b.handleRoom(InboundMessage{
+		ID: "capped-1", Nick: "alice", Room: "team@muc.x.com",
+		From: "alice@x.com/alice", Body: "pi: one more thing",
+	})
+	if n := b.inbox.len(); n != 0 {
+		t.Errorf("a cascade-capped message left %d inbox entries, want 0", n)
+	}
+	if b.streaming() {
+		t.Error("a cascade-capped message must not start a run")
+	}
+}
+
+// The read path is the only way an agent sees a room it was not addressed in
+// (#106), so its failure modes matter: an unjoined room must be refused, and a
+// readable one must render something the model can act on.
+func TestReadRoomRelayRejectsUnjoinedRoom(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	b := newTestBridge(acct)
+	var buf bytes.Buffer
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+
+	// The error room is the interesting case: joined at the XMPP layer, but
+	// write-only by construction, so it must not be readable.
+	b.handleToolRelay("r1", `{"action":"read_room","room":"errors@muc.x"}`)
+	out := buf.String()
+	if !strings.Contains(out, "not a room this bridge has joined") {
+		t.Errorf("unjoined room not refused: %q", out)
+	}
+	if strings.Contains(out, "team@muc.x") && strings.Contains(out, "archived message") {
+		t.Errorf("read_room returned content for an unjoined room: %q", out)
+	}
+}
+
+func TestFormatRoomRead(t *testing.T) {
+	got := formatRoomRead("team@muc.x", nil, true, "newest 30")
+	// The extension rejects any result without this prefix, so an empty archive
+	// (a successful read of nothing) must still carry it — otherwise a working
+	// read is reported to the model as a failed tool call.
+	if !strings.HasPrefix(got, "[pi-msg: read_room:") || !strings.Contains(got, "no archived messages") {
+		t.Errorf("an empty archive must carry the header and say so: %q", got)
+	}
+
+	stamp := time.Now().Add(-3 * time.Minute)
+	msgs := []InboundMessage{
+		{ID: "s1", ArchiveID: "9811", Nick: "slippy", Body: "the parser   is flaky", Stamp: stamp},
+		{ID: "p1", ArchiveID: "9812", Nick: "peppy", Body: "on it", Stamp: stamp, ReplyToID: "abc123"},
+		{ID: "z1", ArchiveID: "9813", Nick: "zach", Body: "thanks", Stamp: stamp, FromOwner: true},
+	}
+	got = formatRoomRead("team@muc.x", msgs, true, "newest 30")
+	if !strings.HasPrefix(got, "[pi-msg: read_room:") {
+		t.Errorf("read_room block must carry its header (the tool keys off it): %q", got)
+	}
+	if !strings.Contains(got, "slippy (3m ago) [id 9811] [stanza s1]: the parser is flaky") {
+		t.Errorf("sender/age/ids/body line wrong: %q", got)
+	}
+	if !strings.Contains(got, "owner (3m ago) [id 9813] [stanza z1]: thanks") {
+		t.Errorf("the owner should render as owner: %q", got)
+	}
+	if !strings.Contains(got, "[in reply to abc123]") {
+		t.Errorf("XEP-0461 stamp not surfaced: %q", got)
+	}
+	// The archive id pages with `before`; the stanza id targets reactions and
+	// reply routing. Both must appear next to any reply stamp (#125).
+	if !strings.Contains(got, "peppy (3m ago) [id 9812] [stanza p1] [in reply to abc123]: on it") {
+		t.Errorf("both ids must be printed alongside the reply stamp: %q", got)
+	}
+	if strings.Contains(got, "older history") {
+		t.Errorf("a complete window should not claim older history: %q", got)
+	}
+
+	// An incomplete result set means the server has more behind this page.
+	got = formatRoomRead("team@muc.x", msgs, false, "newest 3")
+	if !strings.Contains(got, "older history exists") {
+		t.Errorf("an incomplete window should warn: %q", got)
+	}
+}
+
+// read_room's `since` accepts both an absolute stamp and a relative age, and a
+// malformed value is an error rather than a silently dropped bound. A dropped
+// bound would return older messages than asked for while looking successful.
+func TestRoomReadSince(t *testing.T) {
+	now := time.Date(2026, 9, 28, 19, 30, 0, 0, time.UTC)
+	if got, err := roomReadSince("", now); err != nil || !got.IsZero() {
+		t.Errorf("unset since: got (%v,%v), want zero time and no error", got, err)
+	}
+	got, err := roomReadSince("2026-09-28T08:15:58+10:00", now)
+	if err != nil || !got.Equal(time.Date(2026, 9, 27, 22, 15, 58, 0, time.UTC)) {
+		t.Errorf("absolute stamp: got (%v,%v)", got, err)
+	}
+	got, err = roomReadSince("2h", now)
+	if err != nil || !got.Equal(now.Add(-2*time.Hour)) {
+		t.Errorf("relative age: got (%v,%v), want %v", got, err, now.Add(-2*time.Hour))
+	}
+	for _, bad := range []string{"yesterday", "2 hours", "-1h", "2026-13-40"} {
+		if _, err := roomReadSince(bad, now); err == nil {
+			t.Errorf("since %q should be rejected", bad)
+		}
+	}
+}
+
+// A cursor must be an opaque stanza id: empty means the newest page, and a value
+// with whitespace cannot be one. Whether the id exists is the server's answer.
+func TestRoomReadCursor(t *testing.T) {
+	if got, err := roomReadCursor("  "); err != nil || got != "" {
+		t.Errorf("blank cursor: got (%q,%v), want unset", got, err)
+	}
+	if got, err := roomReadCursor(" stanza-1 "); err != nil || got != "stanza-1" {
+		t.Errorf("cursor should be trimmed: got (%q,%v)", got, err)
+	}
+	for _, bad := range []string{"two ids", "a\tb", strings.Repeat("x", 257)} {
+		if _, err := roomReadCursor(bad); err == nil {
+			t.Errorf("cursor %q should be rejected", bad)
+		}
+	}
+}
+
+// The empty cursor page is ambiguous — an archive beginning or an id the archive
+// does not hold — and only the room's oldest archive id tells them apart (#117).
+func TestCursorEmptyPageUnknown(t *testing.T) {
+	oldest := []InboundMessage{{ArchiveID: "1790591198278479"}}
+	if cursorEmptyPageUnknown(oldest, "1790591198278479") {
+		t.Error("the archive's oldest message as cursor is a genuine empty window")
+	}
+	if !cursorEmptyPageUnknown(oldest, "23d0a58749d0e711") {
+		t.Error("an id that is not the oldest message cannot explain an empty page")
+	}
+	if cursorEmptyPageUnknown(nil, "1790591198278479") {
+		t.Error("an empty archive has nothing to compare, so it is not an unknown cursor")
+	}
+}
+
+// A read reports the room as it happened, our own lines included and marked:
+// the reader wrote them, and an unmarked line of its own would read as a peer's.
+func TestFormatRoomReadMarksOwnMessages(t *testing.T) {
+	out := formatRoomRead("r@muc", []InboundMessage{
+		{Nick: "b2-1", ArchiveID: "1001", Body: "theirs"},
+		{Nick: "beltino", ArchiveID: "1002", Body: "ours", Own: true},
+	}, true, "newest 2")
+	if !strings.Contains(out, "beltino [we sent] (") {
+		t.Errorf("our own archived line must be marked as ours, got:\n%s", out)
+	}
+	if strings.Contains(out, "b2-1 [we sent]") {
+		t.Errorf("a peer's line must not be marked as ours, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[id 1002]: ours") {
+		t.Errorf("an own line must still carry its archive id, got:\n%s", out)
+	}
+}
+
+// An unrecognised cursor is answered by the server with the NEWEST page rather
+// than an error, which is how a stale cursor once came back with the 27 newest
+// messages under a `before stanza <garbage>` label. That substitution is what
+// this check catches: a genuine cursor page ends strictly before the cursor, so
+// it can never end at the room's newest message (#117).
+func TestCursorFallbackPage(t *testing.T) {
+	page := []InboundMessage{{ArchiveID: "9811"}, {ArchiveID: "9812"}, {ArchiveID: "9813"}}
+	newest := []InboundMessage{{ArchiveID: "9814"}}
+	if cursorFallbackPage(page, newest) {
+		t.Error("a page ending before the newest message is a genuine cursor page")
+	}
+	// The substitution: the page handed back for an unknown cursor ends at the
+	// room's newest message.
+	if !cursorFallbackPage([]InboundMessage{{ArchiveID: "9812"}, {ArchiveID: "9814"}}, newest) {
+		t.Error("a page ending at the newest message is the unknown-cursor substitution")
+	}
+	if cursorFallbackPage(nil, newest) || cursorFallbackPage(page, nil) {
+		t.Error("an empty page or empty archive is not the substitution")
+	}
+}
+
+// The result must name the window it read, so a narrowed page is not mistaken
+// for the whole recent conversation.
+func TestRoomReadWindowLabel(t *testing.T) {
+	since := time.Date(2026, 9, 28, 9, 30, 0, 0, time.UTC)
+	if got := roomReadWindowLabel(30, time.Time{}, ""); got != "newest 30" {
+		t.Errorf("default label = %q", got)
+	}
+	if got := roomReadWindowLabel(30, since, ""); !strings.Contains(got, "since 2026-09-28T09:30:00Z") {
+		t.Errorf("since label = %q", got)
+	}
+	if got := roomReadWindowLabel(30, time.Time{}, "c1"); !strings.Contains(got, "before stanza c1") {
+		t.Errorf("cursor label = %q", got)
+	}
+	both := roomReadWindowLabel(30, since, "c1")
+	if !strings.Contains(both, "before stanza c1") || !strings.Contains(both, "since 2026-09-28T09:30:00Z") {
+		t.Errorf("combined label = %q", both)
+	}
+	// A narrowed window is described even when the fetch found nothing.
+	empty := formatRoomRead("team@muc.x", nil, true, roomReadWindowLabel(30, since, ""))
+	if !strings.HasPrefix(empty, "[pi-msg: read_room:") || !strings.Contains(empty, "no archived messages") || !strings.Contains(empty, "since ") {
+		t.Errorf("empty narrowed read = %q", empty)
+	}
+}
+
+// A malformed argument must fail loudly in the tool result: the extension treats
+// any result without the read_room header as a failed tool call, so these must
+// NOT carry the header (the same loud-failure shape as an unjoined room).
+func TestReadRoomRelayRejectsBadWindowArgs(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	for _, args := range []string{
+		`{"action":"read_room","room":"team@muc.x","since":"yesterday"}`,
+		`{"action":"read_room","room":"team@muc.x","before":"two ids"}`,
+	} {
+		b := newTestBridge(acct)
+		var buf bytes.Buffer
+		b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+		b.handleToolRelay("r1", args)
+		out := buf.String()
+		if !strings.Contains(out, "read_room:") {
+			t.Errorf("args %s: no failure message: %q", args, out)
+		}
+		if strings.Contains(out, "[pi-msg: read_room:") {
+			t.Errorf("args %s: a malformed window must not look like a successful read: %q", args, out)
+		}
+	}
+}
+
+// A message classified as addressed keeps that verdict through the durable
+// queue. Re-deriving it after a restart cannot work for an anchored reply — the
+// stanza history that proved the target was ours is gone — so a re-delivered
+// message would be dropped as "not ours" and removed permanently (#106 review).
+func TestRedeliveredAddressedMessageKeepsItsVerdict(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	b := newTestBridge(acct)
+	var buf bytes.Buffer
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.inbox = newInbox(t.TempDir()+"/acct.inbox.jsonl", nil)
+	// Fresh process: nothing is in the stanza history, so the reply target is
+	// unresolvable now — exactly the situation after a restart.
+	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, b.log)
+
+	b.deliverInbox(inboxEntry{
+		ID: "r1", Room: "team@muc.x", Nick: "peppy", From: "team@muc.x/peppy",
+		Body: "and another thing", ReplyToID: "a-stanza-we-sent-before-the-restart",
+		Addressed: true,
+	})
+	if !strings.Contains(buf.String(), "[pi-msg: room: You were tagged") || !strings.Contains(buf.String(), "stanza-id: r1") {
+		t.Errorf("a message addressed on arrival was not prompted after re-delivery: %q", buf.String())
+	}
+	if strings.Contains(buf.String(), "and another thing") {
+		t.Errorf("the body must not enter the prompt: %q", buf.String())
+	}
+
+	// Without the recorded verdict the same entry is dropped: the behaviour the
+	// flag exists to prevent.
+	var buf2 bytes.Buffer
+	b2 := newTestBridge(acct)
+	b2.rpc = &RPCClient{stdin: &nopClose{buf: &buf2}, mu: sync.Mutex{}}
+	b2.inbox = newInbox(t.TempDir()+"/acct.inbox.jsonl", nil)
+	b2.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, b2.log)
+	b2.deliverInbox(inboxEntry{
+		ID: "r2", Room: "team@muc.x", Nick: "peppy", From: "team@muc.x/peppy",
+		Body: "and another thing", ReplyToID: "a-stanza-we-sent-before-the-restart",
+	})
+	if strings.Contains(buf2.String(), "[pi-msg: room: You were tagged") {
+		t.Errorf("an unclassified reply to an unknown stanza should not prompt: %q", buf2.String())
+	}
+}
+
+// The bare-mention counter: bareMention isolates the case where a bare name is
+// the ONLY reason a message addresses us, so the false-positive rate the
+// bare-name rule trades for can be measured from the log (#106).
+func TestBareMentionCounter(t *testing.T) {
+	b := roomBridge() // trigger "pi"
+
+	if got := b.bareMention("team@muc.x.com", "ask pi for the path"); got != "pi" {
+		t.Errorf("bareMention = %q, want pi", got)
+	}
+	// Explicit addresses are not false positives.
+	for _, body := range []string{"pi: do it", "pi, go", "@pi do it", "@everyone report", "unrelated chatter", "the pilot flew"} {
+		if got := b.bareMention("team@muc.x.com", body); got != "" {
+			t.Errorf("bareMention(%q) = %q, want empty", body, got)
+		}
+	}
+	// A bare mention still counts when the trigger is only part of the reason we
+	// are addressed... it is not: a broadcast or a handle elsewhere means this is
+	// not a bare-mention case, and the counter must not inflate.
+	if got := b.bareMention("team@muc.x.com", "@everyone ask pi about the path"); got != "" {
+		t.Errorf("bareMention with a broadcast = %q, want empty", got)
+	}
+}
+
+// The seeded routing contract must state the new rule. It is the only place the
+// false-positive cost of bare mentions is disclosed to the agents living with
+// it, and the old wording said the opposite (#106).
+func TestRoutingContractStatesBareMentions(t *testing.T) {
+	b := roomBridge()
+	got := b.routingContract()
+	if strings.Contains(got, "a name without @ does not reach") {
+		t.Errorf("routing contract still denies bare mentions: %q", got)
+	}
+	if !strings.Contains(got, "a name without @ also reaches it") {
+		t.Errorf("routing contract does not state the bare-mention rule: %q", got)
 	}
 }

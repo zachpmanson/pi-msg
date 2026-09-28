@@ -1,9 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestExtractText(t *testing.T) {
@@ -37,11 +46,56 @@ func TestSplitCommand(t *testing.T) {
 		{"/model anthropic/claude", "model", "anthropic/claude"},
 		{"/think high", "think", "high"},
 		{"/COMPACT  keep the api notes ", "compact", "keep the api notes"},
+		{"!new", "new", ""},
+		{"!session", "session", ""},
+		{"!model deepseek/", "model", "deepseek/"},
+		{"!", "", ""}, // bare prefix → empty name; handleCommand special-cases it
 	}
 	for _, c := range cases {
 		name, arg := splitCommand(c.in)
 		if name != c.name || arg != c.arg {
 			t.Errorf("splitCommand(%q) = (%q,%q), want (%q,%q)", c.in, name, arg, c.name, c.arg)
+		}
+	}
+}
+
+// TestBareBangIsInterrupt verifies a lone "!" maps to the interrupt path
+// (abort WITHOUT the queue flush), not a literal prompt and not /abort:
+// splitCommand yields an empty name, which handleCommand's special case turns
+// into "interrupt" (without it, the empty name falls through the default as
+// text). Non-bang inputs are unmodified; "!abort" stays the /abort alias.
+func TestBareBangIsInterrupt(t *testing.T) {
+	cases := []struct {
+		in   string
+		name string
+	}{
+		{"!", "interrupt"}, // lone bang → handleCommand maps to interrupt, not abort
+		{"!!", "!"},        // two bangs → name "!", falls through as text
+		{"! abort", ""},    // space after bang → empty name, falls through
+		{"!abort", "abort"},
+	}
+	for _, c := range cases {
+		name, _ := splitCommand(c.in)
+		if c.in == "!" {
+			name = "interrupt" // the handleCommand special case under test
+		}
+		if name != c.name {
+			t.Errorf("command for %q → %q, want %q", c.in, name, c.name)
+		}
+	}
+}
+
+func TestCommaInt(t *testing.T) {
+	cases := map[int64]string{
+		0:     "0",
+		999:   "999",
+		1000:  "1,000",
+		12345: "12,345",
+		1e9:   "1,000,000,000",
+	}
+	for in, want := range cases {
+		if got := commaInt(in); got != want {
+			t.Errorf("commaInt(%d) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -66,11 +120,11 @@ func TestToolLabel(t *testing.T) {
 		ev   Event
 		want string
 	}{
-		{"bash with command", Event{"toolName": "bash", "args": map[string]any{"command": "npm test"}}, "running: npm test"},
-		{"bash collapses whitespace", Event{"toolName": "bash", "args": map[string]any{"command": "go  build\n./..."}}, "running: go build ./..."},
-		{"non-bash tool", Event{"toolName": "read_file"}, "running read_file"},
+		{"bash with command", Event{"toolName": "bash", "args": map[string]any{"command": "npm test"}}, "! npm test"},
+		{"bash collapses whitespace", Event{"toolName": "bash", "args": map[string]any{"command": "go  build\n./..."}}, "! go build ./..."},
+		{"non-bash tool", Event{"toolName": "read_file"}, "! read_file"},
 		{"missing name", Event{}, "running a tool…"},
-		{"bash no command", Event{"toolName": "bash"}, "running bash"},
+		{"bash no command", Event{"toolName": "bash"}, "! bash"},
 	}
 	for _, c := range cases {
 		if got := toolLabel(c.ev); got != c.want {
@@ -156,6 +210,74 @@ func TestClassifyDest(t *testing.T) {
 	}
 }
 
+// TestStreamTypingTarget pins the room-mode typing decision (issue #44): the
+// indicator is withheld while the reply is still streaming / has not yet
+// written a routing line, and once a completed "to:" line appears it points at
+// that line's 1:1 recipient — or stays dark for a room, noop, or blocked target.
+// delivers reports whether that line will emit a stanza (the presence-label
+// upgrade from "muttering…" to "replying…").
+func TestStreamTypingTarget(t *testing.T) {
+	x := NewXMPPBridge(
+		ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"},
+		func(InboundMessage) {}, func(string, string) {},
+	)
+	x.occupants["team@muc.x"] = map[string]string{"alice": "alice@x"}
+	cases := []struct {
+		buf      string
+		target   string
+		decided  bool
+		delivers bool
+	}{
+		// Not yet a complete routing line → keep waiting.
+		{"", "", false, false},
+		{"to:", "", false, false},
+		{"to: zach", "", false, false},
+		{"to: zach@x", "", false, false},
+		// Owner 1:1 → indicator on the owner, delivers.
+		{"to: zach@x\n", "zach@x", true, true},
+		{"to: zach@x/phone\n", "zach@x", true, true},
+		// Known occupant → indicator on the occupant, delivers.
+		{"to: alice@x\n", "alice@x", true, true},
+		// A leading non-routing line is skipped; the routing still resolves.
+		{"sure\nto: zach@x\n", "zach@x", true, true},
+		// Room deliveries never light the owner's bubble but DO deliver.
+		{"to: team@muc.x\n", "", true, true},
+		// Noop and unknown targets send nothing and never light the bubble.
+		{"to: noop\n", "", true, false},
+		{"to: stranger@x\n", "", true, false},
+		{"to: zach@x\ncommentary only", "zach@x", true, true},
+	}
+	for _, c := range cases {
+		got, decided, delivers := streamTypingTarget(c.buf, x)
+		if got != c.target || decided != c.decided || delivers != c.delivers {
+			t.Errorf("streamTypingTarget(%q) = (%q,%v,%v), want (%q,%v,%v)",
+				c.buf, got, decided, delivers, c.target, c.decided, c.delivers)
+		}
+	}
+}
+
+// TestErrorRoomInvisibleToAgent verifies the write-only error room is NOT in
+// roomBares (so dispatch ignores it) and is NOT an allowed reply/send
+// destination — agents can't read it or route to it.
+func TestErrorRoomInvisibleToAgent(t *testing.T) {
+	x := NewXMPPBridge(
+		ResolvedAccount{Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", Owner: "zach@x"},
+		func(InboundMessage) {}, func(string, string) {},
+	)
+	if x.isRoomJID("errors@muc.x") {
+		t.Error("error room must NOT be an agent-visible (dispatched) room")
+	}
+	if !x.isRoomJID("team@muc.x") {
+		t.Error("normal room should still be agent-visible")
+	}
+	if got := x.classifyDest("errors@muc.x"); got != destBlocked {
+		t.Errorf("error room should be blocked for replies, got %v", got)
+	}
+	if got := x.classifyDest("team@muc.x"); got != destRoom {
+		t.Errorf("normal room should remain an allowed destination, got %v", got)
+	}
+}
+
 func TestRoutingNudgeBound(t *testing.T) {
 	b := NewBridge(ResolvedAccount{}, false)
 	for i := 1; i <= maxRoutingNudges; i++ {
@@ -169,6 +291,83 @@ func TestRoutingNudgeBound(t *testing.T) {
 	b.resetRoutingNudges()
 	if !b.bumpRoutingNudge() {
 		t.Error("after reset, a nudge should be allowed again")
+	}
+}
+
+// TestStagedNudgeLifecycle verifies issue #16's core flow: rejectReply stages
+// a correction that is only fired at settle if a later message didn't route.
+func TestStagedNudgeLifecycle(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+
+	// Nothing staged → nothing to fire.
+	if got := b.takeStagedNudge(); got != "" {
+		t.Errorf("empty staged nudge → got %q, want empty", got)
+	}
+
+	// Stage a correction (as rejectReply does), then a later message routes
+	// fine → the staged nudge is cleared and never fires.
+	b.stageNudge("dropped body", "no to: line")
+	b.clearPendingNudge()
+	if got := b.takeStagedNudge(); got != "" {
+		t.Errorf("staged nudge after clear → got %q, want empty", got)
+	}
+
+	// Stage a correction and fire at settle → reason fires exactly once.
+	b.stageNudge("dropped body", "no to: line")
+	if got := b.takeStagedNudge(); got != "no to: line" {
+		t.Errorf("settled nudge reason = %q, want %q", got, "no to: line")
+	}
+	if got := b.takeStagedNudge(); got != "" {
+		t.Errorf("staged nudge should fire once, got %q on second take", got)
+	}
+
+	// Later staging replaces earlier — only the final reason is nudged.
+	b.stageNudge("a", "reason one")
+	b.stageNudge("b", "reason two")
+	if got := b.takeStagedNudge(); got != "reason two" {
+		t.Errorf("latest staged reason = %q, want %q", got, "reason two")
+	}
+}
+
+// TestStagedNudgeRespectsBudget verifies the per-turn cap still bounds the
+// settle-time reminder even with a single staging point.
+func TestStagedNudgeRespectsBudget(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	b.stageNudge("a", "r1")
+	b.stageNudge("b", "r2")
+	if got := b.takeStagedNudge(); got != "r2" {
+		t.Fatalf("first staged nudge = %q, want r2", got)
+	}
+	// Both staged nudges consumed the budget now; a fresh turn resets it.
+	b.resetRoutingNudges()
+	b.stageNudge("c", "r3")
+	if got := b.takeStagedNudge(); got != "r3" {
+		t.Errorf("post-reset staged nudge = %q, want r3", got)
+	}
+}
+
+// TestFirePendingNudgeReportsLaunch pins the banner-suppression contract: a
+// settle that launches the routing nudge holds the "done (no reply)" banner,
+// because the resend arrives moments later. firePendingNudge must report
+// whether it actually launched so the caller can gate on it.
+func TestFirePendingNudgeReportsLaunch(t *testing.T) {
+	b := roomBridge()
+	b.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
+
+	// Nothing staged → no nudge launches.
+	if b.firePendingNudge() {
+		t.Error("no staged nudge → firePendingNudge must report false")
+	}
+
+	// A staged correction → the nudge fires and is reported.
+	b.stageNudge("dropped body", "no to: line")
+	if !b.firePendingNudge() {
+		t.Error("staged nudge → firePendingNudge must report true")
+	}
+
+	// Consumed on fire → nothing left to launch.
+	if b.firePendingNudge() {
+		t.Error("after firing, no second nudge may launch")
 	}
 }
 
@@ -191,5 +390,1267 @@ func TestPrettyDump(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("prettyDump missing %q in:\n%s", want, out)
 		}
+	}
+}
+
+func TestReactionEmojis(t *testing.T) {
+	// Build the token stream directly (ASCII content) to exercise the reaction
+	// extraction logic without any note-of-tool mangling of embedded emoji or
+	// XML-in-string. The emoji round-trip itself is covered by the real XML
+	// decode path (see xmpp.go handle / reactionEmojis) and TestInboundReactionAck.
+	toks := []xml.Token{
+		xml.StartElement{Name: xml.Name{Local: "message"}},
+		xml.StartElement{Name: xml.Name{Local: "reactions", Space: reactionsNS}},
+		xml.StartElement{Name: xml.Name{Local: "reaction"}},
+		xml.CharData("ACK"),
+		xml.EndElement{Name: xml.Name{Local: "reaction"}},
+		xml.StartElement{Name: xml.Name{Local: "reaction"}},
+		xml.CharData("OK"),
+		xml.EndElement{Name: xml.Name{Local: "reaction"}},
+		xml.StartElement{Name: xml.Name{Local: "reaction"}},
+		xml.CharData("  "),
+		xml.EndElement{Name: xml.Name{Local: "reaction"}},
+		xml.EndElement{Name: xml.Name{Local: "reactions"}},
+	}
+	got := reactionEmojis(toks)
+	if len(got) != 2 || got[0] != "ACK" || got[1] != "OK" {
+		t.Errorf("reactionEmojis = %v, want [ACK OK]", got)
+	}
+	if got := reactionEmojis(nil); len(got) != 0 {
+		t.Errorf("reactionEmojis(nil) = %v, want empty", got)
+	}
+}
+
+func TestInboundReactionAck(t *testing.T) {
+	// Path 1: a run is in flight → the ack is dropped, not a wake. The ambient
+	// buffer that used to hold it was removed in #106, and an ack carries no
+	// obligation, so nothing may interrupt or queue behind the live run.
+	b := roomBridge() // room-mode, owner zach@x.com
+	b.setStreaming(true)
+	b.onInbound(InboundMessage{
+		Nick: "peppy", Room: "team@muc.x.com",
+		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "target-123",
+	})
+	if b.reactionAckRun {
+		t.Error("streaming path should not set reactionAckRun")
+	}
+	if b.currentTurnDest() != "" {
+		t.Errorf("a dropped ack must not set a turn destination, got %q", b.currentTurnDest())
+	}
+
+	// Path 2: idle → the ack wakes the agent (reactionAckRun set, turnDest = room).
+	// A room reaction only reaches us when it acks a message WE sent, so the
+	// target id has to be one of ours.
+	b2 := roomBridge()
+	b2.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
+	b2.xmpp = NewXMPPBridge(b2.acct, func(InboundMessage) {}, b2.log)
+	b2.xmpp.recordSelfMessage("target-123", "team@muc.x.com", "our message")
+	b2.onInbound(InboundMessage{
+		Nick: "peppy", Room: "team@muc.x.com",
+		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "target-123",
+	})
+	if !b2.reactionAckRun {
+		t.Error("idle reaction should set reactionAckRun")
+	}
+	if b2.currentTurnDest() != "team@muc.x.com" {
+		t.Errorf("idle room reaction turnDest = %q, want room", b2.currentTurnDest())
+	}
+
+	// Path 3: idle, but the reaction acks somebody else's message → not ours, no
+	// turn. This is the last room path that could otherwise cost a turn for a
+	// message that does not address us (#106).
+	b4 := roomBridge()
+	b4.rpc = &RPCClient{}
+	b4.xmpp = NewXMPPBridge(b4.acct, func(InboundMessage) {}, b4.log)
+	b4.xmpp.recordSelfMessage("one-of-ours", "team@muc.x.com", "our message")
+	b4.onInbound(InboundMessage{
+		Nick: "peppy", Room: "team@muc.x.com",
+		From: "peppy@x.com/peppy", Reactions: []string{"\U0001FAE1"}, ReactionID: "someone-elses",
+	})
+	if b4.reactionAckRun {
+		t.Error("a reaction to another occupant's message must not wake us")
+	}
+	if b4.currentTurnDest() != "" {
+		t.Errorf("a dropped room reaction must not set a turn destination, got %q", b4.currentTurnDest())
+	}
+
+	// Path 4: the owner acks a room message that belongs to a peer → that peer's
+	// business, not ours (#106). An owner reaction to a message we cannot
+	// attribute (never seen) still wakes us: the owner is trusted traffic, and a
+	// reaction id we do not hold may be our own from before a restart.
+	b5 := roomBridge()
+	b5.rpc = &RPCClient{}
+	b5.xmpp = NewXMPPBridge(b5.acct, func(InboundMessage) {}, b5.log)
+	b5.xmpp.recordInboundMessage("peppys-message", "team@muc.x.com/peppy", "we shipped", false)
+	b5.onInbound(InboundMessage{
+		FromOwner: true, Room: "team@muc.x.com", Nick: "zach",
+		From: "team@muc.x.com/zach", Reactions: []string{"\u2705"}, ReactionID: "peppys-message",
+	})
+	if b5.reactionAckRun {
+		t.Error("the owner's reaction to a peer's message must not wake us")
+	}
+	b5.onInbound(InboundMessage{
+		FromOwner: true, Room: "team@muc.x.com", Nick: "zach",
+		From: "team@muc.x.com/zach", Reactions: []string{"\u2705"}, ReactionID: "never-seen-id",
+	})
+	if !b5.reactionAckRun {
+		t.Error("the owner's reaction to an unattributable message should wake (delivered, not lost)")
+	}
+
+	// Owner reacting on 1:1 renders as "owner" and turns to the owner.
+	b3 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
+	b3.rpc = &RPCClient{}
+	b3.onInbound(InboundMessage{
+		Direct: true, FromOwner: true, From: "zach@x.com/res",
+		Reactions: []string{"\u2705"}, ReactionID: "out-1",
+	})
+	if !b3.reactionAckRun {
+		t.Error("owner 1:1 reaction should wake (set reactionAckRun)")
+	}
+	if b3.currentTurnDest() != "zach@x.com" {
+		t.Errorf("owner 1:1 reaction turnDest = %q, want owner", b3.currentTurnDest())
+	}
+}
+
+func TestIdleAwayClock(t *testing.T) {
+	b := roomBridge()
+	b.markActive()
+	if !b.idleSince.IsZero() {
+		t.Error("markActive should clear idleSince")
+	}
+	b.markIdle()
+	if b.idleSince.IsZero() {
+		t.Error("markIdle should set idleSince")
+	}
+	// An inbound message marks active again, even a non-canonical one.
+	b.markActive()
+	if !b.idleSince.IsZero() {
+		t.Error("markActive after activity should clear idleSince")
+	}
+}
+
+// TestInboundRearmsIdleClock guards against the "busy-room bot never goes
+// away" regression: an inbound message that never becomes a run previously left
+// idleSince cleared by markActive, and since agent_settled never fires for it,
+// the idle watcher had no way to ever drift the agent back to "away". onInbound
+// must re-arm the clock so a quiet stretch still produces an away transition.
+// The reaction-ack path is the remaining case that reaches onInbound without
+// becoming a run (#106 dropped unaddressed room chatter entirely).
+func TestInboundRearmsIdleClock(t *testing.T) {
+	b := roomBridge()
+	b.idleSince = time.Time{} // e.g. just cleared by a prior markActive
+	b.awayAnnounced = false
+
+	// An unaddressed room message: dropped without a turn or a record.
+	b.onInbound(InboundMessage{
+		Nick: "falco", Room: "team@muc.x.com",
+		From: "falco@x.com/falco", Body: "some unrelated chatter",
+	})
+
+	if b.idleSince.IsZero() {
+		t.Fatal("inbound should re-arm the idle clock; zero idleSince = can never go away")
+	}
+	if elapsed := time.Since(b.idleSince); elapsed > time.Second {
+		t.Errorf("idleSince should be restarted to ~now, got %v old", elapsed)
+	}
+	if b.awayAnnounced {
+		t.Error("onInbound should leave awayAnnounced false so a fresh away can be announced")
+	}
+}
+
+// TestIdleTickNoSelfDeadlockWhileStreaming guards against a regression where
+// idleTick held b.mu and then called streaming() (which itself locks b.mu),
+// self-deadlocking the idle-watcher goroutine — and, since idleTick's handler
+// runs in the same goroutine as the XMPP read loop for other callers of b.mu,
+// wedging the whole bridge until a manual restart. A buggy idleTick would hang
+// forever here instead of returning.
+func TestIdleTickNoSelfDeadlockWhileStreaming(t *testing.T) {
+	b := roomBridge()
+	b.idleSince = time.Now().Add(-idleAwayTimeout - time.Minute)
+	b.streamingRun = true
+
+	done := make(chan struct{})
+	go func() {
+		b.idleTick()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idleTick deadlocked while a run was streaming")
+	}
+}
+
+func TestLoadAwayActivities(t *testing.T) {
+	b := roomBridge()
+	b.loadAwayActivities()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(awayActivities) < 400 {
+		t.Errorf("embedded away-activities.txt parsed to %d entries, want >= 400", len(awayActivities))
+	}
+	for _, a := range awayActivities {
+		if a == "" {
+			t.Error("empty activity line in pool")
+		}
+		if len(a) > 90 {
+			t.Errorf("activity too long (%d): %q", len(a), a)
+		}
+	}
+}
+
+// TestToolRelayCarriesReason: a relayed tool action must come back as a string
+// — "ok" on success, or the failure reason — not a bare boolean, so the model
+// learns *why* something failed (issue #34: e.g. an upload rejected by the
+// server as too large never reached the agent).
+func TestToolRelayCarriesReason(t *testing.T) {
+	stdin := &nopClose{buf: &bytes.Buffer{}}
+	b := roomBridge()
+	b.rpc = &RPCClient{stdin: stdin, mu: sync.Mutex{}}
+	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com"} // owner allowlisted; SendFile fails fast ("not online")
+
+	readLine := func(t *testing.T) map[string]any {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if line, err := stdin.readString('\n'); err == nil {
+				var resp map[string]any
+				if err := json.Unmarshal([]byte(line), &resp); err != nil {
+					t.Fatalf("bad relay response line %q: %v", line, err)
+				}
+				return resp
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no relay response within 2s (buf=%q)", stdin.contents())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// Bad payload: the parse error is the reason.
+	b.handleToolRelay("r-bad", `{not json`)
+	resp := readLine(t)
+	if resp["id"] != "r-bad" {
+		t.Errorf("bad-payload response id = %v, want r-bad", resp["id"])
+	}
+	if v, _ := resp["value"].(string); !strings.Contains(v, "bad tool-relay payload") {
+		t.Errorf("bad-payload response value = %q, want a reason", v)
+	}
+
+	// Blocked destination: the allowlist refusal is the reason.
+	b.handleToolRelay("r-block", `{"action":"file","path":"/tmp/a.apk","to":"stranger@x.com"}`)
+	resp = readLine(t)
+	if v, _ := resp["value"].(string); !strings.Contains(v, "not an allowed destination") {
+		t.Errorf("blocked-dest response value = %q, want allowlist reason", v)
+	}
+
+	// Failed upload: SendFile's error text, not a plain false (issue #34).
+	b.handleToolRelay("r-file", `{"action":"file","path":"/tmp/a.apk","to":"zach@x.com"}`)
+	resp = readLine(t)
+	if v, _ := resp["value"].(string); !strings.Contains(v, "not online") {
+		t.Errorf("file-failure response value = %q, want SendFile's reason (not online)", v)
+	}
+	if _, hasConfirmed := resp["confirmed"]; hasConfirmed {
+		t.Errorf("file-failure response = %v, unexpected confirm-style boolean field", resp)
+	}
+}
+
+// TestToolRelaySuccessOk: a successful relay answers "ok", which the extension
+// maps to a clean tool result (as opposed to a generic failure).
+func TestToolRelaySuccessOk(t *testing.T) {
+	stdin := &nopClose{buf: &bytes.Buffer{}}
+	b := roomBridge()
+	b.rpc = &RPCClient{stdin: stdin, mu: sync.Mutex{}}
+	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com"}
+
+	// The react path is synchronous and doesn't need a live session: a missing
+	// target is the only failure mode reachable here, so feed one and assert
+	// the reason names the missing stanza.
+	b.handleToolRelay("r-react", `{"action":"react","emoji":"✅","messageId":"nonexistent-1"}`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var line string
+	for {
+		if l, err := stdin.readString('\n'); err == nil {
+			line = l
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no relay response within 2s (buf=%q)", stdin.contents())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.Contains(line, "\"value\"") || !strings.Contains(line, "not found in message history") {
+		t.Errorf("react-miss response = %q, want a reason naming the missing target", line)
+	}
+}
+
+// nopClose adapts a bytes.Buffer to io.WriteCloser for RPCClient.stdin.
+//
+// The mutex is not decoration: the relay handler writes from its own goroutine
+// while the test reads the same buffer, so both sides must go through the lock.
+// Read the buffer with readString/contents, never through the wrapped buffer.
+type nopClose struct {
+	mu  sync.Mutex
+	buf *bytes.Buffer
+}
+
+func (n *nopClose) Write(p []byte) (int, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.buf.Write(p)
+}
+
+func (n *nopClose) Close() error { return nil }
+
+// readString consumes one delimited line, mirroring bytes.Buffer.ReadString.
+func (n *nopClose) readString(delim byte) (string, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.buf.ReadString(delim)
+}
+
+// contents returns everything still buffered, for failure messages.
+func (n *nopClose) contents() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.buf.String()
+}
+
+func TestOpenRouterCreditsParse(t *testing.T) {
+	// Build a throwaway HTTP server to avoid hitting the real endpoint.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-or-test" {
+			t.Errorf("auth header = %q, want Bearer sk-or-test", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":{"total_credits":85,"total_usage":81.11}}`)
+	}))
+	defer srv.Close()
+	orig := creditEndpoint
+	creditEndpoint = srv.URL
+	defer func() { creditEndpoint = orig }()
+	total, used, err := openRouterCredits("sk-or-test")
+	if err != nil {
+		t.Fatalf("openRouterCredits: %v", err)
+	}
+	if total != 85 || used != 81.11 {
+		t.Fatalf("got total=%v used=%v, want 85 / 81.11", total, used)
+	}
+}
+
+// newTestBridge builds an offline bridge: sends return "" (not online), which
+// is exactly the "nothing reached a destination" case deliverReply must report.
+func newTestBridge(acct ResolvedAccount) *Bridge {
+	b := NewBridge(acct, false)
+	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, b.log)
+	return b
+}
+
+// TestRepliedOnlyOnDelivery pins the core of the dropped-reply fix: "replied"
+// must mean "reached a destination", not "text existed". A malformed reply goes
+// to the write-only error room, which the owner never reads, so counting it as
+// a reply would suppress the settle-time banner and leave the owner in silence.
+func TestRepliedOnlyOnDelivery(t *testing.T) {
+	room := ResolvedAccount{Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", Owner: "zach@x"}
+	b := newTestBridge(room)
+	if b.deliverReply("no routing line here") {
+		t.Error("a reply with no \"to:\" line must not count as delivered")
+	}
+	if b.deliverReply("to: errors@muc.x\n\nsneaky") {
+		t.Error("a blocked destination must not count as delivered")
+	}
+	// Offline: a well-formed reply still can't reach anyone.
+	if b.deliverReply("to: zach@x\n\nhello") {
+		t.Error("an offline send must not count as delivered")
+	}
+	// Pure 1:1 accounts take the other branch; offline is still not delivered.
+	solo := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	if solo.deliverReply("hello") {
+		t.Error("an offline 1:1 send must not count as delivered")
+	}
+}
+
+// TestNoopStillCountsAsReplied verifies deliberate silence stays an answer:
+// "to: noop" emits no stanza but must never look like a run that died before
+// writing a reply, or the empty-tail recovery would argue with it.
+func TestNoopStillCountsAsReplied(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	if !b.deliverReply("to: noop\n\nnothing to add") {
+		t.Error("to: noop must count as delivered")
+	}
+	if !b.replied() {
+		t.Error("to: noop must set replied")
+	}
+}
+
+// TestPreambleDoesNotDisarmNoReplyNet covers the failure that dropped replies
+// live: the agent writes a preamble alongside its tool call, the tool returns,
+// and the run ends with no further text. The delivered preamble used to mark
+// the run as answered, so no banner and no retry fired — the owner just got a
+// "running…" line and then silence.
+func TestPreambleDoesNotDisarmNoReplyNet(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	b.resetTailTracking()
+	// Preamble message: text delivered, then the tool starts.
+	b.setFinalMsgHadText(true)
+	b.clearToolSinceDelivery()
+	b.markToolSinceDelivery()
+	// The tool result arrives and the run ends with a tool-only message.
+	b.setFinalMsgHadText(false)
+	if !b.needsEmptyTailRecovery() {
+		t.Error("a run ending on a tool call after a preamble needs recovery")
+	}
+	// The winning shape: the reply text comes after the tool result.
+	b.setFinalMsgHadText(true)
+	b.clearToolSinceDelivery()
+	if b.needsEmptyTailRecovery() {
+		t.Error("a run that replied after its tool needs no recovery")
+	}
+}
+
+// TestNoRecoveryWithoutTool verifies a run that never ran a tool is left alone:
+// an empty final message there is the model saying nothing, which the existing
+// "done (no reply)" banner already covers.
+func TestNoRecoveryWithoutTool(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.resetTailTracking()
+	if b.needsEmptyTailRecovery() {
+		t.Error("no tool ran — recovery must not fire")
+	}
+	// Volunteer and reaction-ack runs are allowed to end quietly even mid-work.
+	b.markToolSinceDelivery()
+	b.volunteered = true
+	if b.needsEmptyTailRecovery() {
+		t.Error("a volunteer run must not trigger recovery")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if b.needsEmptyTailRecovery() {
+		t.Error("a reaction-ack run must not trigger recovery")
+	}
+}
+
+// TestEmptyTailRecoveryBounded verifies the retry can't loop against a model
+// that keeps ending its runs on a tool call: one prompt per user turn, then the
+// banner takes over and tells the owner nothing came back.
+func TestEmptyTailRecoveryBounded(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	for i := 1; i <= maxTailNudges; i++ {
+		if !b.bumpTailNudge() {
+			t.Errorf("recovery %d should be allowed (cap %d)", i, maxTailNudges)
+		}
+	}
+	if b.bumpTailNudge() {
+		t.Error("recovery past the cap should be denied")
+	}
+	b.resetTailNudges()
+	if !b.bumpTailNudge() {
+		t.Error("after a fresh user turn, recovery should be allowed again")
+	}
+}
+
+// TestSettleLocallyClearsTailTracking verifies an aborted or replaced run can't
+// leave state behind that fires a recovery prompt for cancelled work.
+func TestSettleLocallyClearsTailTracking(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markToolSinceDelivery()
+	b.setFinalMsgHadText(false)
+	if !b.needsEmptyTailRecovery() {
+		t.Fatal("precondition: mid-work run should need recovery")
+	}
+	b.settleLocally()
+	if b.needsEmptyTailRecovery() {
+		t.Error("settleLocally must clear the empty-tail bookkeeping")
+	}
+}
+
+// TestUnansweredRunCounts covers the steer drop seen live: five messages went
+// into one run and only the last one got an answer, because pi injects each
+// queued message the instant a tool yields and the model moves on to it.
+func TestUnansweredRunCounts(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	// The live A–E burst: 5 messages in, 1 reply out.
+	for range 5 {
+		b.countInbound("zach", "", "hello")
+	}
+	b.recordDelivery("id-r", "answered")
+	in, out, ok := b.unansweredRun()
+	if !ok || in != 5 || out != 1 {
+		t.Errorf("A–E burst = (%d,%d,%v), want (5,1,true)", in, out, ok)
+	}
+	// Every message answered → silent.
+	b.resetRunCounts()
+	for range 3 {
+		b.countInbound("zach", "", "hello")
+		b.recordDelivery("id-r", "answered")
+	}
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a run that answered every message must not hint")
+	}
+	// A single unanswered message is the empty-tail case, not this one: the
+	// "done (no reply)" banner and the tail recovery already cover it.
+	b.resetRunCounts()
+	b.countInbound("zach", "", "hello")
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a single-message run must not hint")
+	}
+	// Volunteer and reaction-ack runs stay quiet even when unbalanced.
+	b.resetRunCounts()
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
+	b.volunteered = true
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a volunteer run must not hint")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a reaction-ack run must not hint")
+	}
+}
+
+// TestUnansweredHintBounded verifies the hint can't loop: one per user turn,
+// refilled when the next message arrives.
+func TestUnansweredHintBounded(t *testing.T) {
+	b := NewBridge(ResolvedAccount{}, false)
+	for i := 1; i <= maxHintNudges; i++ {
+		if !b.bumpHintNudge() {
+			t.Errorf("hint %d should be allowed (cap %d)", i, maxHintNudges)
+		}
+	}
+	if b.bumpHintNudge() {
+		t.Error("hint past the cap should be denied")
+	}
+	b.resetHintNudges()
+	if !b.bumpHintNudge() {
+		t.Error("after a fresh user turn, a hint should be allowed again")
+	}
+}
+
+// TestNoopCountsTowardAnsweredRun verifies deliberate silence balances the
+// tally, so a run the agent answered with "to: noop" is never nagged.
+func TestNoopCountsTowardAnsweredRun(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
+	if !b.deliverReply("to: zach@x\n\nanswered one") {
+		// Offline, so this send reports undelivered; count it by hand to model
+		// the online case.
+		b.recordDelivery("id-r", "answered")
+	}
+	if b.deliverReply("to: noop\n\nnothing more to add") {
+		b.recordDelivery("id-r", "answered")
+	}
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a run answered with a reply plus to: noop must not hint")
+	}
+}
+
+// TestNoopWorksInOneToOne pins that a pure 1:1 account can decline to speak.
+// It has no routing contract, but "to: noop" is how the agent says "nothing to
+// send" — without it a deliberate silence looks like a reply that went missing,
+// and the bridge argues with it.
+func TestNoopWorksInOneToOne(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	if !b.deliverReply("to: noop\n\nnothing more to add") {
+		t.Error("a 1:1 \"to: noop\" must count as an answer")
+	}
+	if !b.replied() {
+		t.Error("a 1:1 \"to: noop\" must mark the run as replied")
+	}
+	if _, out, _ := b.unansweredRun(); out != 1 {
+		t.Errorf("deliveries = %d, want 1", out)
+	}
+	// Only the FIRST non-empty line routes. Prose that merely mentions the form
+	// is an ordinary reply, and offline it reaches nobody.
+	b.resetRunCounts()
+	if b.deliverReply("Sure.\nto: noop") {
+		t.Error("a \"to: noop\" after the first line must not be a route")
+	}
+	if leadingNoop("to be fair, noop is a word") {
+		t.Error("prose beginning with \"to\" must not be a route")
+	}
+}
+
+// TestFanOutCountsEachSegment pins that one reply answering several messages is
+// counted as several answers. Counting per assistant message made a run that
+// answered everything look unbalanced, and the unanswered-message hint then
+// fired for work that was already done.
+func TestFanOutCountsEachSegment(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
+	b.countInbound("zach", "id-a", "first question")
+	b.countInbound("zach", "id-b", "second question")
+	// Two segments in ONE message. "to: noop" is used because an offline send
+	// reaches nobody and so is not an answer.
+	if !b.deliverReply("to: noop\n\nanswer to A\nto: noop\n\nanswer to B") {
+		t.Fatal("precondition: a noop segment must deliver")
+	}
+	if _, out, _ := b.unansweredRun(); out != 2 {
+		t.Errorf("deliveries = %d, want 2 (one per \"to:\" segment)", out)
+	}
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("a run that answered both messages in one reply must not hint")
+	}
+}
+
+// TestSettleClearsRunCounts verifies an aborted run can't carry its tally into
+// the next one and fire a hint for cancelled work.
+func TestSettleClearsRunCounts(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
+	if _, _, ok := b.unansweredRun(); !ok {
+		t.Fatal("precondition: 2 in / 0 out should hint")
+	}
+	b.settleLocally()
+	if _, _, ok := b.unansweredRun(); ok {
+		t.Error("settleLocally must clear the run tally")
+	}
+}
+
+// TestHintNotRepeatedOnTheCatchUpRun verifies the run that answers a hint is
+// never hinted about in turn. The agent has just been told to catch up, so
+// whatever it sends IS the catch-up — asking again would have it check its own
+// correction.
+func TestHintNotRepeatedOnTheCatchUpRun(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markHintPending() // as fireUnansweredHint does
+	// The catch-up run: even an unbalanced tally must not hint again.
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
+	b.countInbound("zach", "", "hello")
+	if !b.takeHintPending() {
+		t.Fatal("the run after a hint must be marked as the catch-up run")
+	}
+	// The mark is one-shot: the run after the catch-up is judged normally.
+	if b.takeHintPending() {
+		t.Error("the catch-up mark must clear after one settle")
+	}
+	if _, _, ok := b.unansweredRun(); !ok {
+		t.Error("a later unbalanced run should hint again")
+	}
+}
+
+// TestAbortClearsHintPending verifies an aborted run drops the catch-up mark:
+// no catch-up is coming, so the next real run must be judged on its own tally.
+func TestAbortClearsHintPending(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.markHintPending()
+	b.settleLocally()
+	if b.takeHintPending() {
+		t.Error("settleLocally must clear the catch-up mark")
+	}
+}
+
+// streamDelta builds a pi >= 0.84.0 message_update event: an
+// assistantMessageEvent delta and nothing else. Pi 0.84.0 removed the
+// cumulative `message` field and `assistantMessageEvent.partial`, so any event
+// this helper cannot express is one pi no longer sends.
+func streamDelta(ame map[string]any) Event {
+	return Event{"type": "message_update", "assistantMessageEvent": ame}
+}
+
+// TestStreamDeltaContract pins pi's post-0.84.0 message_update contract:
+// handleStreamDelta must drive presence and the typing bubble from deltas
+// alone. If a future edit reaches for a cumulative field, this test fails
+// because the events here never carry one.
+func TestStreamDeltaContract(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "thinking_start"}))
+	if b.xmpp.show != "dnd" || b.xmpp.presence != "thinking…" {
+		t.Errorf("thinking_start presence = (%q,%q), want (dnd,thinking…)",
+			b.xmpp.show, b.xmpp.presence)
+	}
+
+	// 1:1 account: text_start lights the owner's composer immediately.
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
+	if b.xmpp.presence != "replying…" {
+		t.Errorf("text_start presence = %q, want replying…", b.xmpp.presence)
+	}
+	if b.typingTo != "zach@x" {
+		t.Errorf("text_start typing target = %q, want zach@x", b.typingTo)
+	}
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": "hello"}))
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
+	if b.typingTo != "" {
+		t.Errorf("text_end typing target = %q, want empty", b.typingTo)
+	}
+
+	// An event with no assistantMessageEvent is ignored, not a panic.
+	b.handleStreamDelta(Event{"type": "message_update"})
+}
+
+// TestStreamDeltaContractRoomMode covers the room-mode branch, where the
+// typing target is decided from the accumulated text_delta chunks rather than
+// lit on the owner at text_start. Only the deltas carry that text now, so this
+// pins streamTypingDelta to ame["delta"].
+func TestStreamDeltaContractRoomMode(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}})
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
+	if b.typingTo != "" {
+		t.Errorf("room-mode text_start typing target = %q, want empty (route unknown)", b.typingTo)
+	}
+	// Until a routing line proves a real reply, the stream reads as
+	// inter-tool commentary: label it muttering, not replying.
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("room-mode text_start presence = %q, want muttering…", b.xmpp.presence)
+	}
+
+	// The routing line arrives split across deltas, as it does on the wire.
+	for _, d := range []string{"to: ", "zach", "@x\n", "hi"} {
+		b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": d}))
+	}
+	if b.typingTo != "zach@x" {
+		t.Errorf("room-mode typing target = %q, want zach@x", b.typingTo)
+	}
+	// The routing line resolves to a real delivery: the label upgrades to
+	// replying, matching the lit composer.
+	if b.xmpp.presence != "replying…" {
+		t.Errorf("room-mode routed presence = %q, want replying…", b.xmpp.presence)
+	}
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
+	if b.typingTo != "" {
+		t.Errorf("room-mode text_end typing target = %q, want empty", b.typingTo)
+	}
+}
+
+// TestStreamDeltaCommentaryStaysMuttering pins that a stream carrying no
+// routing line — inter-tool commentary that will never be delivered — keeps
+// the "muttering…" label for the whole stream, and that a "to: noop" route
+// (deliberate silence, nothing sent) does not upgrade it either.
+func TestStreamDeltaCommentaryStaysMuttering(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}})
+
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "thinking_start"}))
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
+	for _, d := range []string{"let me ", "check the ", "file\n", "done"} {
+		b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": d}))
+	}
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("commentary stream presence = %q, want muttering…", b.xmpp.presence)
+	}
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
+
+	// A deliberate-silence route resolves but delivers nothing: still muttering.
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": "to: noop\n"}))
+	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("noop stream presence = %q, want muttering…", b.xmpp.presence)
+	}
+}
+
+// TestClearQueueCounts verifies /abort's queue drain: the dropped count is the
+// sum of pi's steering and follow-up queues.
+func TestClearQueueCounts(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.ctx = context.Background()
+	b.rpc = NewRPCClient(fakePiRespond(t, clearQueueOK), "", "", "", nil)
+	if err := b.rpc.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.rpc.Stop()
+
+	if got := b.clearQueue(); got != 2 {
+		t.Errorf("clearQueue() = %d, want 2 (1 steer + 1 follow-up)", got)
+	}
+}
+
+// TestClearQueueOldPi verifies the degrade path: pi < 0.84.4 has no
+// clear_queue, and an unknown-command failure must report 0 dropped rather
+// than blocking the abort that follows it.
+func TestClearQueueOldPi(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	b.ctx = context.Background()
+	b.rpc = NewRPCClient(fakePiRespond(t, clearQueueUnknown), "", "", "", nil)
+	if err := b.rpc.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.rpc.Stop()
+
+	if got := b.clearQueue(); got != 0 {
+		t.Errorf("clearQueue() against pi < 0.84.4 = %d, want 0", got)
+	}
+}
+
+// bgBridge is a room-mode bridge with a mock XMPP bridge whose SetPresence
+// calls are observable through show/presence.
+func bgBridge() *Bridge {
+	b := roomBridge()
+	b.xmpp = &XMPPBridge{}
+	return b
+}
+
+// TestBgProcessesPresence pins the dnd-while-waiting contract: while pi has
+// background processes running and no agent run is in flight, presence shows
+// dnd with a count label; zero processes settle back to "listening".
+func TestBgProcessesPresence(t *testing.T) {
+	b := bgBridge()
+
+	// No processes: settled presence is available + listening.
+	b.announceSettledPresence()
+	if b.xmpp.show != "" || b.xmpp.presence != "listening" {
+		t.Errorf("settled with 0 processes = show %q status %q, want available \"listening\"", b.xmpp.show, b.xmpp.presence)
+	}
+
+	// A process starts: dnd with the plural label.
+	b.setBgProcesses(2)
+	if b.xmpp.show != "dnd" || b.xmpp.presence != "waiting on 2 processes" {
+		t.Errorf("2 processes = show %q status %q, want dnd \"waiting on 2 processes\"", b.xmpp.show, b.xmpp.presence)
+	}
+
+	// Singular label for exactly one process.
+	b.setBgProcesses(1)
+	if b.xmpp.presence != "waiting on 1 process" {
+		t.Errorf("1 process status = %q, want \"waiting on 1 process\"", b.xmpp.presence)
+	}
+
+	// Settling again (agent run ends) keeps dnd while a process still runs.
+	b.announceSettledPresence()
+	if b.xmpp.show != "dnd" {
+		t.Errorf("settled with 1 process = show %q, want dnd", b.xmpp.show)
+	}
+
+	// Last process ends: back to listening.
+	b.setBgProcesses(0)
+	if b.xmpp.show != "" || b.xmpp.presence != "listening" {
+		t.Errorf("0 processes after being busy = show %q status %q, want listening", b.xmpp.show, b.xmpp.presence)
+	}
+
+	// No-change relay is a no-op (SetPresence skips identical stanzas anyway,
+	// but the count must not be flipped to 0 by a stale relay).
+	b.setBgProcesses(0)
+	if b.xmpp.show != "" || b.xmpp.presence != "listening" {
+		t.Errorf("redundant 0 relay changed presence to %q/%q", b.xmpp.show, b.xmpp.presence)
+	}
+}
+
+// TestBgProcessesDontDriftAway pins the idle-watcher interaction: a bot
+// waiting on background processes must not announce "away" no matter how long
+// it sits idle. awayAnnounced staying false is the observable — the transition
+// was suppressed.
+func TestBgProcessesDontDriftAway(t *testing.T) {
+	b := bgBridge()
+	b.idleSince = time.Now().Add(-idleAwayTimeout - time.Minute)
+	b.bgProcesses = 1
+	b.awayAnnounced = false
+
+	b.idleTick()
+
+	if b.awayAnnounced {
+		t.Error("idleTick announced away while a background process was running")
+	}
+	if b.xmpp.presence == "away" || b.xmpp.show == "away" {
+		t.Errorf("presence drifted to away: %q/%q", b.xmpp.show, b.xmpp.presence)
+	}
+
+	// Once the process finishes and the agent stays idle, away is allowed again.
+	b.bgProcesses = 0
+	b.idleTick()
+	if !b.awayAnnounced {
+		t.Error("idleTick should announce away once processes finished")
+	}
+	if b.xmpp.show != "away" {
+		t.Errorf("presence after idle = show %q, want away", b.xmpp.show)
+	}
+}
+
+// TestSettledPresenceRespectsRunningProcesses: an agent_settled must leave the
+// bot dnd when background processes are still running (the run's own end does
+// not finish the work) — and a process starting must not stamp over a live run.
+func TestSettledPresenceRespectsRunningProcesses(t *testing.T) {
+	b := bgBridge()
+	b.setBgProcesses(1)
+	b.announceSettledPresence()
+	if b.xmpp.show != "dnd" {
+		t.Errorf("agent_settled with 1 process = show %q, want dnd", b.xmpp.show)
+	}
+
+	// A process starting mid-run must not clobber the run's own label.
+	b.streamingRun = true
+	b.xmpp.SetPresence("dnd", "thinking…")
+	b.setBgProcesses(2)
+	if b.xmpp.presence != "thinking…" {
+		t.Errorf("process relay mid-run clobbered run label: %q", b.xmpp.presence)
+	}
+}
+
+// TestToolRelayProcessCount exercises the process_count relay action: the
+// count lands on the bridge and the relay answers "ok".
+func TestToolRelayProcessCount(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+
+	b.handleToolRelay("r-count", `{"action":"process_count","count":3}`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var line string
+	for {
+		if l, err := buf.ReadString('\n'); err == nil {
+			line = l
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.Contains(line, "\"value\": \"ok\"") && !strings.Contains(line, "\"value\":\"ok\"") {
+		t.Errorf("process_count relay response = %q, want ok", line)
+	}
+	b.mu.Lock()
+	got := b.bgProcesses
+	b.mu.Unlock()
+	if got != 3 {
+		t.Errorf("bgProcesses after relay = %d, want 3", got)
+	}
+	if b.xmpp.presence != "waiting on 3 processes" {
+		t.Errorf("presence after relay = %q, want \"waiting on 3 processes\"", b.xmpp.presence)
+	}
+}
+func TestHeartbeatRunNoBanner(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+
+	// A heartbeat alarm wakes the idle agent and marks the run it opens.
+	b.fireHeartbeat(`[pi-msg: process "build" has been running for 600 seconds now…]`)
+	b.mu.Lock()
+	marked := b.heartbeatRun
+	b.mu.Unlock()
+	if !marked {
+		t.Fatal("fireHeartbeat must set heartbeatRun")
+	}
+
+	// agent_start must NOT clear it: the flag has to survive to the settle
+	// decision for the run it opened.
+	b.handleRPCEvent(Event{"type": "agent_start"})
+	b.mu.Lock()
+	marked = b.heartbeatRun
+	b.mu.Unlock()
+	if !marked {
+		t.Fatal("agent_start must not clear heartbeatRun before the run settles")
+	}
+
+	// No reply, no recovery: the banner must be suppressed for a heartbeat run.
+	if b.bannerNoReply(false, false) {
+		t.Error("banner must be suppressed for a heartbeat wake with no reply")
+	}
+
+	// Simulate the settle consuming the flag; a later user-initiated run with
+	// no reply banners normally again.
+	b.handleRPCEvent(Event{"type": "agent_settled"})
+	if !b.bannerNoReply(false, false) {
+		t.Error("after consume, a normal unanswered run must banner again")
+	}
+}
+
+// TestBannerNoReplyGates pins the banner condition directly: it fires only for
+// an unanswered, non-quiet-wake run with no recovery in flight.
+func TestBannerNoReplyGates(t *testing.T) {
+	b := bgBridge()
+
+	// No reply, not a quiet wake, no recovery → banner.
+	if !b.bannerNoReply(false, false) {
+		t.Error("unanswered run should banner")
+	}
+
+	// A delivered reply suppresses it.
+	b.setReplied(true)
+	if b.bannerNoReply(false, false) {
+		t.Error("replied run should not banner")
+	}
+	b.setReplied(false)
+
+	// Quiet wakes suppress it.
+	b.volunteered = true
+	if b.bannerNoReply(false, false) {
+		t.Error("volunteer run should not banner")
+	}
+	b.volunteered = false
+	b.reactionAckRun = true
+	if b.bannerNoReply(false, false) {
+		t.Error("reaction-ack run should not banner")
+	}
+	b.reactionAckRun = false
+	b.heartbeatRun = true
+	if b.bannerNoReply(false, false) {
+		t.Error("heartbeat run should not banner")
+	}
+	b.heartbeatRun = false
+
+	// A recovery/nudge in flight holds it.
+	if b.bannerNoReply(true, false) || b.bannerNoReply(false, true) {
+		t.Error("recovery or nudge in flight should hold the banner")
+	}
+}
+
+func TestNoReplyReactionIgnoresOptionalLifecycleSetting(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"}) // reactions default off
+	var level, message string
+	b.xmpp.logf = func(l, m string) { level, message = l, m }
+	b.setLifecycleReactTarget("zach@x", "msg-1")
+
+	b.reactNoReply()
+
+	if level != "warning" || !strings.Contains(message, "not online") {
+		t.Fatalf("reactNoReply() with reactions disabled did not attempt send: %s: %s", level, message)
+	}
+}
+
+// TestToolRelayProcessHeartbeatInjectsPrompt: an idle agent receives the
+// long-running-process alarm as an injected prompt carrying the TRUE elapsed
+// seconds and the log tail, presence goes dnd thinking, and the relay answers
+// ok so the extension's blocking select resolves.
+func TestToolRelayProcessHeartbeatInjectsPrompt(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+
+	b.handleToolRelay("r-hb", `{"action":"process_heartbeat","processes":[{"id":"p1","name":"gradle","command":"./gradlew assembleRelease","elapsedSecs":606,"tail":"BUILD SUCCESSFUL in 3m 12s\n"}]}`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "\"value\": \"ok\"") && !strings.Contains(buf.String(), "\"value\":\"ok\"") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Both the prompt and the relay ok land in the same stdin buffer (prompt
+	// first — fireHeartbeat runs before RespondUIRelay), so assert on the whole
+	// buffer rather than consuming a single line.
+	out := buf.String()
+	if !strings.Contains(out, "\"type\":\"prompt\"") {
+		t.Errorf("heartbeat did not prompt pi (buf=%q)", out)
+	}
+	if !strings.Contains(out, "process \\\"gradle\\\" has been running for 606 seconds now") {
+		t.Errorf("heartbeat prompt missing true elapsed time (buf=%q)", out)
+	}
+	if !strings.Contains(out, "BUILD SUCCESSFUL in 3m 12s") {
+		t.Errorf("heartbeat prompt missing log tail (buf=%q)", out)
+	}
+	if b.xmpp.show != "dnd" || b.xmpp.presence != "thinking…" {
+		t.Errorf("heartbeat presence = %q/%q, want dnd thinking", b.xmpp.show, b.xmpp.presence)
+	}
+}
+
+// TestToolRelayProcessHeartbeatQueuedWhileStreaming: a heartbeat arriving while
+// a run is in flight must NOT interrupt (no prompt), the relay still answers
+// ok, and the alarm is delivered on agent_settled via flushPendingHeartbeats.
+func TestToolRelayProcessHeartbeatQueuedWhileStreaming(t *testing.T) {
+	var buf bytes.Buffer
+	b := bgBridge()
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.setStreaming(true) // a run is in flight
+
+	b.handleToolRelay("r-hb2", `{"action":"process_heartbeat","processes":[{"id":"p1","name":"install","command":"pnpm install","elapsedSecs":721,"tail":""}]}`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "\"value\": \"ok\"") && !strings.Contains(buf.String(), "\"value\":\"ok\"") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no relay response within 2s (buf=%q)", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Nothing may have been prompted while the run was in flight.
+	out := buf.String()
+	if strings.Contains(out, "\"type\": \"prompt\"") {
+		t.Error("heartbeat prompted pi mid-run; must be deferred")
+	}
+
+	// The run settles: the queue flushes into a prompt.
+	b.setStreaming(false)
+	b.flushPendingHeartbeats()
+	out = buf.String()
+	if !strings.Contains(out, "process \\\"install\\\" has been running for 721 seconds now") {
+		t.Errorf("queued heartbeat not flushed after settle (buf=%q)", out)
+	}
+	if !strings.Contains(out, "(no output yet)") {
+		t.Errorf("empty-tail heartbeat should say so (buf=%q)", out)
+	}
+}
+
+// TestFormatHeartbeat pins the multi-process batch form: several overdue
+// processes become ONE alarm with a section per process, so the agent is
+// woken once rather than once per process.
+func TestFormatHeartbeat(t *testing.T) {
+	b := bgBridge()
+	got := b.formatHeartbeat([]HeartbeatProcess{
+		{Name: "build", ElapsedSecs: 600, Tail: "one"},
+		{Name: "test", ElapsedSecs: 1, Tail: ""},
+	})
+	if !strings.Contains(got, "2 background processes have been running") {
+		t.Errorf("batch headline missing (got=%q)", got)
+	}
+	if !strings.Contains(got, "build — 600 seconds") || !strings.Contains(got, "test — 1 second") {
+		t.Errorf("per-process lines missing/plural wrong (got=%q)", got)
+	}
+	if !strings.Contains(got, "no output yet") {
+		t.Errorf("empty-tail placeholder missing (got=%q)", got)
+	}
+
+	// Empty input renders no alarm at all (callers guard on len>0 anyway).
+	if empty := b.formatHeartbeat(nil); empty != "" {
+		t.Errorf("formatHeartbeat(nil) = %q, want empty", empty)
+	}
+}
+func TestIsCreditError(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		// The real OpenRouter 402 body Zach pasted.
+		{`402: {"message":"This request requires more credits, or fewer max_tokens. You requested up to 384000 tokens, but can only afford 99218."}`, true},
+		{"This request requires more credits, or fewer max_tokens.", true},
+		{"402 insufficient balance", true},
+		{"you are out of credits", true},
+		{"Request timed out.", false},
+		{"529 overloaded_error: Overloaded", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isCreditError(c.in); got != c.want {
+			t.Errorf("isCreditError(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestLowCreditText(t *testing.T) {
+	if got := lowCreditText(3.5, 5); got != "⚠️ OpenRouter credit: $3.50 remaining — below your $5.00 floor, reload soon" {
+		t.Errorf("lowCreditText = %q", got)
+	}
+}
+
+func TestShortError(t *testing.T) {
+	if got := shortError("  a\n\nb  "); got != "a b" {
+		t.Errorf("shortError collapsed = %q, want 'a b'", got)
+	}
+	long := strings.Repeat("x", 300)
+	if got := shortError(long); len([]rune(got)) != 158 { // 157 + ellipsis
+		t.Errorf("shortError(long) len = %d, want 158", len([]rune(got)))
+	}
+}
+
+// A message_end carrying an errored assistant message with the OpenRouter 402
+// body must DM the owner (marked replied) instead of falling through to the
+// "done (no reply)" nudge.
+func TestCreditFailAlertOnMessageEnd(t *testing.T) {
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	b.acct.MinCreditUsd = 2
+	b.setReplied(false)
+
+	ev := Event{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":         "assistant",
+			"content":      []any{},
+			"stopReason":   "error",
+			"errorMessage": `402: {"message":"This request requires more credits, or fewer max_tokens."}`,
+		},
+	}
+	b.handleRPCEvent(ev)
+	if !b.replied() {
+		t.Error("credit-failed run should be marked replied so the no-reply nudge is suppressed")
+	}
+}
+
+// Non-credit run failures (timeout, overloaded) keep the existing behavior:
+// not marked replied, so the agent_settled nudge still applies.
+func TestNonCreditErrorUnchanged(t *testing.T) {
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	b.setReplied(false)
+
+	ev := Event{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":         "assistant",
+			"content":      []any{},
+			"stopReason":   "error",
+			"errorMessage": "Request timed out.",
+		},
+	}
+	b.handleRPCEvent(ev)
+	if b.replied() {
+		t.Error("non-credit error must not mark the run replied; the no-reply nudge should still apply")
+	}
+}
+
+func TestRPCEnv(t *testing.T) {
+	plain := rpcEnv(ResolvedAccount{})
+	if len(plain) != 1 || plain[0] != "PI_MSG_TOOLS=file,reaction" {
+		t.Errorf("rpcEnv(unset) = %v, want [PI_MSG_TOOLS=file,reaction]", plain)
+	}
+	withText := rpcEnv(ResolvedAccount{BeforeAgentStartText: "be brief"})
+	if len(withText) != 2 || withText[1] != "PI_MSG_BEFORE_AGENT_START_TEXT=be brief" {
+		t.Errorf("rpcEnv(text) = %v, want PI_MSG_TOOLS + PI_MSG_BEFORE_AGENT_START_TEXT", withText)
+	}
+}
+
+// A control command produces no prompt, so it must set its own reply/file
+// destination rather than inheriting the previous turn's. Before this, a
+// /export or /dump typed in the owner's 1:1 uploaded the session file to
+// whichever room the agent last spoke in (zpm/beltino#56, pi-msg#113).
+func TestCommandReplyUsesItsOwnOrigin(t *testing.T) {
+	b := roomBridge()
+	b.rpc = &RPCClient{} // fire-and-forget writes fail harmlessly ("pi not running")
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	// The agent's last turn was in the room...
+	b.setTurnDest("team@muc.x.com", true)
+
+	// ...then an owner command arrives in the 1:1. The destination must move to
+	// the owner, not stay in the room.
+	b.handleCanonical("/interrupt", "", b.acct.Owner, "", "", "", "", nil)
+	if got := b.currentTurnDest(); got != b.acct.Owner {
+		t.Errorf("1:1 command turnDest = %q, want owner %q", got, b.acct.Owner)
+	}
+	if b.peerTriggered() {
+		t.Error("an owner command must not be marked as a peer-triggered run")
+	}
+
+	// And the reverse: a command typed in a room replies in that room.
+	b.setTurnDest(b.acct.Owner, false)
+	b.handleCanonical("/interrupt", "zach", "team@muc.x.com", "", "", "", "", nil)
+	if got := b.currentTurnDest(); got != "team@muc.x.com" {
+		t.Errorf("room command turnDest = %q, want room", got)
+	}
+}
+
+// /export and /dump relay through sendDumpFile, which must always upload to the
+// owner: a session HTML/JSONL dump can contain 1:1 content, so it must never
+// land in a MUC even when the command was typed in a room (owner decision on
+// zpm/beltino#56). Regression guard for the stale-room-destination bug: the
+// turn destination here is the room.
+func TestDumpUploadForcesOwnerOverRoom(t *testing.T) {
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	b.setTurnDest("team@muc.x.com", false)
+
+	got := make(chan string, 1)
+	orig := uploadDumpFile
+	uploadDumpFile = func(_ *XMPPBridge, to, _ string) (string, error) {
+		got <- to
+		return "https://upload.example/f", nil
+	}
+	defer func() { uploadDumpFile = orig }()
+
+	b.sendDumpFile("session.jsonl", []byte("{}"))
+
+	select {
+	case dest := <-got:
+		if dest != b.acct.Owner {
+			t.Errorf("dump upload dest = %q, want owner %q (never a room)", dest, b.acct.Owner)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendDumpFile did not attempt an upload")
 	}
 }

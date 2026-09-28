@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -15,8 +16,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"mellium.im/sasl"
@@ -34,6 +37,28 @@ import (
 // stanzas.
 const maxBody = 50000
 
+// Restart-gap inbound replay: messages the server replayed (offline storage /
+// MUC history) that carry a delay stamp inside the swap window are buffered and
+// handed to the resumed session instead of being dropped as stale backfill.
+const (
+	// replayGracePeriod is how long after (re)connect the bridge accepts
+	// server-replayed (delayed) messages as belonging to the restart gap. The
+	// offline/MUC backlog lands within a moment of connect; this lets it all
+	// arrive while keeping the window tight.
+	replayGracePeriod = 3 * time.Second
+	// replaySlack tolerates clock skew when matching a message's delay stamp to
+	// the swap window.
+	replaySlack = 2 * time.Second
+	// directDelayFreshness is how old a delayed owner DM may be and still be
+	// delivered live. A client's own stream resumption can attach XEP-0203 delay
+	// metadata without reconnecting this bridge, so it cannot rely on the
+	// restart/reconnect replay paths to recover a recent message.
+	directDelayFreshness = 5 * time.Minute
+	// directDelayFutureSlack tolerates modest client clock skew without treating
+	// arbitrarily future-dated stanzas as fresh.
+	directDelayFutureSlack = time.Minute
+)
+
 const chatStatesNS = "http://jabber.org/protocol/chatstates"
 
 // Receipt namespaces: XEP-0184 message delivery receipts and XEP-0333 chat
@@ -46,6 +71,74 @@ const (
 // reactionsNS is XEP-0444 message reactions: the agent reacts to an owner
 // message with emoji (e.g. 👀 picked up, ✅ done, ⛔ aborted).
 const reactionsNS = "urn:xmpp:reactions:0"
+
+// replyNS is XEP-0461 Message Replies. An outbound message stamped with this
+// element names the message it answers, so a client threads it under that
+// message instead of showing it as a fresh line.
+//
+// Note the history. An earlier attempt (PRs #50/#51, reverted in #52) emitted
+// this namespace with a `to` attribute that held the *stanza id*, and no `id`
+// attribute at all, and called it XEP-0359. XEP-0461 wants `to` = the author of
+// the answered message, and `id` = that message's stanza id. Both attributes
+// are mandatory. One of them alone threads nowhere.
+const replyNS = "urn:xmpp:reply:0"
+
+// discoInfoNS is XEP-0030 service discovery: the bridge answers disco#info
+// queries so contacts can resolve its XEP-0115 capabilities hash.
+const discoInfoNS = "http://jabber.org/protocol/disco#info"
+
+// idleNS is XEP-0319 user idle time: the bridge advertises when the agent
+// last interacted in every presence stanza.
+const idleNS = "urn:xmpp:idle:1"
+
+// capsNS is XEP-0115 entity capabilities: a presence child that lets contacts
+// cache the agent's feature set instead of probing disco#info every time.
+const capsNS = "http://jabber.org/protocol/caps"
+
+// XEP-0115 entity capabilities payload. capsNode identifies the pi-msg client
+// and capsIdentity is the disco identity hashed into the verification string
+// (category/type/lang/name with '/' separators; lang is empty here). Both are
+// stable per build — bump capsVer by editing either.
+const (
+	capsNode     = "http://pi-msg"
+	capsIdentity = "client/bot//pi-msg"
+)
+
+// discoFeatures is exactly what the bridge implements, for both the disco#info
+// reply and the XEP-0115 caps hash — keep in sync with the codebase.
+var discoFeatures = []string{
+	"http://jabber.org/protocol/caps",
+	"http://jabber.org/protocol/chatstates",
+	discoInfoNS,
+	"http://jabber.org/protocol/muc",
+	"urn:xmpp:chat-markers:0",
+	"urn:xmpp:http:upload:0",
+	idleNS,
+	"urn:xmpp:ping",
+	"urn:xmpp:reactions:0",
+	"urn:xmpp:receipts",
+	replyNS,
+	"vcard-temp",
+	"vcard-temp:x:update",
+}
+
+// capsVer is the XEP-0115 verification string pi-msg announces in presence.
+var capsVer = capsVerFor(capsIdentity, discoFeatures)
+
+// capsVerFor implements the XEP-0115 §5.2 algorithm: SHA-1 over the identity
+// string (category/type/lang/name joined with '/', then '<') followed by the
+// alphabetically sorted feature vars, each terminated by '<', base64-encoded.
+// Cross-checked against the spec's golden test vector in xmpp_test.go.
+func capsVerFor(identity string, features []string) string {
+	h := sha1.New()
+	io.WriteString(h, identity+"<")
+	feats := append([]string(nil), features...)
+	sort.Strings(feats)
+	for _, f := range feats {
+		io.WriteString(h, f+"<")
+	}
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
 
 // newStanzaID generates a random stanza id.
 func newStanzaID() string {
@@ -70,34 +163,127 @@ func resourcepart(full string) string {
 	return ""
 }
 
-// chunk splits text into pieces no longer than max, preferring newline then
-// word boundaries.
+// isFenceLine reports whether a line opens or closes a markdown ``` code
+// fence (e.g. "```" or "```go"). Used so chunking never splices a fence.
+func isFenceLine(s string) bool {
+	t := strings.TrimRight(s, " \t")
+	return strings.HasPrefix(t, "```")
+}
+
+// chunk splits text into pieces no longer than max, preferring line then
+// word boundaries. It is code-fence-aware: a chunk boundary never falls
+// *inside* a ``` fenced block. If the cap is hit while inside a fence, the
+// fence is closed at the end of one piece and reopened at the start of the
+// next, so every piece is self-contained valid markdown (no mangled fences
+// when a client renders one message at a time).
 func chunk(text string, max int) []string {
 	if len(text) <= max {
 		return []string{text}
 	}
+	lines := strings.Split(text, "\n")
 	var chunks []string
+	var buf []string
+	bytes := 0
+	inFence := false
+	// Reserve room for the fence close/reopen lines a cut may inject, so no
+	// emitted piece exceeds max.
+	const fenceReserve = 64
+	// nextOpens: the previous piece had to close an open fence; the next piece
+	// must begin by reopening it.
+	nextOpens := false
+
+	emit := func() {
+		if len(buf) == 0 {
+			if nextOpens {
+				nextOpens = false
+			}
+			return
+		}
+		if inFence {
+			buf = append(buf, "```") // terminate so this piece is well-formed
+		}
+		chunks = append(chunks, strings.Join(buf, "\n"))
+		buf = nil
+		bytes = 0
+		nextOpens = inFence
+		inFence = false
+	}
+
+	for _, line := range lines {
+		isFence := isFenceLine(line)
+		need := len(line) + 1
+
+		// Reopen a fence that a prior cut closed mid-block, unless this next
+		// line is itself a source fence (which then serves as the opener).
+		if nextOpens && !isFence {
+			buf = append(buf, "```")
+			bytes += 4
+			nextOpens = false
+			inFence = true
+		}
+
+		// A single prose line larger than the cap has no newline to cut on, so
+		// fall back to word-boundary splitting. Not inside a fence here (a
+		// fence line or fenced content is handled below and can only be split
+		// at fence boundaries).
+		if len(line) > max && !inFence && !isFence && !nextOpens {
+			emit()
+			for _, w := range chunkWords(line, max) {
+				chunks = append(chunks, w)
+			}
+			continue
+		}
+
+		// Otherwise, if the next line would overflow and we're outside a fence,
+		// cut cleanly between logical blocks before taking it.
+		if bytes+need > max-fenceReserve && len(buf) > 0 && !inFence && !nextOpens {
+			emit()
+		}
+
+		// Track fence state from this line.
+		if isFence {
+			inFence = !inFence
+		}
+
+		buf = append(buf, line)
+		bytes += need
+
+		// A single line can still push us over the cap while inside a fence
+		// (e.g. one giant code line). Close the fence here to keep the piece
+		// well-formed; the next piece reopens it.
+		if bytes > max-fenceReserve && inFence {
+			emit()
+		}
+	}
+	emit()
+	return chunks
+}
+
+// chunkWords splits a string with no usable newlines into pieces no longer
+// than max, preferring spaces then hard cuts (the historical prose fallback).
+func chunkWords(text string, max int) []string {
+	if len(text) <= max {
+		return []string{text}
+	}
+	var out []string
 	rest := text
 	for len(rest) > max {
-		cut := strings.LastIndexByte(rest[:max], '\n')
-		if cut < max/2 {
-			cut = strings.LastIndexByte(rest[:max], ' ')
-		}
+		cut := strings.LastIndexByte(rest[:max], ' ')
 		if cut < max/2 {
 			cut = max
 		}
-		chunks = append(chunks, rest[:cut])
+		out = append(out, rest[:cut])
 		rest = strings.TrimLeft(rest[cut:], " \t\r\n")
 	}
 	if rest != "" {
-		chunks = append(chunks, rest)
+		out = append(out, rest)
 	}
-	return chunks
+	return out
 }
 
 // InboundMessage is a received message the bridge should act on, after
 // transport-level guards. In 1:1 mode it is always the owner. In room mode it
-// may be any occupant; classification (canonical/commentary/ambient) is left
+// may be any occupant; classification (canonical/commentary/not-ours) is left
 // to the bridge.
 type InboundMessage struct {
 	Body      string // message text
@@ -107,7 +293,43 @@ type InboundMessage struct {
 	Direct    bool   // arrived as a 1:1 chat, not groupchat (reply goes back 1:1)
 	Room      string // source room bare JID (room mode); "" for 1:1
 	ID        string // stanza id (used as the XEP-0444 reaction target)
-	From      string // full from-JID, so a reaction routes back to that resource
+	// ArchiveID is the XEP-0313 MAM result id: the id the server archived the
+	// stanza under, which is what RSM <before>/<after> cursors address. It is NOT
+	// the message's own id — measured live 2026-09-28 in testing-2: the archive id
+	// is a numeric string (`1790591200546400`) while the message id is a hex token
+	// (`23d0a58749d0e711`) that also appears as the prompt's `stanza-id:`. A
+	// cursor built from the message id is an archive id the server does not know,
+	// so it pages to nothing.
+	ArchiveID string
+	// Own marks an archived line this account sent itself. A read reports the
+	// room as it happened, so our own lines appear too — marked, because the
+	// reader is the sender and must not read its own words as a peer's.
+	Own  bool
+	From string // full from-JID, so a reaction routes back to that resource
+	// Stamp is the message's own timestamp (XEP-0203 delay, or the archive
+	// stamp for a MAM backfill). Zero for a live message, which has no stamp of
+	// its own. Used to order the restart-replay buffer, where delay-pushed and
+	// MAM-fetched copies of the same period can interleave.
+	Stamp time.Time
+
+	// Reactions is a non-nil emoji set when this is an inbound XEP-0444 reaction
+	// (no body). ReactionID is the stanza id of the message being reacted to.
+	Reactions  []string
+	ReactionID string
+
+	// ReplyToID / ReplyToJID carry a XEP-0461 <reply/> stamp: the stanza id of the
+	// message this one answers, and the JID it was stamped to. Rendered into the
+	// prompt as an `in-reply-to:` header so the agent can tell what is being
+	// referred to (issue #95).
+	ReplyToID  string
+	ReplyToJID string
+
+	// Addressed records that this message already passed the room-address check,
+	// set when it was received live and carried on a re-delivered inbox entry. An
+	// anchored reply to one of our own stanzas is only provably ours while the
+	// in-process stanza history holds that id, and a restart empties it — so the
+	// verdict travels with the message instead of being re-derived (#106 review).
+	Addressed bool
 }
 
 // XMPPBridge owns a single account's XMPP connection: it maintains a
@@ -126,6 +348,20 @@ type XMPPBridge struct {
 	online   bool
 	show     string // presence <show>: "" (available) or "dnd"/"away"/… (availability axis)
 	presence string // presence <status> free text (activity axis)
+	// idleSince is the XEP-0319 timestamp of the agent's last interaction,
+	// stamped by the bridge (SetIdleSince); zero means currently active. It is
+	// attached to every presence announcement until it changes.
+	idleSince time.Time
+
+	// lastKick debounces forced reconnects (issue #31): a wedged socket makes
+	// every write fail at once, so we Close the session at most once per second
+	// instead of once per failing write.
+	lastKick time.Time
+
+	// startStatus is the presence <status> announced on (re)connect, before any
+	// activity occurs. The bridge sets it to distinguish a fresh start ("awake")
+	// from a resumed continuation ("resumed"); it falls back to "awake".
+	startStatus string
 
 	seen      map[string]struct{}
 	seenOrder []string
@@ -137,16 +373,37 @@ type XMPPBridge struct {
 	uploadMu  sync.Mutex
 	uploadSvc string // resolved XEP-0363 upload component JID (cached)
 
+	// omemo is non-nil only when the account has legacy OMEMO enabled.
+	omemo *omemoManager
+
 	// XEP-0153 vCard avatar, loaded once from acct.Avatar. Empty when no avatar
 	// is configured or the file couldn't be read.
 	avatarType string // image MIME type, e.g. "image/png"
 	avatarB64  string // base64 of the raw image bytes (vCard <BINVAL>)
 	avatarHash string // lowercase hex SHA-1 of the raw bytes (presence photo hash)
 
-	// omemo is the OMEMO (XEP-0384) manager, non-nil only when the account has
-	// omemo enabled and the key store loaded. When set, 1:1 messages with the
-	// owner are end-to-end encrypted.
-	omemo *omemoManager
+	// msgHistory maps stanza IDs to their source JID (inbound and outbound) so
+	// send_reaction can target arbitrary messages by ID. Capped at 500 entries;
+	// oldest is evicted when full.
+	msgHistory map[string]msgHistoryEntry
+
+	// mamPending holds the in-flight XEP-0313 backfill collectors, keyed by MAM
+	// query id. The read loop appends archived messages; FetchMAM drains them
+	// once the terminating IQ result arrives.
+	mamMu      sync.Mutex
+	mamPending map[string]*mamCollector
+
+	// Restart-gap replay state. replayStart is the swap-window start (when the
+	// account went offline); replayArmed is set once at startup when a window
+	// marker exists; on the first successful connect the window is "lit" and
+	// delayed messages stamped within it are buffered into replayBuf until
+	// replayGraceEnd. DrainReplay hands the buffer to the resumed session.
+	replayStart    time.Time
+	replayArmed    bool
+	replayLit      bool // replay window armed on the first connect only
+	replayActive   bool // currently collecting swap-window messages
+	replayGraceEnd time.Time
+	replayBuf      []InboundMessage
 }
 
 // NewXMPPBridge constructs a bridge. onMsg is called for each message that
@@ -157,15 +414,18 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		roomBares[bareJid(room)] = true
 	}
 	b := &XMPPBridge{
-		acct:      acct,
-		ownerBare: bareJid(acct.Owner),
-		roomBares: roomBares,
-		onMsg:     onMsg,
-		logf:      logf,
-		presence:  "listening",
-		seen:      make(map[string]struct{}),
-		occupants: make(map[string]map[string]string),
-		selfNick:  make(map[string]string),
+		acct:        acct,
+		ownerBare:   bareJid(acct.Owner),
+		roomBares:   roomBares,
+		onMsg:       onMsg,
+		logf:        logf,
+		presence:    "awake",
+		startStatus: "awake",
+		seen:        make(map[string]struct{}),
+		occupants:   make(map[string]map[string]string),
+		selfNick:    make(map[string]string),
+		msgHistory:  make(map[string]msgHistoryEntry),
+		mamPending:  make(map[string]*mamCollector),
 	}
 	b.loadAvatar()
 	if acct.OMEMO {
@@ -249,6 +509,11 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	b.mu.Lock()
 	b.session = session
 	b.online = true
+	// Re-assert the startup status on every (re)connect so the roster shows the
+	// correct label (fresh start "awake" vs resumed "resumed") rather than a
+	// stale idle label from a previous session.
+	b.show = ""
+	b.presence = b.startStatus
 	show, status := b.show, b.presence
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
 	b.occupants = make(map[string]map[string]string)
@@ -268,9 +533,38 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 		}
 		b.log("info", fmt.Sprintf("joined room %s as %s", room, b.acct.Nick))
 	}
+	// The error room is joined at the XMPP layer (so groupchat sends are
+	// accepted and keepalive covers it) but it is deliberately NOT added to
+	// roomBares, so it stays invisible to the agent: no dispatch, no occupants,
+	// no allowlist. Write-only by construction.
+	if b.acct.ErrorRoom != "" {
+		if err := b.joinRoom(b.acct.ErrorRoom); err != nil {
+			b.setOffline()
+			return fmt.Errorf("join error room %s: %w", b.acct.ErrorRoom, err)
+		}
+		b.log("info", fmt.Sprintf("joined write-only error room %s as %s", b.acct.ErrorRoom, b.acct.Nick))
+	}
 	b.log("info", fmt.Sprintf("online as %s, relaying to %s", b.acct.JID, b.ownerBare))
+	// Open the restart-gap replay window on this (the first) connection. The
+	// offline/MUC backlog is delivered right after presence/join, so any delayed
+	// message stamped within the swap window gets buffered until the grace
+	// window closes.
+	b.mu.Lock()
+	if b.replayArmed && !b.replayLit {
+		b.replayLit = true
+		b.replayActive = true
+		b.replayGraceEnd = time.Now().Add(replayGracePeriod)
+	}
+	b.mu.Unlock()
 	if onConnected != nil {
 		onConnected()
+	}
+	if b.omemo != nil {
+		go func() {
+			bootCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			b.omemo.bootstrap(bootCtx, session)
+		}()
 	}
 
 	// Keepalive: XEP-0199 server pings (and XEP-0410 MUC self-pings) surface a
@@ -293,17 +587,6 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 		}()
 	}
 
-	// Publish the OMEMO bundle + devicelist once the read loop is up to route
-	// the PEP IQ results, so the owner's clients can discover this device and
-	// establish sessions.
-	if b.omemo != nil {
-		go func() {
-			bootCtx, cancel := context.WithTimeout(keepaliveCtx, 30*time.Second)
-			defer cancel()
-			b.omemo.bootstrap(bootCtx, session)
-		}()
-	}
-
 	serveErr := session.Serve(xmpp.HandlerFunc(b.handle))
 	b.setOffline()
 	if ctx.Err() != nil {
@@ -322,8 +605,130 @@ func (b *XMPPBridge) setOffline() {
 	b.mu.Unlock()
 }
 
+// SetReplayWindow arms inbound replay for the restart gap. Call before Run;
+// start is the swap-window start (the time the account went offline). Returns
+// true when a window was armed.
+func (b *XMPPBridge) SetReplayWindow(start time.Time) bool {
+	if start.IsZero() {
+		return false
+	}
+	b.mu.Lock()
+	b.replayStart = start
+	b.replayArmed = true
+	b.mu.Unlock()
+	return true
+}
+
+// swapWindowActive reports whether the replay window is currently open (armed,
+// lit on the first connect, and still inside its grace period).
+func (b *XMPPBridge) swapWindowActive() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.replayActive && time.Now().Before(b.replayGraceEnd)
+}
+
+// inSwapWindow reports whether a delayed message's stamp falls within the swap
+// window (allowing clock skew).
+func (b *XMPPBridge) inSwapWindow(stamp time.Time) bool {
+	if stamp.IsZero() {
+		return false
+	}
+	b.mu.Lock()
+	start := b.replayStart
+	b.mu.Unlock()
+	return !stamp.Add(replaySlack).Before(start)
+}
+
+// recentDirectDelay reports whether a delayed owner DM is recent enough to
+// accept outside the restart replay window. The bounded future allowance
+// handles client clock skew while rejecting missing or implausibly future stamps.
+func recentDirectDelay(stamp, now time.Time) bool {
+	if stamp.IsZero() {
+		return false
+	}
+	return !stamp.Before(now.Add(-directDelayFreshness)) && !stamp.After(now.Add(directDelayFutureSlack))
+}
+
+// bufferReplay appends a swap-window (or MAM-backfilled) message to the
+// restart replay buffer. Duplicate stanza ids are dropped: the same message can
+// arrive twice — once as a server-pushed delayed stanza and once from the MAM
+// archive — and replaying it twice would double-count it in the catch-up
+// banner and re-surface it to the agent.
+func (b *XMPPBridge) bufferReplay(m InboundMessage) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if m.ID != "" {
+		for _, e := range b.replayBuf {
+			if e.ID == m.ID {
+				return
+			}
+		}
+	}
+	b.replayBuf = append(b.replayBuf, m)
+}
+
+// DrainReplay blocks until the replay-window grace period has elapsed after the
+// first connection, then returns (and clears) the buffered swap-window messages.
+// It returns nil immediately if no window was armed, and nil on ctx cancel.
+func (b *XMPPBridge) DrainReplay(ctx context.Context) []InboundMessage {
+	b.mu.Lock()
+	active, end := b.replayActive, b.replayGraceEnd
+	b.mu.Unlock()
+	if !active {
+		return nil
+	}
+	if d := time.Until(end); d > 0 {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(d):
+		}
+	}
+	b.mu.Lock()
+	buf := b.replayBuf
+	b.replayBuf = nil
+	b.replayActive = false
+	b.mu.Unlock()
+	// Delay-pushed stanzas and MAM-fetched ones can interleave in arrival order;
+	// order by each message's own stamp so the catch-up reads chronologically.
+	// Live-buffered entries (zero stamp) keep their relative order at the end.
+	sort.SliceStable(buf, func(i, j int) bool {
+		a, c := buf[i].Stamp, buf[j].Stamp
+		switch {
+		case a.IsZero():
+			return false
+		case c.IsZero():
+			return true
+		default:
+			return a.Before(c)
+		}
+	})
+	return buf
+}
+
+// markOutbound updates the persistent last-outbound floor so an ungraceful
+// crash can still bound its replay window. Called whenever a chat message is
+// actually sent.
+func (b *XMPPBridge) markOutbound() {
+	markLastOut(b.logf, b.acct.Name, time.Now())
+}
+
 // pingTimeout bounds each keepalive ping's round trip.
 const pingTimeout = 15 * time.Second
+
+// TCP keepalive cadence for the bridge's connection. Go enables keepalive on
+// dialed TCP sockets, but with a period measured in minutes; a black-holed
+// path should be declared dead in about a minute so the read loop unwinds and
+// Run() re-dials on its own (issue #90).
+const (
+	tcpKeepAliveIdle     = 30 * time.Second
+	tcpKeepAliveInterval = 10 * time.Second
+	tcpKeepAliveCount    = 3
+)
+
+// keepaliveNagInterval throttles the "still failing" log while a connection is
+// wedged: the first failure is logged immediately, then at most this often.
+const keepaliveNagInterval = 5 * time.Minute
 
 // keepalive periodically pings the server (XEP-0199) to detect a
 // silently-dropped connection, and in room mode self-pings each joined room
@@ -342,6 +747,7 @@ func (b *XMPPBridge) keepalive(ctx context.Context, session *xmpp.Session) {
 	}
 	ticker := time.NewTicker(b.acct.PingInterval)
 	defer ticker.Stop()
+	var wedged keepaliveWedge
 	for {
 		select {
 		case <-ctx.Done():
@@ -349,16 +755,103 @@ func (b *XMPPBridge) keepalive(ctx context.Context, session *xmpp.Session) {
 		case <-ticker.C:
 		}
 		if err := b.pingOnce(ctx, session, server); err != nil {
-			b.log("warning", "keepalive ping failed; forcing reconnect: "+err.Error())
-			// Closing unblocks session.Serve, so serve() returns and Run
-			// reconnects. serve()'s deferred Close makes the double-close a
-			// harmless no-op.
-			session.Close()
-			return
+			// Keep ticking after a failed ping (issue #90): a recovery that
+			// silently does nothing must be retried, not abandoned. This
+			// goroutine lives only as long as the connection does, so it
+			// stops when serve() returns and a fresh keepalive starts for
+			// the new session.
+			wedged.failure(b, time.Now(), err, func() { closeSession(b, session) })
+			continue
 		}
+		wedged.recovered()
 		for _, room := range b.acct.Rooms {
 			b.selfPing(ctx, session, room)
 		}
+		if errRoom := b.acct.ErrorRoom; errRoom != "" {
+			b.selfPing(ctx, session, errRoom)
+		}
+	}
+}
+
+// keepaliveWedge tracks one connection's wedge state so a keepalive that keeps
+// failing keeps forcing a reconnect without spamming the log.
+type keepaliveWedge struct {
+	since   time.Time // first failure of the current wedge; zero when healthy
+	lastNag time.Time // when the "still failing" line was last logged
+}
+
+// failure records one failed keepalive tick and forces a reconnect. It fires
+// forceClose on EVERY failure, not just the first: the connection is only
+// repaired once the read loop unwinds and Run() re-dials, and a close that did
+// not achieve that must not be the end of the story (issue #90).
+func (w *keepaliveWedge) failure(b *XMPPBridge, now time.Time, err error, forceClose func()) {
+	switch {
+	case w.since.IsZero():
+		w.since, w.lastNag = now, now
+		b.log("warning", "keepalive ping failed; forcing reconnect: "+err.Error())
+	case now.Sub(w.lastNag) >= keepaliveNagInterval:
+		w.lastNag = now
+		b.log("warning", fmt.Sprintf(
+			"keepalive ping still failing after %s; forcing reconnect again: %v",
+			now.Sub(w.since).Round(time.Second), err))
+	}
+	forceClose()
+}
+
+// recovered clears the wedge state after a successful ping.
+func (w *keepaliveWedge) recovered() {
+	w.since = time.Time{}
+	w.lastNag = time.Time{}
+}
+
+// sessionCloseTimeout bounds how long hardClose waits for the graceful close
+// (and, afterwards, for it to finish once the transport is gone). It is a var
+// so tests can shrink it.
+var sessionCloseTimeout = 5 * time.Second
+
+// closeSession closes session, severing the underlying connection so the read
+// loop is guaranteed to unwind and Run() re-dials.
+func closeSession(b *XMPPBridge, session *xmpp.Session) {
+	hardClose(b, session.Conn(), func() { _ = session.Close() })
+}
+
+// hardClose runs graceful, then closes the transport unconditionally.
+//
+// The unconditional close is the point: session.Close() is XMPP-level
+// bookkeeping (it sends the stream close and tears down session state) and does
+// NOT guarantee that session.Serve() has returned. When only the write half of
+// a connection is broken -- the peer keeps sending us stanzas but stops
+// acknowledging ours -- the graceful close returns promptly while Serve() keeps
+// reading happily, so serve() never returns, Run() never re-dials, and every
+// later write times out on a socket nobody will replace (issue #90). Closing
+// the raw connection makes the pending read fail, which is what unwinds the
+// loop.
+func hardClose(b *XMPPBridge, conn net.Conn, graceful func()) {
+	done := make(chan struct{})
+	go func() {
+		graceful()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(sessionCloseTimeout):
+		b.log("warning", "session.Close() did not return in time; forcing connection closed")
+	}
+
+	if conn != nil {
+		// Also bound a blocked read in case the peer is silent rather than
+		// loud: Close covers both, and is a no-op if already closed.
+		_ = conn.Close()
+	}
+
+	// Never wait unbounded for the graceful close to notice: a close that is
+	// still blocked after the transport is gone cannot be helped, and the
+	// caller (keepalive or kick) must not be parked on it.
+	select {
+	case <-done:
+	case <-time.After(sessionCloseTimeout):
+		b.log("warning", "session.Close() still blocked after the connection was closed")
 	}
 }
 
@@ -388,6 +881,56 @@ func (b *XMPPBridge) selfPing(ctx context.Context, session *xmpp.Session, room s
 	}
 }
 
+// encode writes v to the XMPP session, and on a transport-level failure forces
+// a reconnection of the whole bridge (issue #31). mellium's session.Encode
+// reports timeouts/broken-connection errors when the underlying TCP socket is
+// wedged (writes timing out while the read loop stays open), and without this
+// the reconnect loop in Run() never fires because serve() only returns when the
+// read side errors. Kicking the session unblocks session.Serve -> serve()
+// returns -> Run re-dials with exponential backoff.
+func (b *XMPPBridge) encode(ctx context.Context, session *xmpp.Session, v any) error {
+	err := session.Encode(ctx, v)
+	if isTransportError(err) {
+		b.kick()
+	}
+	return err
+}
+
+// kick force-closes the active session so the serve() read loop returns and
+// Run() reconnects. It is debounced so a burst of wedged-socket writes (all
+// failing at once) triggers a single reconnect rather than a Close storm; the
+// deferred Close in serve() makes any double-close a harmless no-op.
+func (b *XMPPBridge) kick() {
+	b.mu.Lock()
+	if !b.online || time.Since(b.lastKick) < time.Second {
+		b.mu.Unlock()
+		return
+	}
+	b.lastKick = time.Now()
+	session := b.session
+	b.mu.Unlock()
+	// closeSession blocks (bounded) on a wedged socket; do it after releasing
+	// mu so other bridge operations aren't stuck behind a slow close too.
+	if session != nil {
+		closeSession(b, session)
+	}
+}
+
+// isTransportError reports whether err indicates a broken/wedged transport
+// (write i/o timeout, connection reset, broken pipe, etc.) rather than a benign
+// per-stanza error such as "not online" or an invalid recipient. These are the
+// errors that should force a reconnect.
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 // connect dials and negotiates a client session for the account.
 func (b *XMPPBridge) connect(ctx context.Context) (*xmpp.Session, error) {
 	addr := b.acct.JID
@@ -407,6 +950,21 @@ func (b *XMPPBridge) connect(ctx context.Context) (*xmpp.Session, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	var d net.Dialer
+	// Keep both halves of the connection's failure modes bounded, so a stalled
+	// peer surfaces as an error the bridge can act on rather than as writes
+	// that hang for the kernel's full retransmission budget (issue #90):
+	// TCP_USER_TIMEOUT caps how long unacknowledged data is retransmitted
+	// before the write fails, and a short TCP keepalive declares a black-holed
+	// path dead in both directions within ~a minute.
+	d.Control = func(network, address string, c syscall.RawConn) error {
+		return hardenTCP(c)
+	}
+	d.KeepAliveConfig = net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     tcpKeepAliveIdle,
+		Interval: tcpKeepAliveInterval,
+		Count:    tcpKeepAliveCount,
+	}
 	conn, err := d.DialContext(dialCtx, "tcp", target)
 	if err != nil {
 		return nil, fmt.Errorf("dialing %s: %w", target, err)
@@ -434,9 +992,14 @@ type incomingMsg struct {
 	typ         string
 	body        string
 	id          string
-	delay       bool // carried an XEP-0203 <delay/> (server-replayed history)
-	wantReceipt bool // carried a XEP-0184 <request/> (delivery receipt)
-	markable    bool // carried a XEP-0333 <markable/> (chat marker)
+	delay       bool      // carried a XEP-0203 <delay/> (server-replayed history)
+	delayStamp  time.Time // the <delay stamp> attr, zero if absent/unparsable
+	wantReceipt bool      // carried a XEP-0184 <request/> (delivery receipt)
+	markable    bool      // carried a XEP-0333 <markable/> (chat marker)
+	reactions   []string  // XEP-0444 reactions: the emoji set, if this is a reaction
+	reactionFor string    // XEP-0444 reactions id: stanza id of the message being reacted to
+	replyToID   string    // XEP-0461 <reply id>: stanza id of the message this one answers
+	replyToJID  string    // XEP-0461 <reply to>: author of the message this one answers
 }
 
 // handle is the mellium read-loop callback for one inbound stanza.
@@ -453,13 +1016,6 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 			id:   attr(start.Attr, "id"),
 			body: childText(toks, "body"),
 		}
-		_, m.delay = element(toks, "urn:xmpp:delay", "delay")
-		_, m.wantReceipt = element(toks, receiptsNS, "request")
-		_, m.markable = element(toks, chatMarkersNS, "markable")
-		// OMEMO: a 1:1 <encrypted> message from the owner is decrypted in place,
-		// replacing the fallback body with plaintext, before the dispatch guards
-		// run. Encrypted stanzas from anyone else (or in a room) are ignored to
-		// avoid spending one-time prekeys on unsolicited sessions.
 		if b.omemo != nil && m.typ != "groupchat" && bareJid(m.from) == b.ownerBare {
 			if enc, ok := parseEncrypted(toks); ok {
 				plain, err := b.omemo.decryptInbound(bareJid(m.from), enc)
@@ -470,6 +1026,35 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 				m.body = plain
 			}
 		}
+		// A XEP-0313 archived-message result is backfill, never live input:
+		// consume it into the in-flight collector and never let it dispatch.
+		if res, ok := element(toks, mamNS, "result"); ok {
+			b.collectMAMResult(toks, res)
+			return nil
+		}
+		if re, ok := element(toks, reactionsNS, "reactions"); ok {
+			m.reactionFor = attr(re.Attr, "id")
+			m.reactions = reactionEmojis(toks)
+		}
+		// XEP-0461: log what a real client puts on the wire. The reverted
+		// attempt (#50/#51) shipped a malformed <reply/> twice because nobody
+		// read one, so record every inbound stamp at notice level. This is the
+		// live confirmation of the attribute names and the namespace.
+		if re, ok := element(toks, replyNS, "reply"); ok {
+			m.replyToID = attr(re.Attr, "id")
+			m.replyToJID = attr(re.Attr, "to")
+			b.log("notice", fmt.Sprintf("inbound XEP-0461 reply stamp from %s: to=%q id=%q", m.from, m.replyToJID, m.replyToID))
+		}
+		if d, ok := element(toks, "urn:xmpp:delay", "delay"); ok {
+			m.delay = true
+			if s := attr(d.Attr, "stamp"); s != "" {
+				if t, err := time.Parse(time.RFC3339, s); err == nil {
+					m.delayStamp = t
+				}
+			}
+		}
+		_, m.wantReceipt = element(toks, receiptsNS, "request")
+		_, m.markable = element(toks, chatMarkersNS, "markable")
 		b.dispatch(m)
 		return nil
 	case "presence":
@@ -489,6 +1074,11 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 		if attr(start.Attr, "type") == "get" {
 			if _, ok := element(toks, ping.NS, "ping"); ok {
 				return b.encodePong(attr(start.Attr, "from"), attr(start.Attr, "id"))
+			}
+			// Answer XEP-0030 disco#info so contacts that saw our XEP-0115
+			// caps hash can resolve it to the actual feature set.
+			if _, ok := element(toks, discoInfoNS, "query"); ok {
+				return b.encodeDiscoInfo(attr(start.Attr, "from"), attr(start.Attr, "id"))
 			}
 		}
 		return nil
@@ -516,7 +1106,53 @@ func (b *XMPPBridge) encodePong(to, id string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
 	defer cancel()
-	return session.Encode(ctx, resp)
+	return b.encode(ctx, session, resp)
+}
+
+// discoInfoQuery is the payload of a XEP-0030 disco#info IQ result: the
+// bridge's identity and the exact feature set its caps hash was computed over.
+type discoInfoQuery struct {
+	XMLName  xml.Name       `xml:"http://jabber.org/protocol/disco#info query"`
+	Identity discoIdentity  `xml:"identity"`
+	Features []discoFeature `xml:"feature"`
+}
+
+type discoIdentity struct {
+	Category string `xml:"category,attr"`
+	Type     string `xml:"type,attr"`
+	Name     string `xml:"name,attr,omitempty"`
+}
+
+type discoFeature struct {
+	Var string `xml:"var,attr"`
+}
+
+// encodeDiscoInfo replies to a XEP-0030 disco#info query. Contacts that see
+// the XEP-0115 caps child in our presence use this to resolve the hash.
+func (b *XMPPBridge) encodeDiscoInfo(to, id string) error {
+	session := b.currentSession()
+	if session == nil {
+		return fmt.Errorf("not online")
+	}
+	resp := struct {
+		stanza.IQ
+		Query discoInfoQuery
+	}{IQ: stanza.IQ{ID: id, Type: stanza.ResultIQ}}
+	if to != "" {
+		toJID, err := jid.Parse(to)
+		if err != nil {
+			return fmt.Errorf("invalid disco sender %q: %w", to, err)
+		}
+		resp.To = toJID
+	}
+	resp.Query.Identity = discoIdentity{Category: "client", Type: "bot", Name: "pi-msg"}
+	resp.Query.Features = make([]discoFeature, len(discoFeatures))
+	for i, f := range discoFeatures {
+		resp.Query.Features[i] = discoFeature{Var: f}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return b.encode(ctx, session, resp)
 }
 
 // dispatch applies delivery policy and forwards a message to onMsg. Routing is
@@ -543,20 +1179,41 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if bareJid(m.from) != b.ownerBare {
 		return
 	}
-	if strings.TrimSpace(m.body) == "" {
-		return // chat-states, receipts, empty
+	if strings.TrimSpace(m.body) == "" && len(m.reactions) == 0 {
+		return // chat-states, receipts, empty, or a reaction-only ack is forwarded below
 	}
-	// Drop server-replayed history (offline / MAM catch-up on reconnect) so a
-	// blip doesn't reprocess old messages.
+	// Server-replayed history (offline / MAM catch-up) is normally accepted only
+	// inside the restart swap window, where it is buffered for the resumed
+	// session. The owner's own client can also queue a recent DM through its
+	// stream interruption and attach XEP-0203 delay metadata without the bridge
+	// reconnecting; accept that message live rather than requiring a MAM trigger
+	// that may never happen (#100).
 	if m.delay {
-		return
+		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
+			b.bufferReplay(InboundMessage{
+				Body: m.body, RealJID: b.ownerBare, FromOwner: true,
+				Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp,
+			})
+			return
+		}
+		if !recentDirectDelay(m.delayStamp, time.Now()) {
+			b.log("notice", fmt.Sprintf("dropped stale delayed 1:1 message outside the replay window (id=%s from=%s stamp=%s)", m.id, m.from, stampLabel(m.delayStamp)))
+			return
+		}
+		b.log("info", fmt.Sprintf("delivering recent delayed 1:1 message outside the replay window (id=%s from=%s stamp=%s)", m.id, m.from, stampLabel(m.delayStamp)))
 	}
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
 	}
+	// Record the inbound message in history so send_reaction can target it by ID,
+	// and so a later reply to it can be resolved and quoted (#95).
+	if m.id != "" {
+		b.recordInboundMessage(m.id, m.from, m.body, true)
+	}
 	// The agent is about to take this in — acknowledge it as read/delivered.
 	b.sendReceipts(m)
-	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from})
+	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp, Reactions: m.reactions, ReactionID: m.reactionFor,
+		ReplyToID: m.replyToID, ReplyToJID: m.replyToJID})
 }
 
 // dispatchRoom applies groupchat guards and forwards room messages to onMsg,
@@ -573,25 +1230,58 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	if nick == "" {
 		return // room-level stanza (e.g. subject with no occupant)
 	}
-	if nick == b.ownNick(room) {
+	// Own-echo guard — case-insensitive (#29): XMPP nick matching is case-folded
+	// in principle, so a server echoing a differently-cased resource must not
+	// defeat the filter (a miss lets our own message re-enter classify and
+	// prompt ourselves).
+	if strings.EqualFold(nick, b.ownNick(room)) {
 		return // our own echo
 	}
 	if m.delay {
-		return // replayed history
+		// Replayed MUC history: buffer only what falls inside the restart swap
+		// window for the resumed session; drop the rest as stale backfill (logged,
+		// so a dropped owner message in a reconnect gap is visible — #94).
+		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
+			real := b.occupantRealJID(room, nick)
+			b.bufferReplay(InboundMessage{
+				Body:      m.body,
+				Nick:      nick,
+				RealJID:   real,
+				FromOwner: real != "" && real == b.ownerBare,
+				Room:      room,
+				ID:        m.id,
+				From:      m.from,
+				Stamp:     m.delayStamp,
+			})
+		} else {
+			b.log("notice", fmt.Sprintf("dropped delayed room message outside the replay window (room=%s nick=%s id=%s stamp=%s)", room, nick, m.id, stampLabel(m.delayStamp)))
+		}
+		return
 	}
-	if strings.TrimSpace(m.body) == "" {
-		return // subject-only, chat-states, empty
+	if strings.TrimSpace(m.body) == "" && len(m.reactions) == 0 {
+		return // subject-only, chat-states, empty (reaction-only acks forwarded below)
 	}
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
 	}
+	// Record the inbound room message in history so send_reaction can target it
+	// by ID, and so a later reply to it can be resolved and quoted (#95).
 	real := b.occupantRealJID(room, nick)
+	if m.id != "" {
+		b.recordInboundMessage(m.id, m.from, m.body, real != "" && real == b.ownerBare)
+	}
 	b.onMsg(InboundMessage{
-		Body:      m.body,
-		Nick:      nick,
-		RealJID:   real,
-		FromOwner: real != "" && real == b.ownerBare,
-		Room:      room,
+		Body:       m.body,
+		Nick:       nick,
+		RealJID:    real,
+		FromOwner:  real != "" && real == b.ownerBare,
+		Room:       room,
+		ReplyToID:  m.replyToID,
+		ReplyToJID: m.replyToJID,
+		ID:         m.id,
+		From:       m.from,
+		Reactions:  m.reactions,
+		ReactionID: m.reactionFor,
 	})
 }
 
@@ -648,6 +1338,25 @@ func (b *XMPPBridge) ownNick(room string) string {
 	return b.acct.Nick
 }
 
+// OccupantNicks returns a snapshot of the room's occupant nicks. Empty when the
+// room is unknown or nobody has been seen yet; callers must treat that as "no
+// information" rather than "nobody is addressable", since the map is populated
+// asynchronously from presence and is empty for a moment after every join.
+func (b *XMPPBridge) OccupantNicks(room string) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	m := b.occupants[room]
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for nick := range m {
+		out = append(out, nick)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // occupantRealJID returns the bare real JID mapped to nick in room, or "".
 func (b *XMPPBridge) occupantRealJID(room, nick string) string {
 	b.mu.Lock()
@@ -676,34 +1385,76 @@ func (b *XMPPBridge) seenDuplicate(id string) bool {
 	return false
 }
 
-// Send delivers a chat message to the owner, splitting long text across
-// stanzas.
-func (b *XMPPBridge) Send(text string) { b.SendChatTo(b.acct.Owner, text) }
+// hasSeen reports whether id was already handled, WITHOUT recording it. Used by
+// the reconnect backfill to skip archived copies of messages the running bridge
+// already delivered live (#94).
+func (b *XMPPBridge) hasSeen(id string) bool {
+	if id == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.seen[id]
+	return ok
+}
 
-// SendChatTo posts a 1:1 chat message to an arbitrary JID, splitting long text.
-// When OMEMO is enabled and the recipient is the owner, each part is
-// end-to-end encrypted; if encryption can't be completed (e.g. the owner has no
-// published OMEMO device yet) it falls back to plaintext with a loud warning so
-// the bot stays usable during setup.
-func (b *XMPPBridge) SendChatTo(to, text string) {
-	if b.currentSession() == nil {
-		b.log("warning", "send skipped: not online")
+// markSeen records id as handled without reporting whether it already was, so a
+// recovered message is not re-delivered by a later backfill.
+func (b *XMPPBridge) markSeen(id string) {
+	if id == "" {
 		return
 	}
+	b.seenDuplicate(id)
+}
+
+// stampLabel renders a delay stamp for a log line, "unknown" when absent.
+func stampLabel(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// Send delivers a chat message to the owner, splitting long text across
+// stanzas.
+func (b *XMPPBridge) Send(text string) string { return b.SendChatTo(b.acct.Owner, text) }
+
+// SendChatTo posts a 1:1 chat message to an arbitrary JID, splitting long text.
+// Returns the stanza ID of the last chunk sent, or "" if nothing was sent.
+func (b *XMPPBridge) SendChatTo(to, text string) string {
+	return b.SendChatReply(to, text, nil)
+}
+
+// SendChatReply is SendChatTo with an optional XEP-0461 reply stamp. Only the
+// first chunk of a split message carries the stamp. A client threads on the
+// first stanza, and a repeat of the element on every chunk makes each chunk a
+// separate reply to the same parent.
+func (b *XMPPBridge) SendChatReply(to, text string, reply *replyTarget) string {
+	if b.currentSession() == nil {
+		b.log("warning", "send skipped: not online")
+		return ""
+	}
+	var lastID string
 	omemoTo := b.omemo != nil && bareJid(to) == b.ownerBare
-	for _, part := range chunk(text, maxBody) {
+	for i, part := range chunk(text, maxBody) {
 		if omemoTo {
-			if err := b.sendEncrypted(to, part); err != nil {
-				b.log("warning", "omemo: encrypt failed, sending plaintext: "+err.Error())
-			} else {
+			err := b.sendEncrypted(to, part)
+			if err == nil {
 				continue
 			}
+			b.log("warning", "omemo: encrypt failed, sending plaintext: "+err.Error())
 		}
-		if err := b.encodeChat(to, part, stanza.ChatMessage); err != nil {
+		id, err := b.encodeChat(to, part, stanza.ChatMessage, replyForChunk(i, reply))
+		if err != nil {
 			b.log("error", "send failed: "+err.Error())
 			break
 		}
+		lastID = id
 	}
+	if lastID != "" {
+		b.markOutbound()
+	}
+	return lastID
 }
 
 // destKind classifies an agent-chosen reply destination for delivery policy.
@@ -752,6 +1503,18 @@ func (b *XMPPBridge) isOccupant(bare string) bool {
 	return false
 }
 
+// SetStartupStatus sets the presence <status> label announced on (re)connect,
+// before any activity run. Call it before Run to distinguish a fresh start
+// ("awake") from a resumed continuation ("resumed"). It falls back to "awake".
+func (b *XMPPBridge) SetStartupStatus(status string) {
+	if status == "" {
+		status = "awake"
+	}
+	b.mu.Lock()
+	b.startStatus = status
+	b.mu.Unlock()
+}
+
 // SetPresence announces presence with a show (availability axis: "" = available,
 // "dnd" = busy, …) and a status label (activity axis), remembering both for
 // re-assertion on reconnect. Redundant no-change calls are dropped so streaming
@@ -774,6 +1537,24 @@ func (b *XMPPBridge) SetPresence(show, status string) {
 	}
 }
 
+// SetIdleSince records when the agent last interacted (XEP-0319); pass the
+// zero Time to mark it active. The timestamp rides on every subsequent
+// presence announcement until updated.
+func (b *XMPPBridge) SetIdleSince(t time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.idleSince = t
+}
+
+// idleSinceISO renders a XEP-0319 'since' attribute (UTC RFC-3339); empty for
+// an active agent, which XEP-0319 reads as "interacting now".
+func idleSinceISO(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 // GoOffline broadcasts an unavailable presence so the owner's roster stops
 // showing the bot online, carrying an optional status describing why (e.g.
 // "session ended — …"). Safe to call when already offline (no-op).
@@ -786,10 +1567,18 @@ func (b *XMPPBridge) GoOffline(status string) {
 // ChatState sends an XEP-0085 chat-state notification to the owner (the
 // "typing…" indicator). "composing" shows typing; "active" clears it.
 func (b *XMPPBridge) ChatState(state string) {
+	b.ChatStateTo(state, b.acct.Owner)
+}
+
+// ChatStateTo sends an XEP-0085 chat-state notification to a specific JID. The
+// typing indicator is a per-recipient 1:1 chat state, so a reply routed to (or
+// from) someone other than the owner points the bubble at that recipient rather
+// than always lighting the owner (issue #44).
+func (b *XMPPBridge) ChatStateTo(state, to string) {
 	if b.currentSession() == nil {
 		return
 	}
-	if err := b.encodeChatState(b.acct.Owner, state, stanza.ChatMessage); err != nil {
+	if err := b.encodeChatState(to, state, stanza.ChatMessage); err != nil {
 		b.log("warning", "chatstate failed: "+err.Error())
 	}
 }
@@ -805,25 +1594,71 @@ func (b *XMPPBridge) currentSession() *xmpp.Session {
 
 // --- stanza encoders ---
 
-func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType) error {
+// replyTarget names the message an outbound message answers (XEP-0461).
+// author is the JID recorded for that message: an occupant JID
+// (room@muc/nick) for a room message, the sender's JID for a 1:1. id is that
+// message's stanza id.
+type replyTarget struct {
+	author string
+	id     string
+}
+
+// replyElem is the XEP-0461 <reply/> child. Both attributes are mandatory.
+type replyElem struct {
+	XMLName xml.Name `xml:"urn:xmpp:reply:0 reply"`
+	To      string   `xml:"to,attr"`
+	ID      string   `xml:"id,attr"`
+}
+
+// chatMessage is one outbound message stanza as it goes on the wire.
+type chatMessage struct {
+	stanza.Message
+	Body  string     `xml:"body"`
+	Reply *replyElem `xml:"reply,omitempty"`
+}
+
+// chatStanza builds one outbound message stanza. reply, when it names both an
+// author and an id, adds the XEP-0461 <reply/> child. A half-filled reply adds
+// nothing: one attribute alone threads nowhere, and an element with a missing
+// attribute is worse than no element.
+func chatStanza(id string, to jid.JID, typ stanza.MessageType, body string, reply *replyTarget) chatMessage {
+	msg := chatMessage{
+		Message: stanza.Message{ID: id, To: to, Type: typ},
+		Body:    body,
+	}
+	if reply != nil && reply.author != "" && reply.id != "" {
+		msg.Reply = &replyElem{To: reply.author, ID: reply.id}
+	}
+	return msg
+}
+
+// replyForChunk returns the reply stamp for chunk i of a split message: the
+// first chunk only. A client threads on the first stanza, so a stamp repeated
+// on every chunk makes each chunk a separate reply to the same parent.
+func replyForChunk(i int, reply *replyTarget) *replyTarget {
+	if i == 0 {
+		return reply
+	}
+	return nil
+}
+
+// encodeChat sends one message stanza. A non-nil reply adds the XEP-0461
+// <reply/> child that names the message this one answers.
+func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, reply *replyTarget) (string, error) {
 	session := b.currentSession()
 	if session == nil {
-		return fmt.Errorf("not online")
+		return "", fmt.Errorf("not online")
 	}
 	toJID, err := jid.Parse(to)
 	if err != nil {
-		return fmt.Errorf("invalid recipient %q: %w", to, err)
+		return "", fmt.Errorf("invalid recipient %q: %w", to, err)
 	}
-	msg := struct {
-		stanza.Message
-		Body string `xml:"body"`
-	}{
-		Message: stanza.Message{ID: newStanzaID(), To: toJID, Type: typ},
-		Body:    body,
-	}
+	id := newStanzaID()
+	msg := chatStanza(id, toJID, typ, body, reply)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	b.recordSelfMessage(id, to, body)
+	return id, b.encode(ctx, session, msg)
 }
 
 func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) error {
@@ -846,22 +1681,19 @@ func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) e
 	msg.State.XMLName = xml.Name{Space: chatStatesNS, Local: state}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	return b.encode(ctx, session, msg)
 }
 
-// sendReceipts acknowledges an accepted 1:1 owner message: a XEP-0184 delivery
-// receipt if the sender requested one, and a XEP-0333 "displayed" chat marker
-// if the message was markable — a genuine read receipt, since the agent is
-// about to act on it. Sent to the message's full from-JID so it routes back to
-// the originating resource. Best-effort; failures are logged, not fatal.
+// sendReceipts acknowledges an accepted 1:1 owner message with a single
+// XEP-0333 "displayed" chat marker if the message was markable — a genuine
+// read receipt, since the agent is about to act on it. Sent to the message's
+// full from-JID so it routes back to the originating resource. Only one ack is
+// sent per message (a lone XEP-0333 marker, not both a delivery receipt AND a
+// marker), so chat clients don't show a doubled acknowledgment. Best-effort;
+// failures are logged, not fatal.
 func (b *XMPPBridge) sendReceipts(m incomingMsg) {
 	if m.id == "" || m.from == "" {
 		return
-	}
-	if m.wantReceipt {
-		if err := b.encodeReceipt(m.from, receiptsNS, "received", m.id); err != nil {
-			b.log("warning", "delivery receipt failed: "+err.Error())
-		}
 	}
 	if m.markable {
 		if err := b.encodeReceipt(m.from, chatMarkersNS, "displayed", m.id); err != nil {
@@ -896,7 +1728,155 @@ func (b *XMPPBridge) encodeReceipt(to, ns, local, forID string) error {
 	msg.Ack.ID = forID
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	return b.encode(ctx, session, msg)
+}
+
+// msgHistoryEntry records an inbound or outbound message stanza in the
+// history ring buffer, so the bridge can resolve a stanza ID to its source
+// JID without the agent having to remember it. Body (truncated) lets an inbound
+// XEP-0461 reply quote what it answers (#95). Self marks a stanza this bridge
+// sent, and Owner one the owner sent: together they tell a reply target apart —
+// a reply to someone else's message is routed to them alone, while a reply to
+// ours or the owner's own is ours to answer (#106). Self cannot be inferred from
+// FromJID: a room send records the room, which looks exactly like anyone else's
+// message in that room, and a room receive records room/nick, whose bare JID is
+// the room.
+type msgHistoryEntry struct {
+	FromJID   string
+	Timestamp time.Time
+	Body      string
+	Self      bool
+	Owner     bool
+}
+
+// msgHistoryCap is the maximum number of stanza IDs retained in history.
+const msgHistoryCap = 500
+
+// msgHistoryBodyCap is the most text retained per history entry, so 500 entries
+// cannot pin an unbounded amount of message content in memory.
+const msgHistoryBodyCap = 200
+
+// recordMessage records a stanza ID -> JID mapping in the history ring buffer,
+// evicting the oldest entry if the buffer is full. Used where the body is not
+// worth retaining (outbound sends).
+func (b *XMPPBridge) recordMessage(id, fromJID string) {
+	b.recordMessageBody(id, fromJID, "")
+}
+
+// recordSelfMessage records a stanza WE sent, so a later inbound XEP-0461 reply
+// to it can be recognised as addressing us (see classify, #106).
+func (b *XMPPBridge) recordSelfMessage(id, toJID, body string) {
+	b.mu.Lock()
+	b.recordMessageBodyLocked(id, toJID, body)
+	// Mark it as ours in the same critical section: an eviction landing between
+	// two acquisitions could re-insert a zero-value entry that then wins every
+	// oldest-eviction scan.
+	if e, ok := b.msgHistory[id]; ok {
+		e.Self, e.Owner = true, false
+		b.msgHistory[id] = e
+	}
+	b.mu.Unlock()
+}
+
+// recordInboundMessage records a stanza we received, marking whether the owner
+// sent it. The owner flag lets a later reply to it be recognised as a reply to
+// the owner's own message (ours to answer) rather than to a peer's.
+func (b *XMPPBridge) recordInboundMessage(id, fromJID, body string, owner bool) {
+	b.mu.Lock()
+	b.recordMessageBodyLocked(id, fromJID, body)
+	if e, ok := b.msgHistory[id]; ok {
+		e.Self, e.Owner = false, owner
+		b.msgHistory[id] = e
+	}
+	b.mu.Unlock()
+}
+
+// isSelfMessage reports whether id is a stanza this bridge sent.
+func (b *XMPPBridge) isSelfMessage(id string) bool {
+	if id == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.msgHistory[id].Self
+}
+
+// replyTargetOther reports whether id belongs to a message we have seen that
+// came from neither us nor the owner — i.e. a peer's message. An unknown id
+// answers false: the sender could be anyone, including us before a restart, so
+// "not ours" cannot be concluded from silence.
+func (b *XMPPBridge) replyTargetOther(id string) bool {
+	if id == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.msgHistory[id]
+	return ok && !e.Self && !e.Owner
+}
+
+// recordMessageBody records a stanza ID -> (JID, body) mapping in the history
+// ring buffer. The body is what a later inbound reply to this message gets to
+// see, so both directions are recorded.
+func (b *XMPPBridge) recordMessageBody(id, fromJID, body string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.recordMessageBodyLocked(id, fromJID, body)
+}
+
+// recordMessageBodyLocked is recordMessageBody with b.mu already held, so a
+// caller can update the entry it just wrote in the same critical section.
+func (b *XMPPBridge) recordMessageBodyLocked(id, fromJID, body string) {
+	if id == "" {
+		return
+	}
+	body = truncateLabel(strings.TrimSpace(body), msgHistoryBodyCap)
+	if prev, exists := b.msgHistory[id]; exists {
+		// Keep Self and Owner: a re-record (a MAM fetch of our own archived line,
+		// a late duplicate) must not unmark a stanza we sent — or one the owner
+		// sent — or an unaddressed XEP-0461 reply to it would be classified as
+		// not ours and dropped (#106 review).
+		b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now(), Body: body, Self: prev.Self, Owner: prev.Owner}
+		return
+	}
+	if len(b.msgHistory) >= msgHistoryCap {
+		// Evict the oldest entry.
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range b.msgHistory {
+			if oldestKey == "" || v.Timestamp.Before(oldestTime) {
+				oldestKey, oldestTime = k, v.Timestamp
+			}
+		}
+		delete(b.msgHistory, oldestKey)
+	}
+	b.msgHistory[id] = msgHistoryEntry{FromJID: fromJID, Timestamp: time.Now(), Body: body}
+}
+
+// lookupMessage returns the from-JID for a recorded stanza ID, or "" if not found.
+func (b *XMPPBridge) lookupMessage(id string) string {
+	if id == "" {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if e, ok := b.msgHistory[id]; ok {
+		return e.FromJID
+	}
+	return ""
+}
+
+// lookupMessageEntry returns the recorded entry for a stanza ID, so an inbound
+// reply can be resolved to its author, timestamp and a short quote of what it
+// answers.
+func (b *XMPPBridge) lookupMessageEntry(id string) (msgHistoryEntry, bool) {
+	if id == "" {
+		return msgHistoryEntry{}, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.msgHistory[id]
+	return e, ok
 }
 
 // SendReaction reacts to message forID (authored by `to`) with the given emoji,
@@ -913,9 +1893,18 @@ func (b *XMPPBridge) SendReaction(to, forID string, emojis ...string) {
 	}
 }
 
+// SendReactionTo reacts to message forID (authored by `to`) with a single
+// emoji, taking explicit target parameters. Unlike SendReaction, it accepts a
+// single required emoji string. Calling with an empty emoji clears the reaction.
+func (b *XMPPBridge) SendReactionTo(to, forID, emoji string) {
+	b.SendReaction(to, forID, emoji)
+}
+
 // encodeReaction sends a bodyless message to `to` carrying an XEP-0444
 // <reactions id='forID'> element with one <reaction> child per emoji. An empty
 // emojis slice yields an empty <reactions>, which clears the reaction set.
+// When the target is a known room, the stanza is sent as groupchat so clients
+// display the reaction within the room context.
 func (b *XMPPBridge) encodeReaction(to, forID string, emojis []string) error {
 	session := b.currentSession()
 	if session == nil {
@@ -924,6 +1913,10 @@ func (b *XMPPBridge) encodeReaction(to, forID string, emojis []string) error {
 	toJID, err := jid.Parse(to)
 	if err != nil {
 		return fmt.Errorf("invalid recipient %q: %w", to, err)
+	}
+	msgType := stanza.ChatMessage
+	if b.isRoomJID(to) {
+		msgType = stanza.GroupChatMessage
 	}
 	type reaction struct {
 		XMLName xml.Name `xml:"reaction"`
@@ -937,7 +1930,7 @@ func (b *XMPPBridge) encodeReaction(to, forID string, emojis []string) error {
 			Reactions []reaction
 		}
 	}{
-		Message: stanza.Message{To: toJID, Type: stanza.ChatMessage},
+		Message: stanza.Message{To: toJID, Type: msgType},
 	}
 	msg.Reactions.XMLName = xml.Name{Space: reactionsNS, Local: "reactions"}
 	msg.Reactions.ID = forID
@@ -949,7 +1942,24 @@ func (b *XMPPBridge) encodeReaction(to, forID string, emojis []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	return b.encode(ctx, session, msg)
+}
+
+// idleElem is the XEP-0319 <idle/> presence child: 'since' carries the
+// RFC-3339 timestamp of the agent's last interaction when idle; an empty
+// element means the agent is active right now.
+type idleElem struct {
+	XMLName xml.Name `xml:"urn:xmpp:idle:1 idle"`
+	Since   string   `xml:"since,attr,omitempty"`
+}
+
+// capsElem is the XEP-0115 <c/> presence child advertising the client's
+// capabilities hash, so contacts fetch disco#info once and cache the result.
+type capsElem struct {
+	XMLName xml.Name `xml:"http://jabber.org/protocol/caps c"`
+	Hash    string   `xml:"hash,attr"`
+	Node    string   `xml:"node,attr"`
+	Ver     string   `xml:"ver,attr"`
 }
 
 // vcardXUpdate is the XEP-0153 <x xmlns='vcard-temp:x:update'> presence child
@@ -971,22 +1981,93 @@ func (b *XMPPBridge) avatarUpdate() *vcardXUpdate {
 }
 
 // encodePresence announces presence with an optional show and status, carrying
-// the XEP-0153 avatar hash when one is configured. An empty "to" broadcasts
-// (roster-wide) presence.
+// the XEP-0153 avatar hash when one is configured. It sends the roster-wide
+// broadcast AND directed presence to every joined room, so the agent's state
+// reads the same in a room as it does in the owner's 1:1.
+//
+// Both are required. A broadcast presence reaches roster subscribers only — the
+// MUC service does not relay it into rooms (XEP-0045 scopes an occupant's
+// presence to room@service/nick). Without the directed copies a room roster
+// keeps showing whatever state was current at join time, forever, while the
+// owner's 1:1 tracks every change.
 func (b *XMPPBridge) encodePresence(show, status string) error {
 	session := b.currentSession()
 	if session == nil {
 		return fmt.Errorf("not online")
 	}
+	// Broadcast first: the owner's 1:1 is the primary channel, so it should not
+	// be delayed behind per-room stanzas if one of them is slow.
+	err := b.encodePresenceTo(session, "", show, status)
+	for _, occupant := range b.presenceTargets() {
+		// A room that rejects our presence must not stop the others updating,
+		// so failures are logged and skipped rather than returned.
+		if e := b.encodePresenceTo(session, occupant, show, status); e != nil {
+			b.log("warning", "room presence failed for "+occupant+": "+e.Error())
+		}
+	}
+	return err
+}
+
+// presenceTargets returns the occupant JIDs (room@service/nick) that should
+// receive directed presence updates.
+//
+// Only rooms whose join we have *confirmed* are included, keyed on selfNick,
+// which is populated when the service echoes our own occupant presence with MUC
+// status code 110. This is not tidiness. Presence sent to room@service/nick
+// WITHOUT an <x xmlns='http://jabber.org/protocol/muc'/> child is, per XEP-0045,
+// a legacy "groupchat 1.0" join — and Run announces presence *before* joining
+// any room, so targeting un-joined rooms would legacy-join every one of them a
+// moment before the real join. A legacy join yields no status code 110 and no
+// muc#user items, so occupants[] never learns real JIDs, FromOwner is never true
+// in a room, and the owner silently stops being recognised. Gating on 110 makes
+// that sequence impossible.
+//
+// Between joinRoom and the 110 echo, room presence is skipped; joinRoom carries
+// the current show/status itself, so no state is lost in that window.
+//
+// The error room is excluded by construction — it is never in acct.Rooms, being
+// a write-only dumping ground kept out of the agent-visible room set.
+func (b *XMPPBridge) presenceTargets() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	targets := make([]string, 0, len(b.acct.Rooms))
+	for _, room := range b.acct.Rooms {
+		bare := bareJid(room)
+		nick := b.selfNick[bare]
+		if nick == "" {
+			continue // not joined, or join not yet confirmed — see above
+		}
+		targets = append(targets, bare+"/"+nick)
+	}
+	return targets
+}
+
+// currentPresence returns the current <show>/<status> pair under the lock.
+func (b *XMPPBridge) currentPresence() (show, status string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.show, b.presence
+}
+
+// encodePresenceTo sends one presence stanza. An empty "to" broadcasts
+// (roster-wide); otherwise it is directed at that JID.
+func (b *XMPPBridge) encodePresenceTo(session *xmpp.Session, to, show, status string) error {
+	b.mu.Lock()
+	idle := b.idleSince
+	b.mu.Unlock()
 	p := struct {
-		XMLName xml.Name `xml:"presence"`
-		Show    string   `xml:"show,omitempty"`
-		Status  string   `xml:"status,omitempty"`
-		VCard   *vcardXUpdate
-	}{Show: show, Status: status, VCard: b.avatarUpdate()}
+		XMLName  xml.Name `xml:"presence"`
+		To       string   `xml:"to,attr,omitempty"`
+		Show     string   `xml:"show,omitempty"`
+		Status   string   `xml:"status,omitempty"`
+		Priority int      `xml:"priority"`
+		Idle     idleElem
+		Caps     capsElem
+		VCard    *vcardXUpdate
+	}{To: to, Show: show, Status: status, Priority: 0, Idle: idleElem{Since: idleSinceISO(idle)}, Caps: capsElem{Hash: "sha-1", Node: capsNode, Ver: capsVer}, VCard: b.avatarUpdate()}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, p)
+	return b.encode(ctx, session, p)
 }
 
 // encodeUnavailable broadcasts a roster-wide unavailable presence, marking the
@@ -1003,7 +2084,7 @@ func (b *XMPPBridge) encodeUnavailable(status string) error {
 	}{Type: "unavailable", Status: status}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, p)
+	return b.encode(ctx, session, p)
 }
 
 // publishAvatar stores the configured image in the account's vCard via an
@@ -1028,7 +2109,13 @@ func (b *XMPPBridge) publishAvatar() error {
 				BinVal  string   `xml:"BINVAL"`
 			}
 		}
-	}{IQ: stanza.IQ{Type: stanza.SetIQ}}
+		// jid.JID implements xml.MarshalerAttr, so encoding/xml's `omitempty`
+		// on stanza.IQ.To never applies (isEmptyValue doesn't special-case
+		// structs) — a zero-value To always marshals to `to=""`, which
+		// ejabberd rejects as "Bad value of attribute 'to'". Set it to our
+		// own bare JID (the standard self-addressed form for vcard-temp) so
+		// the attribute is always well-formed.
+	}{IQ: stanza.IQ{Type: stanza.SetIQ, To: session.LocalAddr().Bare()}}
 	iq.VCard.Photo.Type = b.avatarType
 	iq.VCard.Photo.BinVal = b.avatarB64
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -1037,48 +2124,81 @@ func (b *XMPPBridge) publishAvatar() error {
 	if err != nil {
 		return err
 	}
-	return resp.Close()
+	// Manually check the IQ response for errors instead of using
+	// session.UnmarshalIQ with nil — the mellium library panics on nil
+	// interface type assertions when the server responds with an error.
+	tok, err := resp.Token()
+	if err != nil {
+		return err
+	}
+	start, ok := tok.(xml.StartElement)
+	if !ok {
+		return fmt.Errorf("publish avatar: expected IQ start element")
+	}
+	_, err = stanza.UnmarshalIQError(resp, start)
+	if err != nil {
+		return fmt.Errorf("publish avatar: %w", err)
+	}
+	resp.Close()
+	return nil
 }
 
 // SendRoomTo posts a groupchat message to a room JID, splitting long text.
-func (b *XMPPBridge) SendRoomTo(room, text string) {
+// Returns the stanza ID of the last chunk sent, or "" if nothing was sent.
+func (b *XMPPBridge) SendRoomTo(room, text string) string {
+	return b.SendRoomReply(room, text, nil)
+}
+
+// SendRoomReply is SendRoomTo with an optional XEP-0461 reply stamp, carried on
+// the first chunk only. Rooms are in scope for the stamp because the agent
+// names the answered message. The bridge never infers one.
+func (b *XMPPBridge) SendRoomReply(room, text string, reply *replyTarget) string {
 	if b.currentSession() == nil {
 		b.log("warning", "room send skipped: not online")
-		return
+		return ""
 	}
-	for _, part := range chunk(text, maxBody) {
-		if err := b.encodeChat(room, part, stanza.GroupChatMessage); err != nil {
+	var lastID string
+	for i, part := range chunk(text, maxBody) {
+		id, err := b.encodeChat(room, part, stanza.GroupChatMessage, replyForChunk(i, reply))
+		if err != nil {
 			b.log("error", "room send failed: "+err.Error())
 			break
 		}
+		lastID = id
 	}
+	if lastID != "" {
+		b.markOutbound()
+	}
+	return lastID
 }
 
 // SendFile uploads a local file via XEP-0363 and sends its URL to `to` as an
 // XEP-0066 out-of-band message (groupchat if `to` is a joined room, else 1:1),
-// so the recipient's client shows it as a downloadable file.
-func (b *XMPPBridge) SendFile(to, path string) error {
+// so the recipient's client shows it as a downloadable file. It returns the
+// share URL on success so the send_file relay can hand it back to the agent
+// (to reuse elsewhere, e.g. pasted into a PR) rather than discarding it.
+func (b *XMPPBridge) SendFile(to, path string) (string, error) {
 	session := b.currentSession()
 	if session == nil {
-		return fmt.Errorf("not online")
+		return "", fmt.Errorf("not online")
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", path, err)
+		return "", fmt.Errorf("stat %s: %w", path, err)
 	}
 	if fi.IsDir() {
-		return fmt.Errorf("%s is a directory", path)
+		return "", fmt.Errorf("%s is a directory", path)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	svc, err := b.uploadService(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	svcJID, err := jid.Parse(svc)
 	if err != nil {
-		return fmt.Errorf("invalid upload service %q: %w", svc, err)
+		return "", fmt.Errorf("invalid upload service %q: %w", svc, err)
 	}
 	name := filepath.Base(path)
 	ctype := mime.TypeByExtension(filepath.Ext(name))
@@ -1087,33 +2207,36 @@ func (b *XMPPBridge) SendFile(to, path string) error {
 	}
 	slot, err := upload.GetSlot(ctx, upload.File{Name: name, Size: int(fi.Size()), Type: ctype}, svcJID, session)
 	if err != nil {
-		return fmt.Errorf("requesting upload slot: %w", err)
+		return "", fmt.Errorf("requesting upload slot: %w", err)
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 	req, err := slot.Put(ctx, f)
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.ContentLength = fi.Size()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("uploading file: %w", err)
+		return "", fmt.Errorf("uploading file: %w", err)
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("upload rejected (HTTP %d)", resp.StatusCode)
+		return "", fmt.Errorf("upload rejected (HTTP %d)", resp.StatusCode)
 	}
 
 	typ := stanza.ChatMessage
 	if b.isRoomJID(bareJid(to)) {
 		typ = stanza.GroupChatMessage
 	}
-	return b.encodeOOB(to, slot.GetURL.String(), typ)
+	if err := b.encodeOOB(to, slot.GetURL.String(), typ); err != nil {
+		return "", err
+	}
+	return slot.GetURL.String(), nil
 }
 
 // uploadService resolves (and caches) the XEP-0363 upload component JID: the
@@ -1181,7 +2304,7 @@ func (b *XMPPBridge) encodeOOB(to, url string, typ stanza.MessageType) error {
 	msg.X.URL = url
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, msg)
+	return b.encode(ctx, session, msg)
 }
 
 // domainOf returns the domain part of a JID (after '@', before '/').
@@ -1203,9 +2326,14 @@ func (b *XMPPBridge) joinRoom(room string) error {
 		return fmt.Errorf("not online")
 	}
 	occupant := room + "/" + b.acct.Nick
+	// Carry <show> as well as <status>, so an agent that joins mid-run appears
+	// busy in the room rather than idle. Read both under the lock; they are
+	// mutated from the bridge's goroutine via SetPresence.
+	show, status := b.currentPresence()
 	join := struct {
 		XMLName xml.Name `xml:"presence"`
 		To      string   `xml:"to,attr"`
+		Show    string   `xml:"show,omitempty"`
 		Status  string   `xml:"status,omitempty"`
 		X       struct {
 			XMLName xml.Name `xml:"http://jabber.org/protocol/muc x"`
@@ -1215,10 +2343,10 @@ func (b *XMPPBridge) joinRoom(room string) error {
 			} `xml:"history"`
 		} `xml:"x"`
 		VCard *vcardXUpdate // XEP-0153 avatar hash, so it shows in the room roster
-	}{To: occupant, Status: b.presence, VCard: b.avatarUpdate()}
+	}{To: occupant, Show: show, Status: status, VCard: b.avatarUpdate()}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, join)
+	return b.encode(ctx, session, join)
 }
 
 // approveSubscription auto-accepts a presence subscription request.
@@ -1233,7 +2361,7 @@ func (b *XMPPBridge) approveSubscription(from string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return session.Encode(ctx, stanza.Presence{To: fromJID, Type: stanza.SubscribedPresence})
+	return b.encode(ctx, session, stanza.Presence{To: fromJID, Type: stanza.SubscribedPresence})
 }
 
 // --- token helpers ---
@@ -1276,17 +2404,50 @@ func element(toks []xml.Token, space, local string) (xml.StartElement, bool) {
 
 // childText returns the character data immediately following the first start
 // element with the given local name, or "".
+//
+// Only a DIRECT child of the stanza being read is considered (the scan stops at
+// nested depth): <body> is also the local name of the XHTML-IM payload
+// (`<html><body>`) and of the XEP-0461 `<fallback><body>` quote, either of which
+// could otherwise be returned as the message text (#95).
 func childText(toks []xml.Token, local string) string {
+	depth := 0
 	for i, tok := range toks {
-		se, ok := tok.(xml.StartElement)
-		if !ok || se.Name.Local != local {
-			continue
-		}
-		if i+1 < len(toks) {
-			if cd, ok := toks[i+1].(xml.CharData); ok {
-				return string(cd)
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if depth == 0 && t.Name.Local == local {
+				if i+1 < len(toks) {
+					if cd, ok := toks[i+1].(xml.CharData); ok {
+						return string(cd)
+					}
+				}
+				return ""
+			}
+			depth++
+		case xml.EndElement:
+			if depth > 0 {
+				depth--
 			}
 		}
 	}
 	return ""
+}
+
+// reactionEmojis collects the text of every <reaction> child among toks
+// (XEP-0444 reaction elements), in document order.
+func reactionEmojis(toks []xml.Token) []string {
+	var out []string
+	for i, tok := range toks {
+		se, ok := tok.(xml.StartElement)
+		if !ok || se.Name.Local != "reaction" {
+			continue
+		}
+		if i+1 < len(toks) {
+			if cd, ok := toks[i+1].(xml.CharData); ok {
+				if e := strings.TrimSpace(string(cd)); e != "" {
+					out = append(out, e)
+				}
+			}
+		}
+	}
+	return out
 }

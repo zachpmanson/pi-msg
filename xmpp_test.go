@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestBareJid(t *testing.T) {
@@ -70,6 +75,39 @@ func TestSeenDuplicate(t *testing.T) {
 	}
 	if b.seenDuplicate("b") {
 		t.Error("first sighting of 'b' reported as duplicate")
+	}
+}
+
+// The reconnect backfill needs a non-recording membership test (hasSeen) plus an
+// explicit recorder (markSeen): a recovered message must be skipped if it
+// already arrived live, and recorded once delivered so the next backfill does
+// not re-deliver it (#94).
+func TestHasSeenAndMarkSeen(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{Owner: "o@x.com"}, func(InboundMessage) {}, nil)
+	if b.hasSeen("a") {
+		t.Error("hasSeen on a fresh id")
+	}
+	if b.hasSeen("") {
+		t.Error("hasSeen must not report the empty id as seen")
+	}
+	b.markSeen("a")
+	if !b.hasSeen("a") {
+		t.Error("hasSeen after markSeen")
+	}
+	// markSeen is a no-op for an empty id, and hasSeen stays false for it.
+	b.markSeen("")
+	if b.hasSeen("") {
+		t.Error("empty id must never be recorded")
+	}
+}
+
+func TestStampLabel(t *testing.T) {
+	if got := stampLabel(time.Time{}); got != "unknown" {
+		t.Errorf("zero stamp = %q, want unknown", got)
+	}
+	ts := time.Date(2026, 9, 22, 1, 14, 32, 0, time.UTC)
+	if got := stampLabel(ts); got != "2026-09-22T01:14:32Z" {
+		t.Errorf("stampLabel = %q", got)
 	}
 }
 
@@ -237,5 +275,594 @@ func TestVCardXUpdateMarshal(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("vcard x:update = %q, missing %q", got, want)
 		}
+	}
+}
+
+func TestReplayInSwapWindow(t *testing.T) {
+	b := &XMPPBridge{}
+	start := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	if !b.SetReplayWindow(start) {
+		t.Fatal("SetReplayWindow should arm")
+	}
+	if !b.inSwapWindow(start.Add(time.Second)) {
+		t.Errorf("stamp inside window should be buffered")
+	}
+	if !b.inSwapWindow(start) {
+		t.Errorf("stamp at window start should be buffered")
+	}
+	if !b.inSwapWindow(start.Add(-time.Second)) {
+		t.Errorf("stamp within slack before start should be buffered")
+	}
+	if b.inSwapWindow(start.Add(-replaySlack - time.Second)) {
+		t.Errorf("stamp well before window start should be dropped")
+	}
+	if b.inSwapWindow(time.Time{}) {
+		t.Errorf("missing stamp should be dropped")
+	}
+	if b.SetReplayWindow(time.Time{}) {
+		t.Errorf("zero window start should not arm")
+	}
+}
+
+func TestRecentDirectDelayFreshness(t *testing.T) {
+	now := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		stamp time.Time
+		want  bool
+	}{
+		{name: "recent", stamp: now.Add(-2 * time.Second), want: true},
+		{name: "at freshness limit", stamp: now.Add(-directDelayFreshness), want: true},
+		{name: "too old", stamp: now.Add(-directDelayFreshness - time.Nanosecond), want: false},
+		{name: "modest future skew", stamp: now.Add(directDelayFutureSlack), want: true},
+		{name: "implausibly future", stamp: now.Add(directDelayFutureSlack + time.Nanosecond), want: false},
+		{name: "missing stamp", stamp: time.Time{}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recentDirectDelay(tc.stamp, now); got != tc.want {
+				t.Errorf("recentDirectDelay(%v) = %v, want %v", tc.stamp, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDispatchDirectRecentDelayedOutsideReplayWindow(t *testing.T) {
+	var got []InboundMessage
+	b := NewXMPPBridge(ResolvedAccount{Owner: "zach@x.com"}, func(m InboundMessage) {
+		got = append(got, m)
+	}, nil)
+	stamp := time.Now().Add(-2 * time.Second)
+	msg := incomingMsg{
+		typ: "chat", from: "zach@x.com/phone", body: "please do this", id: "queued-1",
+		delay: true, delayStamp: stamp,
+	}
+	b.dispatchDirect(msg)
+	if len(got) != 1 {
+		t.Fatalf("recent delayed DM delivered %d times, want once", len(got))
+	}
+	if m := got[0]; m.Body != msg.body || !m.Direct || !m.FromOwner || m.ID != msg.id || !m.Stamp.Equal(stamp) {
+		t.Errorf("delivered message = %+v, want recent delayed owner DM with stamp", m)
+	}
+	if !b.hasSeen(msg.id) {
+		t.Errorf("recent delayed DM id was not recorded for deduplication")
+	}
+
+	// A later live/archive copy with the same stanza id must not start a second turn.
+	msg.delay = false
+	b.dispatchDirect(msg)
+	if len(got) != 1 {
+		t.Errorf("duplicate copy delivered again; got %d messages", len(got))
+	}
+}
+
+func TestDispatchDirectStaleDelayedOutsideReplayWindow(t *testing.T) {
+	var got []InboundMessage
+	var logs []string
+	b := NewXMPPBridge(ResolvedAccount{Owner: "zach@x.com"}, func(m InboundMessage) {
+		got = append(got, m)
+	}, func(level, msg string) { logs = append(logs, level+": "+msg) })
+	b.dispatchDirect(incomingMsg{
+		typ: "chat", from: "zach@x.com/phone", body: "old backlog", id: "stale-1",
+		delay: true, delayStamp: time.Now().Add(-directDelayFreshness - time.Second),
+	})
+	if len(got) != 0 {
+		t.Fatalf("stale delayed DM was delivered: %+v", got)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "dropped stale delayed 1:1 message") {
+		t.Errorf("stale delayed DM drop was not logged: %v", logs)
+	}
+}
+
+func TestDispatchRoomRecentDelayedOutsideReplayWindowStillDrops(t *testing.T) {
+	var got []InboundMessage
+	b := NewXMPPBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi", Rooms: []string{"team@muc.x.com"}}, func(m InboundMessage) {
+		got = append(got, m)
+	}, nil)
+	b.dispatchRoom(incomingMsg{
+		typ: "groupchat", from: "team@muc.x.com/peppy", body: "old room history", id: "room-old",
+		delay: true, delayStamp: time.Now().Add(-time.Second),
+	})
+	if len(got) != 0 {
+		t.Errorf("recent delayed room history should remain suppressed: %+v", got)
+	}
+}
+
+func TestReplaySwapWindowActive(t *testing.T) {
+	b := &XMPPBridge{}
+	b.replayActive = true
+	b.replayGraceEnd = time.Now().Add(time.Second)
+	if !b.swapWindowActive() {
+		t.Errorf("open window should report active")
+	}
+	b.replayGraceEnd = time.Now().Add(-time.Second)
+	if b.swapWindowActive() {
+		t.Errorf("expired window should report inactive")
+	}
+	b.replayActive = false
+	b.replayGraceEnd = time.Now().Add(time.Second)
+	if b.swapWindowActive() {
+		t.Errorf("unarmed window should report inactive")
+	}
+}
+
+func TestReplayBufferDrain(t *testing.T) {
+	b := &XMPPBridge{}
+	b.replayStart = time.Now().Add(-time.Minute)
+	b.replayArmed = true
+	b.replayLit = true
+	b.replayActive = true
+	b.replayGraceEnd = time.Now().Add(50 * time.Millisecond)
+	b.bufferReplay(InboundMessage{Body: "first", Direct: true})
+	b.bufferReplay(InboundMessage{Body: "second", Direct: true})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got := b.DrainReplay(ctx)
+	if len(got) != 2 || got[0].Body != "first" || got[1].Body != "second" {
+		t.Errorf("drain = %v, want both buffered messages in order", got)
+	}
+	if b.replayActive {
+		t.Errorf("window should be closed after drain")
+	}
+	if again := b.DrainReplay(context.Background()); again != nil {
+		t.Errorf("second drain = %v, want nil", again)
+	}
+}
+
+func TestReplayDrainNotArmed(t *testing.T) {
+	b := &XMPPBridge{}
+	if got := b.DrainReplay(context.Background()); got != nil {
+		t.Errorf("unarmed drain = %v, want nil", got)
+	}
+}
+
+// Presence must reach every joined room, not just the roster. A broadcast
+// presence is not relayed into MUCs by the service (XEP-0045 scopes an
+// occupant's presence to room@service/nick), so without directed copies a room
+// roster shows the agent's join-time state forever while the owner's 1:1 tracks
+// every change.
+func TestPresenceTargets(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{
+		Owner:     "zach@x.com",
+		Nick:      "pi",
+		Rooms:     []string{"team@muc.x.com", "Ops@MUC.x.com"},
+		ErrorRoom: "errors@muc.x.com",
+	}, func(InboundMessage) {}, func(_, _ string) {})
+
+	// Before any join is confirmed there must be NO targets. Run announces
+	// presence before joining, and directed presence to room@service/nick with
+	// no MUC <x/> child is a legacy groupchat-1.0 join (XEP-0045) — which would
+	// join every room in legacy mode a moment before the real join, losing
+	// status code 110 and the muc#user real JIDs the owner check depends on.
+	if got := b.presenceTargets(); len(got) != 0 {
+		t.Fatalf("presenceTargets() before join = %v, want none", got)
+	}
+
+	// The service echoes our own occupant presence with status code 110; that
+	// is what marks a room joined, and it carries the nick actually assigned
+	// (which may differ from the configured one after a nick conflict).
+	b.mu.Lock()
+	b.selfNick["team@muc.x.com"] = "pi"
+	b.selfNick["ops@muc.x.com"] = "pi2"
+	b.mu.Unlock()
+
+	got := b.presenceTargets()
+	want := []string{"team@muc.x.com/pi", "ops@muc.x.com/pi2"}
+	if len(got) != len(want) {
+		t.Fatalf("presenceTargets() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("presenceTargets()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// The error room is write-only and out of the agent-visible set; nothing
+	// reads presence there, so it must not be targeted even once joined.
+	b.mu.Lock()
+	b.selfNick["errors@muc.x.com"] = "pi"
+	b.mu.Unlock()
+	for _, tgt := range b.presenceTargets() {
+		if strings.HasPrefix(tgt, "errors@") {
+			t.Errorf("error room was targeted: %q", tgt)
+		}
+	}
+
+	// A reconnect clears selfNick, so targets must drop back to none until the
+	// rooms are re-joined and re-confirmed.
+	b.mu.Lock()
+	b.selfNick = make(map[string]string)
+	b.mu.Unlock()
+	if got := b.presenceTargets(); len(got) != 0 {
+		t.Errorf("presenceTargets() after reconnect reset = %v, want none", got)
+	}
+}
+
+func TestIsTransportError(t *testing.T) {
+	// A wedged/broken TCP write surfaces as a *net.OpError (which implements
+	// net.Error) wrapping a timeout — the exact "write tcp …: i/o timeout" from
+	// issue #31.
+	timeout := &net.OpError{Op: "write", Net: "tcp", Err: &timeoutErr{}}
+	reset := syscall.ECONNRESET
+	pipe := syscall.EPIPE
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"timeout (net.Error)", timeout, true},
+		{"connection reset", reset, true},
+		{"broken pipe", pipe, true},
+		{"not online", fmt.Errorf("not online"), false},
+		{"invalid recipient", fmt.Errorf("invalid recipient %q", "x"), false},
+		{"plain error", fmt.Errorf("some stanza problem"), false},
+	}
+	for _, c := range cases {
+		if got := isTransportError(c.err); got != c.want {
+			t.Errorf("isTransportError(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// timeoutErr is a minimal error implementing net.Error so it can sit inside a
+// *net.OpError as the wrapped cause, mimicking how mellium reports a write that
+// exceeded its context deadline on a wedged socket.
+type timeoutErr struct{}
+
+func (*timeoutErr) Error() string   { return "i/o timeout" }
+func (*timeoutErr) Timeout() bool   { return true }
+func (*timeoutErr) Temporary() bool { return true }
+
+// TestKickDebounced verifies kick() is a safe no-op when offline and fires at
+// most once per second when online, so a burst of wedged-socket writes triggers
+// a single reconnect rather than a Close storm.
+func TestKickDebounced(t *testing.T) {
+	b := &XMPPBridge{}
+
+	// Offline: kick must not panic and must not touch anything.
+	b.kick()
+	if b.lastKick != (time.Time{}) {
+		t.Errorf("offline kick recorded a timestamp: %v", b.lastKick)
+	}
+
+	// Online, no real session: first kick records a timestamp (Close is skipped
+	// because the session is nil), a second immediate kick is debounced.
+	b.online = true
+	b.kick()
+	first := b.lastKick
+	if first.IsZero() {
+		t.Fatalf("online kick did not record a timestamp")
+	}
+	b.kick()
+	if !b.lastKick.Equal(first) {
+		t.Errorf("kicks within the debounce window advanced lastKick: %v -> %v", first, b.lastKick)
+	}
+}
+
+// fenceCount counts ``` fence lines in a string, treating any line starting
+// with "```" as a fence marker (open or close).
+func fenceCount(s string) int {
+	n := 0
+	for _, l := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimRight(l, " \t"), "```") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestChunkFenceAware ensures chunk() never splits a ``` code fence across
+// message boundaries: every piece is self-contained (its own balanced fences),
+// and together the pieces reconstruct the fenced content without corruption.
+func TestChunkFenceAware(t *testing.T) {
+	// A long message whose bulk is a fenced code block, small enough that the
+	// fix must not refuse to split but large enough to force boundary cuts.
+	fence := "```\n"
+	for i := 0; i < maxBody/4; i++ {
+		fence += "code line\n"
+	}
+	fence += "```"
+	msg := "Before fence.\n" + fence + "\nAfter fence."
+
+	parts := chunk(msg, maxBody)
+	if len(parts) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(parts))
+	}
+	// Every piece must be self-contained: it opens what it closes.
+	for i, p := range parts {
+		if len(p) > maxBody {
+			t.Errorf("piece %d exceeds cap (%d > %d)", i, len(p), maxBody)
+		}
+		if n := fenceCount(p); n%2 != 0 {
+			t.Errorf("piece %d has unbalanced fence markers (%d):\n%s", i, n, p)
+		}
+		// Strip the code block and confirm no bare fence opener leaked without
+		// a closer within the piece.
+		if strings.HasPrefix(p, "```") && fenceCount(p) == 1 {
+			t.Errorf("piece %d opens a fence it never closes:\n%s", i, p)
+		}
+	}
+}
+
+func TestCapsVerGoldenVector(t *testing.T) {
+	// XEP-0115 §5.3 worked example: identity client/pc (name "Exodus 0.9.1",
+	// no language) and features caps / disco#info / disco#items / muc hash to
+	// the verification string published in the spec.
+	feats := []string{
+		"http://jabber.org/protocol/caps",
+		"http://jabber.org/protocol/disco#info",
+		"http://jabber.org/protocol/disco#items",
+		"http://jabber.org/protocol/muc",
+	}
+	got := capsVerFor("client/pc//Exodus 0.9.1", feats)
+	const want = "QgayPKawpkPSDYmwT/WM94uAlu0="
+	if got != want {
+		t.Fatalf("caps ver: got %q, want %q", got, want)
+	}
+	// The bridge's own ver must be a stable, non-colliding value.
+	if capsVer == "" || capsVer == want {
+		t.Fatalf("bridge caps ver unexpected: %q", capsVer)
+	}
+}
+
+func TestIdleSinceISO(t *testing.T) {
+	if got := idleSinceISO(time.Time{}); got != "" {
+		t.Fatalf("zero idle: got %q, want empty", got)
+	}
+	// 2026-01-02 03:04:05 +10:00 (AEST) == 2026-01-01 17:04:05 UTC.
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("AEST", 10*3600))
+	if got := idleSinceISO(ts); got != "2026-01-01T17:04:05Z" {
+		t.Fatalf("idle iso: got %q, want 2026-01-01T17:04:05Z", got)
+	}
+}
+
+func TestPresenceChildrenMarshal(t *testing.T) {
+	// idle with timestamp
+	idle := idleElem{Since: "2026-01-01T17:04:05Z"}
+	b, err := xml.Marshal(idle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != `<idle xmlns="urn:xmpp:idle:1" since="2026-01-01T17:04:05Z"></idle>` {
+		t.Fatalf("idle marshal: %s", got)
+	}
+	// idle empty = active
+	b, _ = xml.Marshal(idleElem{})
+	if got := string(b); got != `<idle xmlns="urn:xmpp:idle:1"></idle>` {
+		t.Fatalf("idle empty marshal: %s", got)
+	}
+	// caps
+	c := capsElem{Hash: "sha-1", Node: "http://pi-msg", Ver: capsVer}
+	b, err = xml.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		`xmlns="http://jabber.org/protocol/caps"`,
+		`hash="sha-1"`,
+		`node="http://pi-msg"`,
+		`ver="` + capsVer + `"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("caps marshal missing %q: %s", want, s)
+		}
+	}
+	// full presence shape
+	p := struct {
+		XMLName  xml.Name `xml:"presence"`
+		Show     string   `xml:"show,omitempty"`
+		Status   string   `xml:"status,omitempty"`
+		Priority int      `xml:"priority"`
+		Idle     idleElem
+		Caps     capsElem
+	}{Show: "away", Status: "consulting the entrails", Priority: 0,
+		Idle: idleElem{Since: "2026-01-01T17:04:05Z"}, Caps: c}
+	b, err = xml.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = string(b)
+	for _, want := range []string{"<priority>0</priority>", "urn:xmpp:idle:1", "http://jabber.org/protocol/caps"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("presence missing %q: %s", want, s)
+		}
+	}
+}
+
+// TestDispatchRoomOwnEchoCaseInsensitive verifies the MUC own-echo filter drops
+// messages from our own nick even when the server echoes a differently-cased
+// resource (XMPP nick matching is case-folded; a case-sensitive compare was
+// the #29 loop precondition). Other occupants' messages must still forward.
+func TestDispatchRoomOwnEchoCaseInsensitive(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{Nick: "pi", Rooms: []string{"team@muc.x.com"}}, nil, nil)
+	b.selfNick = map[string]string{"team@muc.x.com": "pi"}
+	var got []InboundMessage
+	b.onMsg = func(m InboundMessage) { got = append(got, m) }
+
+	for _, from := range []string{
+		"team@muc.x.com/pi",    // own nick, exact case (server-confirmed)
+		"team@muc.x.com/Pi",    // differently-cased resource — must still drop
+		"team@muc.x.com/PI",    // all-caps variant
+		"team@muc.x.com/peppy", // another occupant forwards
+	} {
+		b.dispatchRoom(incomingMsg{typ: "groupchat", from: from, body: "pi: hello"})
+	}
+	if len(got) != 1 || got[0].Nick != "peppy" {
+		t.Fatalf("dispatchRoom forwarded %d messages (want only peppy): %+v", len(got), got)
+	}
+}
+
+// TestDispatchRoomOwnEchoFallsBackToAccountNick covers the pre-110 window where
+// the server-confirmed nick is unknown and ownNick falls back to the configured
+// account nick.
+func TestDispatchRoomOwnEchoFallsBackToAccountNick(t *testing.T) {
+	b := NewXMPPBridge(ResolvedAccount{Nick: "pi", Rooms: []string{"team@muc.x.com"}}, nil, nil) // selfNick unset
+	var got []InboundMessage
+	b.onMsg = func(m InboundMessage) { got = append(got, m) }
+	b.dispatchRoom(incomingMsg{typ: "groupchat", from: "team@muc.x.com/Pi", body: "anything"})
+	if len(got) != 0 {
+		t.Fatalf("own-echo from fallback nick forwarded: %+v", got)
+	}
+}
+
+// testLogBridge returns a bridge whose log lines are captured, so tests can
+// assert on what the user would have seen in journalctl.
+func testLogBridge() (*XMPPBridge, *[]string) {
+	logged := &[]string{}
+	b := &XMPPBridge{}
+	b.logf = func(level, msg string) { *logged = append(*logged, level+": "+msg) }
+	return b, logged
+}
+
+// countLogs counts captured log lines containing substr.
+func countLogs(logged []string, substr string) int {
+	n := 0
+	for _, l := range logged {
+		if strings.Contains(l, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// withShortCloseTimeout shrinks sessionCloseTimeout for the duration of a test.
+func withShortCloseTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := sessionCloseTimeout
+	sessionCloseTimeout = d
+	t.Cleanup(func() { sessionCloseTimeout = prev })
+}
+
+// TestHardCloseSeversConnEvenWhenGracefulReturns covers issue #90. The graceful
+// session.Close() is XMPP-level bookkeeping: it can return promptly while
+// session.Serve() is still reading happily (the write half was the broken one),
+// which leaves serve() running, Run() never re-dialling, and every later write
+// timing out on a socket nobody will replace. Closing the transport is what
+// unblocks that read.
+func TestHardCloseSeversConnEvenWhenGracefulReturns(t *testing.T) {
+	withShortCloseTimeout(t, 50*time.Millisecond)
+	b, logged := testLogBridge()
+
+	client, server := net.Pipe()
+	defer server.Close()
+
+	// This is Serve(): a read already blocked when the close lands.
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := client.Read(buf)
+		readErr <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// The incident shape: the graceful close returns immediately.
+	hardClose(b, client, func() {})
+
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Errorf("pending read returned nil after hardClose; the transport was left open")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("hardClose left a pending read blocked; Serve() would never return")
+	}
+	if _, err := client.Write([]byte("x")); err == nil {
+		t.Errorf("write succeeded after hardClose; the transport was not closed")
+	}
+	if got := countLogs(*logged, "did not return in time"); got != 0 {
+		t.Errorf("a graceful close that returned cleanly was reported as stuck: %v", *logged)
+	}
+}
+
+// TestHardCloseBoundsABlockedGracefulClose verifies both waits are bounded and
+// that the blocked close is reported rather than hanging the caller (the old
+// implementation waited on it forever after forcing the connection).
+func TestHardCloseBoundsABlockedGracefulClose(t *testing.T) {
+	withShortCloseTimeout(t, 50*time.Millisecond)
+	b, logged := testLogBridge()
+
+	client, server := net.Pipe()
+	defer server.Close()
+
+	release := make(chan struct{})
+	defer close(release)
+
+	start := time.Now()
+	hardClose(b, client, func() { <-release })
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("hardClose blocked for %s on a stuck graceful close", elapsed)
+	}
+	if _, err := client.Write([]byte("x")); err == nil {
+		t.Errorf("write succeeded after hardClose; the transport was not closed")
+	}
+	if got := countLogs(*logged, "did not return in time"); got != 1 {
+		t.Errorf("blocked graceful close not reported once: %v", *logged)
+	}
+	if got := countLogs(*logged, "still blocked after the connection was closed"); got != 1 {
+		t.Errorf("unbounded post-close wait not reported: %v", *logged)
+	}
+}
+
+// TestKeepaliveWedgeForcesReconnectOnEveryFailure covers the other half of
+// issue #90: a failed ping used to be a single recovery attempt followed by the
+// keepalive goroutine returning, so a close that silently achieved nothing left
+// the bridge unmonitored and mute. Every failing tick must force a close, with
+// the log throttled to one line per wedge plus an occasional "still failing".
+func TestKeepaliveWedgeForcesReconnectOnEveryFailure(t *testing.T) {
+	b, logged := testLogBridge()
+	var w keepaliveWedge
+	closes := 0
+	fail := func(now time.Time) {
+		t.Helper()
+		w.failure(b, now, fmt.Errorf("write tcp 10.0.0.107:46232->141.168.129.5:5222: i/o timeout"), func() { closes++ })
+	}
+
+	base := time.Now()
+	fail(base)
+	fail(base.Add(30 * time.Second))
+	fail(base.Add(60 * time.Second))
+	if closes != 3 {
+		t.Errorf("forceClose called %d times across 3 failing ticks, want 3", closes)
+	}
+	if got := countLogs(*logged, "keepalive ping failed"); got != 1 {
+		t.Errorf("first failure logged %d times, want 1: %v", got, *logged)
+	}
+
+	fail(base.Add(keepaliveNagInterval + time.Minute))
+	if closes != 4 {
+		t.Errorf("forceClose called %d times after a nag tick, want 4", closes)
+	}
+	if got := countLogs(*logged, "still failing after"); got != 1 {
+		t.Errorf("long wedge not reported once: %v", *logged)
+	}
+
+	// A successful ping ends the wedge; the next failure warns afresh.
+	w.recovered()
+	fail(base.Add(2 * keepaliveNagInterval))
+	if got := countLogs(*logged, "keepalive ping failed"); got != 2 {
+		t.Errorf("first failure of a new wedge logged %d times, want 2 total: %v", got, *logged)
 	}
 }

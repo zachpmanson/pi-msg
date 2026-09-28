@@ -27,10 +27,21 @@ func (e Event) Str(k string) string { s, _ := e[k].(string); return s }
 // Bool returns bool field k, or false.
 func (e Event) Bool(k string) bool { b, _ := e[k].(bool); return b }
 
+// F64 returns float64 field k (JSON numbers decode as float64), or 0.
+func (e Event) F64(k string) float64 { f, _ := e[k].(float64); return f }
+
 // Obj returns object field k as an Event, or nil.
 func (e Event) Obj(k string) Event {
 	if m, ok := e[k].(map[string]any); ok {
 		return Event(m)
+	}
+	return nil
+}
+
+// Arr returns array field k as []any, or nil.
+func (e Event) Arr(k string) []any {
+	if a, ok := e[k].([]any); ok {
+		return a
 	}
 	return nil
 }
@@ -57,9 +68,12 @@ type RPCClient struct {
 	bin     string
 	model   string
 	cwd     string
-	extPath string       // optional companion extension to load via `-e`
-	env     []string     // extra environment ("KEY=value") for the pi process
-	stderr  func(string) // optional per-line stderr sink
+	extPath string // optional companion extension to load via `-e`
+	// sessionPath, when set, resumes that session file on launch via
+	// `--session`. Set before Start().
+	sessionPath string
+	env         []string     // extra environment ("KEY=value") for the pi process
+	stderr      func(string) // optional per-line stderr sink
 
 	events chan Event
 	done   chan struct{} // closed once pi exits
@@ -116,6 +130,9 @@ func (c *RPCClient) Start() error {
 	}
 	if c.extPath != "" {
 		args = append(args, "-e", c.extPath)
+	}
+	if c.sessionPath != "" {
+		args = append(args, "--session", c.sessionPath)
 	}
 	cmd := exec.Command(c.bin, args...)
 	cmd.Dir = c.cwd
@@ -327,17 +344,53 @@ func (c *RPCClient) GetState(ctx context.Context) (Event, error) {
 	return c.Request(ctx, map[string]any{"type": "get_state"}, 30*time.Second)
 }
 
+// ExportHTML renders the current session to a static HTML file at
+// outputPath and returns the path the exporter actually wrote. Mirrors pi's
+// `export_html` RPC command (the CLI /export equivalent), so /export is
+// deterministic and never requires an agent turn.
+func (c *RPCClient) ExportHTML(ctx context.Context, outputPath string) (Event, error) {
+	return c.Request(ctx, map[string]any{"type": "export_html", "outputPath": outputPath}, 60*time.Second)
+}
+
+// GetSessionStats returns token/cost/message tallies for the current session.
+func (c *RPCClient) GetSessionStats(ctx context.Context) (Event, error) {
+	return c.Request(ctx, map[string]any{"type": "get_session_stats"}, 30*time.Second)
+}
+
+// SetSessionName sets the current session's display name.
+func (c *RPCClient) SetSessionName(ctx context.Context, name string) (Event, error) {
+	return c.Request(ctx, map[string]any{"type": "set_session_name", "name": name}, 30*time.Second)
+}
+
 func (c *RPCClient) Abort() { c.Send(map[string]any{"type": "abort"}) }
+
+// ClearQueue removes pi's queued steering and follow-up messages and returns
+// their text under data.steering / data.followUp. Requires pi >= 0.84.4; older
+// pi answers with an unknown-command failure, which callers must tolerate.
+//
+// Pi's documented order is clear_queue BEFORE abort: `abort` on its own leaves
+// the queue intact, so a steer that landed mid-run would start a fresh run the
+// instant the aborted one stops.
+func (c *RPCClient) ClearQueue(ctx context.Context) (Event, error) {
+	// Short timeout on purpose: this sits in front of /abort, which must feel
+	// immediate. Pi reads its stdin continuously, so a live pi answers well
+	// inside this. An unresponsive one costs the drain, not the abort.
+	return c.Request(ctx, map[string]any{"type": "clear_queue"}, 3*time.Second)
+}
 
 // CancelUI declines a pi UI request dialog (nobody is at the TUI to answer).
 func (c *RPCClient) CancelUI(id string) {
 	c.Send(map[string]any{"type": "extension_ui_response", "id": id, "cancelled": true})
 }
 
-// RespondUI answers a confirm-style extension_ui_request with a boolean result.
-// Used to complete the companion extension's tool-action relay.
-func (c *RPCClient) RespondUI(id string, confirmed bool) {
-	c.Send(map[string]any{"type": "extension_ui_response", "id": id, "confirmed": confirmed})
+// RespondUIRelay completes a companion-extension tool-action relay with a
+// string result: "ok" on success, or a failure reason the extension surfaces
+// to the model as the tool's error. The relay rides ui.select (not confirm)
+// because confirm's response is boolean-only — the boolean said *that* the
+// action failed but never *why*, so a server rejection (e.g. an upload slot
+// refused as "too large: 207387434 bytes") never reached the model (issue #34).
+func (c *RPCClient) RespondUIRelay(id, result string) {
+	c.Send(map[string]any{"type": "extension_ui_response", "id": id, "value": result})
 }
 
 // Stop signals intentional shutdown and terminates the pi process.

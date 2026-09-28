@@ -1,0 +1,340 @@
+package main
+
+import (
+	"encoding/xml"
+	"strings"
+	"testing"
+	"time"
+
+	"mellium.im/xmlstream"
+)
+
+// mamTokens parses an XML fragment into a token slice the way handle() sees a
+// stanza body: ReadAll after the outer start element has been consumed.
+func mamTokens(t *testing.T, s string) []xml.Token {
+	t.Helper()
+	toks, err := xmlstream.ReadAll(xml.NewDecoder(strings.NewReader(s)))
+	if err != nil {
+		t.Fatalf("parsing %q: %v", s, err)
+	}
+	return toks
+}
+
+func newMAMTestBridge() *XMPPBridge {
+	return &XMPPBridge{
+		acct:       ResolvedAccount{JID: "slippy@chat.zachmanson.com", Owner: "zach@chat.zachmanson.com", Nick: "slippy"},
+		ownerBare:  "zach@chat.zachmanson.com",
+		msgHistory: make(map[string]msgHistoryEntry),
+		mamPending: make(map[string]*mamCollector),
+	}
+}
+
+// An archived owner 1:1 message lands in the collector with its archive stamp,
+// is recorded for reaction targeting, and is tagged direct/canonical.
+func TestCollectMAMResultDirect(t *testing.T) {
+	b := newMAMTestBridge()
+	col := &mamCollector{record: true}
+	b.mamPending["q1"] = col
+
+	toks := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q1' id='a1'>`+
+		`<forwarded xmlns='urn:xmpp:forward:0'><delay xmlns='urn:xmpp:delay' stamp='2026-09-15T01:02:03Z'/>`+
+		`<message xmlns='jabber:client' from='zach@chat.zachmanson.com/phone' id='m1' type='chat'>`+
+		`<body>hello there</body></message></forwarded></result>`)
+	res, ok := element(toks, mamNS, "result")
+	if !ok {
+		t.Fatal("result element not detected")
+	}
+	b.collectMAMResult(toks, res)
+
+	if len(col.out) != 1 {
+		t.Fatalf("collected %d messages, want 1", len(col.out))
+	}
+	m := col.out[0]
+	if m.Body != "hello there" || m.ID != "m1" {
+		t.Errorf("message = %+v, want body/id from the archived stanza", m)
+	}
+	if !m.Direct || !m.FromOwner || m.Room != "" {
+		t.Errorf("direct scope: got Direct=%v FromOwner=%v Room=%q", m.Direct, m.FromOwner, m.Room)
+	}
+	want := time.Date(2026, 9, 15, 1, 2, 3, 0, time.UTC)
+	if !m.Stamp.Equal(want) {
+		t.Errorf("stamp = %v, want %v", m.Stamp, want)
+	}
+	if got := b.lookupMessage("m1"); got != "zach@chat.zachmanson.com/phone" {
+		t.Errorf("lookupMessage = %q, want the archived full JID", got)
+	}
+}
+
+// A room-scoped archive result becomes a room message tagged with the room and
+// the occupant nick; our own archived outbound is skipped.
+func TestCollectMAMResultRoom(t *testing.T) {
+	b := newMAMTestBridge()
+	col := &mamCollector{record: true, room: "testing@muc.chat.zachmanson.com"}
+	b.mamPending["q2"] = col
+
+	for _, from := range []string{
+		"testing@muc.chat.zachmanson.com/slippy",
+		"testing@muc.chat.zachmanson.com/peppy",
+	} {
+		toks := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q2'>`+
+			`<forwarded xmlns='urn:xmpp:forward:0'><delay xmlns='urn:xmpp:delay' stamp='2026-09-15T01:00:00Z'/>`+
+			`<message xmlns='jabber:client' from='`+from+`' id='r-`+from+`' type='groupchat'>`+
+			`<body>tick</body></message></forwarded></result>`)
+		res, _ := element(toks, mamNS, "result")
+		b.collectMAMResult(toks, res)
+	}
+
+	if len(col.out) != 1 {
+		t.Fatalf("collected %d messages, want 1 (own outbound skipped)", len(col.out))
+	}
+	m := col.out[0]
+	if m.Direct || m.Room != "testing@muc.chat.zachmanson.com" {
+		t.Errorf("room scope: got Direct=%v Room=%q", m.Direct, m.Room)
+	}
+	if m.Nick != "peppy" {
+		t.Errorf("nick = %q, want peppy", m.Nick)
+	}
+}
+
+// A result for an unknown query id must be dropped, never dispatched as live
+// input; an empty-body (chat-state) archive entry is dropped too.
+func TestCollectMAMResultUnknownAndEmpty(t *testing.T) {
+	b := newMAMTestBridge()
+	b.mamPending["q1"] = &mamCollector{record: true}
+
+	unknown := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='nope'>`+
+		`<forwarded xmlns='urn:xmpp:forward:0'><message xmlns='jabber:client' from='zach@chat.zachmanson.com' id='x'><body>stray</body></message></forwarded></result>`)
+	res, _ := element(unknown, mamNS, "result")
+	b.collectMAMResult(unknown, res) // must not panic, must not collect
+
+	empty := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q1'>`+
+		`<forwarded xmlns='urn:xmpp:forward:0'><message xmlns='jabber:client' from='zach@chat.zachmanson.com' id='e'><body/></message></forwarded></result>`)
+	res, _ = element(empty, mamNS, "result")
+	b.collectMAMResult(empty, res)
+
+	if n := len(b.mamPending["q1"].out); n != 0 {
+		t.Fatalf("collected %d, want 0 (unknown id + empty body dropped)", n)
+	}
+}
+
+// The MAM query payload must carry the query id, the FILTER form, the `start`
+// time bound, the `with` filter and the RSM page cap. A missing `start` makes
+// the server return the whole archive instead of the offline window.
+func TestMAMQueryPayloadMarshal(t *testing.T) {
+	since := time.Date(2026, 9, 15, 8, 15, 58, 0, time.UTC)
+	p := newMAMQueryPayload("qid-1", "zach@chat.zachmanson.com", since, mamPageMax, "", false)
+
+	raw, err := xml.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(raw)
+	for _, want := range []string{
+		`<query xmlns="urn:xmpp:mam:2" queryid="qid-1">`,
+		`<x xmlns="jabber:x:data" type="submit">`,
+		`<field var="FORM_TYPE"><value>urn:xmpp:mam:2</value></field>`,
+		`<field var="start"><value>2026-09-15T08:15:58Z</value></field>`,
+		`<field var="with"><value>zach@chat.zachmanson.com</value></field>`,
+		`<set xmlns="http://jabber.org/protocol/rsm"><max>200</max></set>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("marshalled payload missing %q:\n%s", want, got)
+		}
+	}
+
+	// A room query omits `with` (the room archive is addressed by JID) but still
+	// carries the time bound.
+	room := string(mustMarshal(t, newMAMQueryPayload("qid-2", "", since, 0, "", false)))
+	if strings.Contains(room, `var="with"`) {
+		t.Errorf("room payload should not carry a with filter:\n%s", room)
+	}
+	if !strings.Contains(room, `<field var="start">`) {
+		t.Errorf("room payload missing start bound:\n%s", room)
+	}
+	if strings.Contains(room, `protocol/rsm`) {
+		t.Errorf("max=0 should omit RSM:\n%s", room)
+	}
+}
+
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, err := xml.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return raw
+}
+
+// Duplicate stanza ids must not enter the replay buffer twice: the same message
+// can arrive as a server-pushed delayed stanza and again from MAM.
+func TestReplayBufferDedupesStanzaID(t *testing.T) {
+	b := &XMPPBridge{}
+	b.bufferReplay(InboundMessage{Body: "once", ID: "dup"})
+	b.bufferReplay(InboundMessage{Body: "twice", ID: "dup"})
+	b.bufferReplay(InboundMessage{Body: "other", ID: "uniq"})
+
+	if len(b.replayBuf) != 2 {
+		t.Fatalf("buffer = %d entries, want 2", len(b.replayBuf))
+	}
+	if b.replayBuf[0].Body != "once" {
+		t.Errorf("dedupe kept the wrong copy: %+v", b.replayBuf[0])
+	}
+}
+
+// Delay-pushed and MAM-fetched entries interleave in arrival order; the drain
+// sorts them chronologically so the catch-up reads as one timeline.
+func TestReplayDrainOrdersByStamp(t *testing.T) {
+	b := &XMPPBridge{}
+	b.replayActive = true
+	b.replayGraceEnd = time.Now()
+	base := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+	b.bufferReplay(InboundMessage{Body: "third", ID: "c", Stamp: base.Add(3 * time.Minute)})
+	b.bufferReplay(InboundMessage{Body: "first", ID: "a", Stamp: base.Add(time.Minute)})
+	b.bufferReplay(InboundMessage{Body: "second", ID: "b", Stamp: base.Add(2 * time.Minute)})
+
+	got := b.DrainReplay(t.Context())
+	if len(got) != 3 {
+		t.Fatalf("drained %d, want 3", len(got))
+	}
+	for i, want := range []string{"first", "second", "third"} {
+		if got[i].Body != want {
+			t.Errorf("drain[%d] = %q, want %q", i, got[i].Body, want)
+		}
+	}
+}
+
+// The backfill lower bound must be the LATER of the downtime window and the
+// last completed backfill. Using the earlier one re-delivers messages already
+// handled live (a replayed `!new` reset peppy's session in testing).
+func TestMAMSinceFor(t *testing.T) {
+	window := time.Date(2026, 9, 15, 8, 29, 6, 0, time.UTC) // graceful-stop marker
+	marker := time.Date(2026, 9, 15, 8, 27, 52, 0, time.UTC)
+
+	// Marker behind the window (the common case): use the window.
+	got, ok := mamSinceFor(window, true, marker, true)
+	if !ok || !got.Equal(window) {
+		t.Errorf("window newer: got (%v,%v), want %v", got, ok, window)
+	}
+	// Marker ahead of the window (stale last-outbound after a crash): use the
+	// marker, so the already-backfilled range is not fetched twice.
+	ahead := window.Add(10 * time.Minute)
+	got, ok = mamSinceFor(window, true, ahead, true)
+	if !ok || !got.Equal(ahead) {
+		t.Errorf("marker newer: got (%v,%v), want %v", got, ok, ahead)
+	}
+	// No window: no backfill, even with a marker.
+	if _, ok := mamSinceFor(time.Time{}, false, marker, true); ok {
+		t.Error("no window should mean no backfill")
+	}
+	// No marker: use the window.
+	got, ok = mamSinceFor(window, true, time.Time{}, false)
+	if !ok || !got.Equal(window) {
+		t.Errorf("no marker: got (%v,%v), want %v", got, ok, window)
+	}
+}
+
+// The reconnect lower bound (#94): the later of the last inbound handled live
+// and the last completed backfill, clamped so a long-idle session cannot drag
+// hours of archive into a catch-up.
+func TestReconnectSince(t *testing.T) {
+	now := time.Date(2026, 9, 22, 11, 16, 3, 0, time.UTC)
+	lastIn := now.Add(-8 * time.Minute) // handled at 11:08
+	seen := now.Add(-46 * time.Minute)  // last backfill, older
+
+	// lastin is the newer cursor: the outage window starts there.
+	got, ok := reconnectSince(lastIn, true, seen, true, now)
+	if !ok || !got.Equal(lastIn) {
+		t.Errorf("lastin newer: got (%v,%v), want %v", got, ok, lastIn)
+	}
+	// A newer backfill marker wins.
+	newer := now.Add(-2 * time.Minute)
+	got, ok = reconnectSince(lastIn, true, newer, true, now)
+	if !ok || !got.Equal(newer) {
+		t.Errorf("mamseen newer: got (%v,%v), want %v", got, ok, newer)
+	}
+	// No cursor at all: nothing to backfill.
+	if _, ok := reconnectSince(time.Time{}, false, time.Time{}, false, now); ok {
+		t.Error("no cursors should mean no backfill")
+	}
+	// A cursor far in the past is clamped to the reconnect window, not honoured.
+	stale := now.Add(-6 * time.Hour)
+	got, ok = reconnectSince(stale, true, time.Time{}, false, now)
+	if !ok || !got.Equal(now.Add(-mamReconnectWindow)) {
+		t.Errorf("stale cursor: got (%v,%v), want %v", got, ok, now.Add(-mamReconnectWindow))
+	}
+	// Only one cursor present still works (crash before any completed backfill).
+	got, ok = reconnectSince(time.Time{}, false, seen, true, now)
+	if !ok || !got.Equal(now.Add(-mamReconnectWindow)) {
+		t.Errorf("mamseen only: got (%v,%v), want clamped %v", got, ok, now.Add(-mamReconnectWindow))
+	}
+}
+
+// The last-page query is what makes read_room return the NEWEST messages. With
+// no RSM cursor the server returns the archive's first page, so a read would
+// hand the agent the room's oldest messages while claiming they were the latest
+// (#106 review): <before/> with no <after> and no start bound is what selects
+// the final page (XEP-0313 §4.3.3).
+func TestMAMLastPagePayload(t *testing.T) {
+	last := string(mustMarshal(t, newMAMQueryPayload("qid-3", "", time.Time{}, 30, "", true)))
+	if !strings.Contains(last, `<set xmlns="http://jabber.org/protocol/rsm"><max>30</max><before></before></set>`) {
+		t.Errorf("last-page payload must cap the page and ask for the final one:\n%s", last)
+	}
+	if strings.Contains(last, `var="start"`) {
+		// A start bound anchors the window at its BEGINNING, which is the bug.
+		t.Errorf("last-page payload must not carry a start bound:\n%s", last)
+	}
+
+	// The backfill (first-page) query keeps its start bound and no cursor.
+	first := string(mustMarshal(t, newMAMQueryPayload("qid-4", "", time.Now(), 200, "", false)))
+	if strings.Contains(first, "<before>") || !strings.Contains(first, `var="start"`) {
+		t.Errorf("the backfill query must stay start-bounded with no cursor:\n%s", first)
+	}
+}
+
+// read_room's `before` argument pages BACKWARDS from a stanza id: the query must
+// carry <before>id</before>, not the empty <before/> that means "the newest
+// page". An explicit cursor also overrides lastPage, and can be combined with a
+// `since` lower bound.
+func TestMAMBeforeCursorPayload(t *testing.T) {
+	cursor := string(mustMarshal(t, newMAMQueryPayload("qid-5", "", time.Time{}, 30, "stanza-abc", true)))
+	want := `<set xmlns="http://jabber.org/protocol/rsm"><max>30</max><before>stanza-abc</before></set>`
+	if !strings.Contains(cursor, want) {
+		t.Errorf("cursor payload must page back from the stanza id, want %q in:\n%s", want, cursor)
+	}
+	if strings.Contains(cursor, "<before></before>") {
+		t.Errorf("an explicit cursor must not degrade to the newest-page cursor:\n%s", cursor)
+	}
+	if strings.Contains(cursor, `var="start"`) {
+		t.Errorf("a bare cursor must not invent a start bound:\n%s", cursor)
+	}
+
+	since := time.Date(2026, 9, 28, 9, 30, 0, 0, time.UTC)
+	both := string(mustMarshal(t, newMAMQueryPayload("qid-6", "", since, 50, "stanza-abc", false)))
+	if !strings.Contains(both, `<field var="start"><value>2026-09-28T09:30:00Z</value></field>`) ||
+		!strings.Contains(both, `<before>stanza-abc</before>`) {
+		t.Errorf("a cursor read may also carry a since bound:\n%s", both)
+	}
+}
+
+// A read must not write the stanza history: recording fetched ids clears the
+// "we sent this" flag on our own archived lines and can evict live ids that
+// `to: <stanza-id>` routing depends on (#106 review).
+func TestMAMReadDoesNotRecordHistory(t *testing.T) {
+	b := newMAMTestBridge()
+	col := &mamCollector{room: "testing@muc.chat.zachmanson.com"} // record=false: a read
+	b.mamPending["q1"] = col
+
+	toks := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q1' id='a1'>`+
+		`<forwarded xmlns='urn:xmpp:forward:0'><delay xmlns='urn:xmpp:delay' stamp='2026-09-15T01:00:00Z'/>`+
+		`<message xmlns='jabber:client' from='testing@muc.chat.zachmanson.com/peppy' id='m9' type='groupchat'>`+
+		`<body>on it</body></message></forwarded></result>`)
+	res, _ := element(toks, mamNS, "result")
+	b.collectMAMResult(toks, res)
+
+	if len(col.out) != 1 {
+		t.Fatalf("collected %d messages, want 1", len(col.out))
+	}
+	if got := b.lookupMessage("m9"); got != "" {
+		t.Errorf("a read recorded stanza m9 in history (%q), want nothing recorded", got)
+	}
+}

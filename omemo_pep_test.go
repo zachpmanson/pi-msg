@@ -85,7 +85,7 @@ func TestBundleThroughWireXML(t *testing.T) {
 
 	// Simulate the server echoing the item back inside an <items> result.
 	respXML := `<pubsub xmlns="http://jabber.org/protocol/pubsub"><items node="x">` +
-		`<item id="current">` + string(mustMarshal(t, p.Publish.Item.Bundle)) + `</item></items></pubsub>`
+		`<item id="current">` + string(mustMarshalOMEMO(t, p.Publish.Item.Bundle)) + `</item></items></pubsub>`
 	var resp pubsubBundleResp
 	if err := xml.Unmarshal([]byte(respXML), &resp); err != nil {
 		t.Fatalf("unmarshal resp: %v", err)
@@ -128,7 +128,7 @@ func TestDeviceListXML(t *testing.T) {
 
 	// Round-trip through the fetch-response struct.
 	respXML := `<pubsub xmlns="http://jabber.org/protocol/pubsub"><items node="x"><item>` +
-		string(mustMarshal(t, p.Publish.Item.List)) + `</item></items></pubsub>`
+		string(mustMarshalOMEMO(t, p.Publish.Item.List)) + `</item></items></pubsub>`
 	var resp pubsubListResp
 	if err := xml.Unmarshal([]byte(respXML), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -144,7 +144,7 @@ func TestDeviceListXML(t *testing.T) {
 	}
 }
 
-func mustMarshal(t *testing.T, v any) []byte {
+func mustMarshalOMEMO(t *testing.T, v any) []byte {
 	t.Helper()
 	data, err := xml.Marshal(v)
 	if err != nil {
