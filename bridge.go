@@ -1470,9 +1470,7 @@ func (b *Bridge) handleCommand(t string) bool {
 	case "name":
 		b.handleName(arg)
 	case "session":
-		b.handleSession(false)
-	case "status":
-		b.handleSession(true)
+		b.handleSession()
 	case "abort", "stop":
 		// Drain the queue BEFORE aborting. `abort` alone leaves queued steers
 		// and follow-ups in the session, so pi starts a fresh run the moment
@@ -3366,29 +3364,22 @@ func (b *Bridge) handleName(arg string) {
 
 // handleSession reports the current session's id, file, message counts, token
 // usage and cost straight from get_session_stats — no LLM turn.
-func (b *Bridge) handleSession(status bool) {
-	command := "/session"
-	if status {
-		command = "/status"
-	}
+func (b *Bridge) handleSession() {
 	res, err := b.rpc.GetSessionStats(b.ctx)
 	if err != nil {
-		b.reply("⚠️ " + command + " failed: " + err.Error())
+		b.reply("⚠️ /session failed: " + err.Error())
 		return
 	}
 	if !res.success() {
-		b.reply("⚠️ " + command + " failed: " + res.errText())
+		b.reply("⚠️ /session failed: " + res.errText())
 		return
 	}
 	data := res.Obj("data")
 	if data == nil {
-		b.reply("⚠️ " + command + ": no stats data")
+		b.reply("⚠️ /session: no stats data")
 		return
 	}
 	lines := []string{"📊 session " + orUnknown(data.Str("sessionId"))}
-	if status {
-		lines[0] = "📊 /status — session " + orUnknown(data.Str("sessionId"))
-	}
 	if f := data.Str("sessionFile"); f != "" {
 		lines = append(lines, "file: "+f)
 	}
@@ -3410,9 +3401,6 @@ func (b *Bridge) handleSession(status bool) {
 	if cu := data.Obj("contextUsage"); cu != nil && cu.F64("percent") > 0 {
 		lines = append(lines, fmt.Sprintf("context: %.1f%% (%s / %s tokens)", cu.F64("percent"),
 			commaInt(int64(cu.F64("tokens"))), commaInt(int64(cu.F64("contextWindow")))))
-	}
-	if status {
-		lines = append(lines, "Pi session metrics only; no Codex plan quota data.")
 	}
 	b.reply(strings.Join(lines, "\n"))
 }
