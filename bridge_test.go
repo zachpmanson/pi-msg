@@ -1391,6 +1391,19 @@ func TestBannerNoReplyGates(t *testing.T) {
 	}
 }
 
+func TestNoReplyReactionIgnoresOptionalLifecycleSetting(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"}) // reactions default off
+	var level, message string
+	b.xmpp.logf = func(l, m string) { level, message = l, m }
+	b.setLifecycleReactTarget("zach@x", "msg-1")
+
+	b.reactNoReply()
+
+	if level != "warning" || !strings.Contains(message, "not online") {
+		t.Fatalf("reactNoReply() with reactions disabled did not attempt send: %s: %s", level, message)
+	}
+}
+
 // TestToolRelayProcessHeartbeatInjectsPrompt: an idle agent receives the
 // long-running-process alarm as an injected prompt carrying the TRUE elapsed
 // seconds and the log tail, presence goes dnd thinking, and the relay answers
@@ -1596,7 +1609,7 @@ func TestCommandReplyUsesItsOwnOrigin(t *testing.T) {
 
 	// ...then an owner command arrives in the 1:1. The destination must move to
 	// the owner, not stay in the room.
-	b.handleCanonical("/interrupt", "", b.acct.Owner, "", "", "", "")
+	b.handleCanonical("/interrupt", "", b.acct.Owner, "", "", "", "", nil)
 	if got := b.currentTurnDest(); got != b.acct.Owner {
 		t.Errorf("1:1 command turnDest = %q, want owner %q", got, b.acct.Owner)
 	}
@@ -1606,7 +1619,7 @@ func TestCommandReplyUsesItsOwnOrigin(t *testing.T) {
 
 	// And the reverse: a command typed in a room replies in that room.
 	b.setTurnDest(b.acct.Owner, false)
-	b.handleCanonical("/interrupt", "zach", "team@muc.x.com", "", "", "", "")
+	b.handleCanonical("/interrupt", "zach", "team@muc.x.com", "", "", "", "", nil)
 	if got := b.currentTurnDest(); got != "team@muc.x.com" {
 		t.Errorf("room command turnDest = %q, want room", got)
 	}

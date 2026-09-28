@@ -482,8 +482,8 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// malformed commentary drops silently, and the agent is only nudged if
 		// the run's FINAL message was malformed (pending nudge set AND nothing
 		// successfully delivered after it). Not before. A launched nudge is
-		// itself a pending reply, so it holds the "done (no reply)" banner: the
-		// resend lands moments later, and showing the banner first would read
+		// itself a pending reply, so it holds the no-reply reaction: the
+		// resend lands moments later, and reacting first would read
 		// as "agent: done, no reply" immediately followed by the resend.
 		nudged := b.firePendingNudge()
 		// A run that ended on a tool call never wrote its answer: the tool
@@ -512,10 +512,10 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// heartbeat wake (heartbeatRun): noop is exactly what the alarm asks
 		// for, and the "— your turn" would be a misleading prompt to the
 		// owner. A recovery prompt (tail retry or routing nudge) is in flight,
-		// so hold the banner: the retry may still answer, and "done (no
-		// reply)" followed by the resend would read as a contradiction.
+		// so hold the reaction: the retry may still answer, and a 🫡 followed
+		// by the resend would read as a contradiction.
 		if b.bannerNoReply(recovering, nudged) {
-			b.reply("✅ done (no reply) — your turn")
+			b.reactNoReply()
 		}
 		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
 		// A heartbeat wake is likewise one-shot: the flag lives only for the
@@ -583,7 +583,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// "replied" must mean "reached a destination", not "text existed".
 		// A malformed reply goes to the error room, which the owner never
 		// reads — counting that as a reply would suppress the settle-time
-		// "done (no reply)" banner and leave the owner with silence.
+		// 🫡 reaction and leave the owner with silence.
 		if b.deliverReply(text) {
 			b.setReplied(true)
 			b.clearToolSinceDelivery()
@@ -2696,7 +2696,7 @@ func (b *Bridge) deliverReply(text string) bool {
 		}
 		// "to: noop" — the agent deliberately has nothing to send. Drop the body
 		// without emitting a stanza, and count it as having replied so the
-		// "done (no reply)" nudge doesn't turn room silence into DM noise.
+		// 🫡 reaction doesn't turn room silence into owner DM noise.
 		if strings.EqualFold(s.dest, destNoopName) {
 			// "notice", not "info": info is suppressed unless PI_MSG_DEBUG is set,
 			// and a noop emits no stanza, so this line is the ONLY evidence the
@@ -2997,7 +2997,7 @@ func (b *Bridge) resetRunCounts() {
 // unansweredRun reports whether the run took in more messages than it answered,
 // and returns both counts. It only fires when at least two messages entered the
 // run: a single message with no reply is the empty-tail case, already covered by
-// needsEmptyTailRecovery and the "done (no reply)" banner.
+// needsEmptyTailRecovery and the unanswered-run reaction.
 //
 // "to: noop" counts as a delivery, so a run the agent deliberately answered with
 // silence is never flagged.
@@ -3012,7 +3012,7 @@ func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
 
 // fireUnansweredHint asks the agent to check whether any message of the run
 // still needs its own reply. It reports whether a prompt went out so the caller
-// can hold the "done (no reply)" banner while the check is in flight.
+// can hold the unanswered-run reaction while the check is in flight.
 //
 // The hint is a prompt, not a chat message: it never reaches the owner. The
 // agent answers it with real replies, or with "to: noop" if it already covered
@@ -4120,6 +4120,18 @@ func (b *Bridge) lifecycleReact(emojis ...string) {
 	b.xmpp.SendReaction(to, id, emojis...)
 }
 
+// reactNoReply always marks an unanswered run, independent of the optional
+// lifecycle-reactions setting. It replaces the completion reaction with 🫡.
+func (b *Bridge) reactNoReply() {
+	b.mu.Lock()
+	to, id := b.lifecycleReactTo, b.lifecycleReactID
+	b.mu.Unlock()
+	if to == "" || id == "" {
+		return
+	}
+	b.xmpp.SendReaction(to, id, "🫡")
+}
+
 func (b *Bridge) setStreaming(v bool) {
 	b.mu.Lock()
 	b.streamingRun = v
@@ -4223,7 +4235,7 @@ func heartbeatTail(tail string) string {
 // fireHeartbeat wakes the (idle) agent with a long-running-process alarm,
 // routing any response to the owner like the other synthetic prompts. The run
 // is marked heartbeatRun so its (expected) to:noop outcome is treated like a
-// volunteer or reaction-ack run: no "done (no reply)" banner, no recovery or
+// volunteer or reaction-ack run: no 🫡 reaction, no recovery or
 // unanswered-message hints.
 func (b *Bridge) fireHeartbeat(text string) {
 	if text == "" {

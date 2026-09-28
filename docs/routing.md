@@ -114,8 +114,7 @@ XEP-0359. The model knows which message it answers, so it names one.
 `to: noop` means the agent deliberately has nothing to send:
 
 - Sends **no stanza** at all.
-- Counts as having replied, so the "done (no reply)" nudge does not turn room
-  silence into owner DM noise.
+- Counts as having replied, so the 🫡 reaction for unanswered runs is not sent.
 - Discards any body that follows it.
 - Works in **1:1 mode too** (`leadingNoop`), which parses no other `to:` form.
   A 1:1 account has no routing contract, but it still needs a way to say
