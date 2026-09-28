@@ -300,49 +300,63 @@ func TestStagedNudgeLifecycle(t *testing.T) {
 	b := NewBridge(ResolvedAccount{}, false)
 
 	// Nothing staged → nothing to fire.
-	if got := b.takeStagedNudge(); got != "" {
-		t.Errorf("empty staged nudge → got %q, want empty", got)
+	if got := b.takeStagedNudge(); got != nil {
+		t.Errorf("empty staged nudge → got %+v, want nil", got)
 	}
 
 	// Stage a correction (as rejectReply does), then a later message routes
 	// fine → the staged nudge is cleared and never fires.
 	b.stageNudge("dropped body", "no to: line")
 	b.clearPendingNudge()
-	if got := b.takeStagedNudge(); got != "" {
-		t.Errorf("staged nudge after clear → got %q, want empty", got)
+	if got := b.takeStagedNudge(); got != nil {
+		t.Errorf("staged nudge after clear → got %+v, want nil", got)
 	}
 
-	// Stage a correction and fire at settle → reason fires exactly once.
+	// Stage a correction and fire at settle → the correction fires exactly once,
+	// carrying both the reason (for the reminder) and the body (for the card).
 	b.stageNudge("dropped body", "no to: line")
-	if got := b.takeStagedNudge(); got != "no to: line" {
-		t.Errorf("settled nudge reason = %q, want %q", got, "no to: line")
+	got := b.takeStagedNudge()
+	if got == nil || got.reason != "no to: line" || got.body != "dropped body" {
+		t.Errorf("settled nudge = %+v, want body+reason", got)
 	}
-	if got := b.takeStagedNudge(); got != "" {
-		t.Errorf("staged nudge should fire once, got %q on second take", got)
+	if got := b.takeStagedNudge(); got != nil {
+		t.Errorf("staged nudge should fire once, got %+v on second take", got)
 	}
 
-	// Later staging replaces earlier — only the final reason is nudged.
+	// Later staging replaces earlier — only the final message is reported.
 	b.stageNudge("a", "reason one")
 	b.stageNudge("b", "reason two")
-	if got := b.takeStagedNudge(); got != "reason two" {
-		t.Errorf("latest staged reason = %q, want %q", got, "reason two")
+	if got := b.takeStagedNudge(); got == nil || got.reason != "reason two" {
+		t.Errorf("latest staged nudge = %+v, want reason two", got)
 	}
 }
 
-// TestStagedNudgeRespectsBudget verifies the per-turn cap still bounds the
-// settle-time reminder even with a single staging point.
+// TestStagedNudgeRespectsBudget verifies the per-turn cap bounds the reminder
+// prompt — and only that. The drop report (error-room card) is deliberately not
+// capped (#92): it is the only record that a reply reached nobody, so a
+// malformed agent that exhausts the prompt budget still leaves a trail.
 func TestStagedNudgeRespectsBudget(t *testing.T) {
-	b := NewBridge(ResolvedAccount{}, false)
-	b.stageNudge("a", "r1")
-	b.stageNudge("b", "r2")
-	if got := b.takeStagedNudge(); got != "r2" {
-		t.Fatalf("first staged nudge = %q, want r2", got)
+	b := roomBridge()
+	b.acct.ErrorRoom = "errors@muc.x.com"
+	var buf bytes.Buffer
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	var dropped []string
+	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com", logf: func(level, msg string) {
+		dropped = append(dropped, level+": "+msg)
+	}}
+
+	attempts := maxRoutingNudges + 1
+	for i := 0; i < attempts; i++ {
+		b.stageNudge("dropped body", "no to: line")
+		b.firePendingNudge()
 	}
-	// Both staged nudges consumed the budget now; a fresh turn resets it.
-	b.resetRoutingNudges()
-	b.stageNudge("c", "r3")
-	if got := b.takeStagedNudge(); got != "r3" {
-		t.Errorf("post-reset staged nudge = %q, want r3", got)
+	if got := strings.Count(buf.String(), `"type":"prompt"`); got != maxRoutingNudges {
+		t.Errorf("launched %d reminders, want %d (per-turn cap)", got, maxRoutingNudges)
+	}
+	// Offline, so each routed drop reports itself by skipping the send: one per
+	// attempt, uncapped.
+	if got := strings.Count(strings.Join(dropped, "\n"), "room send skipped: not online"); got != attempts {
+		t.Errorf("posted %d drop cards, want %d (uncapped)", got, attempts)
 	}
 }
 
@@ -353,6 +367,7 @@ func TestStagedNudgeRespectsBudget(t *testing.T) {
 func TestFirePendingNudgeReportsLaunch(t *testing.T) {
 	b := roomBridge()
 	b.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
+	b.xmpp = &XMPPBridge{ownerBare: "zach@x.com"}
 
 	// Nothing staged → no nudge launches.
 	if b.firePendingNudge() {
@@ -368,6 +383,82 @@ func TestFirePendingNudgeReportsLaunch(t *testing.T) {
 	// Consumed on fire → nothing left to launch.
 	if b.firePendingNudge() {
 		t.Error("after firing, no second nudge may launch")
+	}
+}
+
+// TestMidRunNarrationNeverDropped pins issue #92. A run emits one message per
+// assistant turn, and an unroutable one is usually narration ("Now the
+// manifest and strings:") that was never addressed to anyone. Reporting it at
+// message time flooded the write-only error room — the channel meant for
+// genuinely lost replies — and made the "agent reply not routed" warning
+// useless as a signal. The drop report belongs at settle, and only when the run
+// ended on the unroutable message.
+func TestMidRunNarrationNeverDropped(t *testing.T) {
+	newHarness := func() (*Bridge, *bytes.Buffer, *[]string) {
+		b := roomBridge()
+		b.acct.ErrorRoom = "errors@muc.x.com"
+		buf := &bytes.Buffer{}
+		b.rpc = &RPCClient{stdin: &nopClose{buf: buf}, mu: sync.Mutex{}}
+		var dropped []string
+		// Offline, so a routed drop announces itself by skipping the send.
+		b.xmpp = &XMPPBridge{ownerBare: "zach@x.com", logf: func(level, msg string) {
+			dropped = append(dropped, level+": "+msg)
+		}}
+		return b, buf, &dropped
+	}
+
+	// Mid-run narration followed by an answer later in the same run: nothing is
+	// dropped, so no card is posted and no reminder is owed. (The later answer is
+	// a noop because this harness is offline — a send that fails leaves the
+	// staged correction in place, which is the behaviour under test elsewhere.)
+	b, _, dropped := newHarness()
+	b.deliverReply("Now the manifest and strings:")
+	if n := strings.Count(strings.Join(*dropped, "\n"), "room send skipped"); n != 0 {
+		t.Fatalf("mid-run narration posted %d error-room cards, want 0", n)
+	}
+	b.deliverReply("to: noop")
+	if b.firePendingNudge() {
+		t.Error("a run that later answered must not be reminded")
+	}
+	if n := strings.Count(strings.Join(*dropped, "\n"), "room send skipped"); n != 0 {
+		t.Errorf("error room received %d cards after a run that answered, want 0", n)
+	}
+
+	// r2d2's real shape: a preamble before an otherwise-valid "to: noop". The
+	// agent did answer (deliberately, with silence), so the preamble is
+	// narration and must not be reported either.
+	b, buf, dropped := newHarness()
+	b.deliverReply("No lint errors (one expected warning).\n\nto: noop")
+	if b.firePendingNudge() {
+		t.Error("a noop answer must not be reminded")
+	}
+	if n := strings.Count(strings.Join(*dropped, "\n"), "room send skipped"); n != 0 {
+		t.Errorf("preamble before a noop posted %d error-room cards, want 0", n)
+	}
+	if strings.Contains(buf.String(), "NOT delivered") {
+		t.Error("preamble before a noop triggered a resend reminder")
+	}
+
+	// A run that ENDS on unroutable text is a real drop: reported once, at
+	// settle, with the reminder.
+	b, buf, dropped = newHarness()
+	b.deliverReply("Now updating the wiki page with everything we established.")
+	if n := strings.Count(strings.Join(*dropped, "\n"), "room send skipped"); n != 0 {
+		t.Errorf("the drop must not be reported before settle, got %d cards", n)
+	}
+	if !b.firePendingNudge() {
+		t.Error("a run that settled on unroutable text must be reminded")
+	}
+	if n := strings.Count(strings.Join(*dropped, "\n"), "room send skipped: not online"); n != 1 {
+		t.Errorf("posted %d error-room cards, want exactly 1", n)
+	}
+	if !strings.Contains(buf.String(), "NOT delivered") {
+		t.Error("resend reminder not sent for a settled unroutable message")
+	}
+	// Settling twice must not report the same message twice.
+	b.firePendingNudge()
+	if n := strings.Count(strings.Join(*dropped, "\n"), "room send skipped: not online"); n != 1 {
+		t.Errorf("second settle reposted the card: %d cards, want 1", n)
 	}
 }
 
