@@ -356,13 +356,15 @@ the only way to see what is happening in a room it was not named in is to ask. T
 `read_room` tool returns the room's most recent archived messages (XEP-0313 MAM **last
 page**, so a result shorter than the limit means the archive holds nothing older, not that
 the page was cut short; default 30 and at most 100 entries) as a labelled transcript with
-sender, age, stanza id, and reply stamps. Two optional arguments narrow or page the read:
+sender, age, archive id, and reply stamps. Two optional arguments narrow or page the read:
 `since` bounds the window from below (an RFC 3339 stamp or a relative age such as `2h`),
-and `before` takes a stanza id — any id printed on a previous read, or the id of the
-message being answered — as an RSM cursor that walks the archive backwards past the
-newest-N window. A `before` read returns the messages **strictly older** than the cursor,
-so chaining on a printed id never repeats the cursor message; a cursor the archive does
-not recognise is reported as an error, never as an empty or newest page.
+and `before` takes an **archive id** — the `[id …]` value printed on a previous read — as an
+RSM cursor that walks the archive backwards past the newest-N window. A `before` read
+returns the messages **strictly older** than the cursor, so chaining on a printed id never
+repeats the cursor message; a cursor the archive does not recognise is reported as an
+error, never as an empty or newest page. The archive id is deliberately *not* a
+`stanza-id:`: that is the message's own id, a different value the archive does not index,
+so a cursor built from one pages to nothing.
 Only `normal` rooms are readable: the error room is not a joined room as far as the tool
 is concerned. The room list and this rule are seeded once per session in the agent's
 prompt, so the agent knows it must look rather than assume silence means an empty room.

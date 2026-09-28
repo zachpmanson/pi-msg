@@ -785,14 +785,14 @@ func formatRoomRead(room string, msgs []InboundMessage, complete bool, window st
 		if m.ReplyToID != "" {
 			reply = fmt.Sprintf(" [in reply to %s]", m.ReplyToID)
 		}
-		// The id is printed so the agent can page from it (`before`): it is the
-		// message's own id, which the server accepts as an RSM cursor (measured
-		// live 2026-09-28 — a printed id paged back to exactly the messages before
-		// it). Without it the documented cursor — "the oldest id of a previous
-		// read" — has no source at all (#117).
+		// The id printed is the MAM ARCHIVE id, because that is the only id a
+		// `before` cursor addresses (measured live 2026-09-28: the archive id is
+		// numeric while the message's `stanza-id` is a hex token, and a cursor built
+		// from the stanza id pages to nothing). Without it the documented cursor —
+		// "the id of a previous read" — has no source at all (#117).
 		id := ""
-		if m.ID != "" {
-			id = fmt.Sprintf(" [id %s]", m.ID)
+		if m.ArchiveID != "" {
+			id = fmt.Sprintf(" [id %s]", m.ArchiveID)
 		}
 		fmt.Fprintf(&sb, "\n  %s (%s)%s%s: %s", who, when, id, reply, strings.Join(strings.Fields(m.Body), " "))
 	}
@@ -1862,9 +1862,10 @@ func (b *Bridge) routingContract() string {
 	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. The owner's own rule differs: an owner room message that names nobody is addressed to every agent in the room, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
-// composePrompt assembles the text sent to pi. When the account has room
-// access it leads with a "from:"/"sender:" header naming the message's origin;
-// non-owner messages are wrapped as untrusted commentary. origin is the channel
+// composePrompt assembles the text sent to pi. A room-triggered prompt is a
+// pointer block (#58): the case, the addressing meta and a read_room call, with
+// the body left out. A 1:1 DM (or the invocation-time initial prompt) keeps the
+// "from:"/"sender:" header with the body below it. origin is the channel
 // jid (owner or room); sender is the individual's real jid (room only, when
 // known).
 //

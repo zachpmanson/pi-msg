@@ -293,6 +293,14 @@ type InboundMessage struct {
 	Direct    bool   // arrived as a 1:1 chat, not groupchat (reply goes back 1:1)
 	Room      string // source room bare JID (room mode); "" for 1:1
 	ID        string // stanza id (used as the XEP-0444 reaction target)
+	// ArchiveID is the XEP-0313 MAM result id: the id the server archived the
+	// stanza under, which is what RSM <before>/<after> cursors address. It is NOT
+	// the message's own id — measured live 2026-09-28 in testing-2: the archive id
+	// is a numeric string (`1790591200546400`) while the message id is a hex token
+	// (`23d0a58749d0e711`) that also appears as the prompt's `stanza-id:`. A
+	// cursor built from the message id is an archive id the server does not know,
+	// so it pages to nothing.
+	ArchiveID string
 	From      string // full from-JID, so a reaction routes back to that resource
 	// Stamp is the message's own timestamp (XEP-0203 delay, or the archive
 	// stamp for a MAM backfill). Zero for a live message, which has no stamp of
