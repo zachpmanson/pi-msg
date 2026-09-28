@@ -41,14 +41,15 @@ sequenceDiagram
   reply is actually being written, presence **`<show>`** (`dnd` while busy, available
   when idle), and a presence **status** label of the current activity (`thinking…`,
   `running: <cmd>`, `replying…`, `retrying…`, `listening`). When a run settles
-  without delivering anything you get a `✅ done (no reply) — your turn` nudge.
-  A reply that was written but could not be routed does **not** count as
-  delivered, so a dropped reply still raises the nudge instead of passing as an
-  answer.
+  without delivering anything you get a 🫡 reaction on the message that started
+  the run. This signal is always active, independent of the optional lifecycle
+  reactions. A reply that was written but could not be routed does **not** count
+  as delivered, so a dropped reply still gets the reaction instead of passing as
+  an answer.
 - **Empty-tail recovery**: when a run ends on a tool call with no reply text
   after it, the answer was never written and nothing can be sent. The bridge
-  asks the agent once per turn to write the reply, then falls back to the
-  `done (no reply)` nudge if that also produces nothing.
+  asks the agent once per turn to write the reply, then reacts 🫡 if that also
+  produces nothing.
 - **Unanswered-message hint**: a message that arrives mid-run is injected as a
   steer at the next yield point, usually the moment a tool result returns. The
   agent can read the new question before it writes the answer to the previous
@@ -150,7 +151,7 @@ Per-account fields:
 | `reactions` | no | `false` | XEP-0444 emoji reactions: with `rooms`, inbound acks to a room message wake the agent while idle (a mid-run ack is dropped); on 1:1 owner messages it enables lifecycle → 👀 picked up / ✅ done / ⛔ aborted, and enables the agent-driven `send_reaction` tool (see [Agent tools](#agent-tools)). Override per room |
 | `beforeAgentStartText` | no | — | literal text injected into the agent's system prompt on **every turn** (the companion extension's `before_agent_start`), after the identity line. Re-applied each turn, so a steer holds up in a long session instead of fading — the same property the equivalent Claude Code `UserPromptSubmit` hook relies on. Empty (or whitespace) means no injection; see [Per-turn prompt text](#per-turn-prompt-text-beforeagentstarttext) |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
-| `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic "done (no reply)". e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
+| `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic 🫡 unanswered-run reaction. e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
 | `mam` | no | `true` | XEP-0313 archive backfill on startup; set `false` to opt out — see [Archive backfill](#archive-backfill-mam) |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
