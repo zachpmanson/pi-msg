@@ -347,7 +347,9 @@ long-lived persona enforcing the old ones from its own context.
 
 Authority is unchanged: the owner is **canonical** (authoritative), everyone else is
 **untrusted commentary** even when addressing the agent, and the agent is told to use
-its judgment and is under no obligation to act.
+its judgment and is under no obligation to act. The room pointer block names the sender
+and whether the case is a tag, an owner broadcast, or a reply, so the trust distinction is
+carried by the meta rather than by an untrusted-commentary wrapper.
 
 **Reading a room (`read_room`).** Because unaddressed messages never reach the agent,
 the only way to see what is happening in a room it was not named in is to ask. The
@@ -386,23 +388,41 @@ anything to it — it's write-only by construction, which keeps multiple agents 
 on each other's rejected output. With no error room configured, unrouteable replies fall
 back to the owner's 1:1 as before.
 
-**Reply routing (explicit `from:`/`to:`).** When an account has room access, routing is
-fully explicit — no guessing. Each prompt the agent receives leads with a header naming
-the message's origin:
+**Room prompts are pointer blocks (#58).** When an account has room access, a
+room-triggered prompt does **not** carry the message body. It names what reached the agent
+and gives the addressing meta, and the agent pulls the text itself with `read_room`:
 
 ```
-from: <channel jid>     # the room (group msg) or the owner (DM) — reply here to answer in place
-sender: <person jid>    # room messages only, when the real JID is known — reply here to DM them
-stanza-id: <uuid>       # this message's id — reply here to answer this message specifically
-react-to: <jid>         # reactions only: where to react (room jid or sender)
-in-reply-to: <id> …     # inbound XEP-0461 only: what this message answers
+[pi-msg: room: You were tagged in a room. The text is not in this prompt.
+from: team@muc.chat.zachmanson.com     # the room — reply here to answer in place
+sender: alice@chat.zachmanson.com      # the sender's real jid — reply here to DM them
+stanza-id: 3ac658d3ac0f8e88            # this message's id — reply here to answer it specifically
+react-to: team@muc.chat.zachmanson.com # reactions only: where to react
+Check message using read_room(room="team@muc.chat.zachmanson.com", limit=15).]
+```
+
+The first sentence names the case (a tag, an owner broadcast, or a reply to our own
+message); the reaction ack is the one block that quotes anything, and quotes our own
+message being reacted to. `docs/routing.md` lists every case.
+
+A DM (or the initial `--prompt`) keeps the plain header + body form, with the message text
+below the metadata:
+
+```
+from: <owner jid>
+stanza-id: <uuid>
+in-reply-to: <id> …
 <message body>
 ```
 
 `in-reply-to:` appears when the sender's client stamped the message as a **reply**
-(XEP-0461). pi-msg resolves the stamped id against its stanza history — recording both
-directions, so a reply to our own message resolves too — and prints the author, how long
-ago it was sent, and a short quote:
+(XEP-0461) and it is delivered in the 1:1 form. pi-msg resolves the stamped id against its
+stanza history — recording both directions, so a reply to our own message resolves too —
+and prints the author, how long ago it was sent, and a short quote. In a room pointer block
+the `in-reply-to:` field carries the parent **id only**: the parent is our own message, so
+an excerpt would be our own words played back.
+
+A resolved 1:1 reply looks like this:
 
 ```
 in-reply-to: 6e7c6ed8-5485-4c01-be7a-07750c59ed27 (from zach@x/phone, 2m ago): "then send me latest master apk"

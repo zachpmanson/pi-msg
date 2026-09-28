@@ -348,7 +348,7 @@ func TestComposePrompt(t *testing.T) {
 
 	// Owner DM turn: "from:" is the owner, body follows directly (no sender
 	// line). No routing hint is appended (removed per issue #33).
-	got := b.composePrompt("hello", true, "", "zach@x.com", "", "", "", "")
+	got := b.composePrompt("hello", "zach@x.com", "", "", "", "", nil)
 	if !strings.HasPrefix(got, "from: zach@x.com\nhello") {
 		t.Errorf("dm header wrong: %q", got)
 	}
@@ -356,27 +356,24 @@ func TestComposePrompt(t *testing.T) {
 		t.Errorf("dm turn should not contain a routing hint: %q", got)
 	}
 
-	// Room turn from the owner: from: is the room, sender: is the owner's jid.
-	got = b.composePrompt("hi", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
+	// A room turn is a pointer block (#58): the body is dropped and the
+	// addressing meta lives inside the block. The old untrusted-commentary
+	// wrapper is retired.
+	got = b.composePrompt("PINEAPPLE", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
+	if !strings.Contains(got, "[pi-msg: room: You were tagged in a room.") {
+		t.Errorf("room turn should be a pointer block: %q", got)
+	}
 	if !strings.Contains(got, "from: team@muc.x.com\n") || !strings.Contains(got, "sender: zach@x.com\n") {
-		t.Errorf("room header wrong: %q", got)
+		t.Errorf("room block header wrong: %q", got)
 	}
-
-	// Commentary: wrapped as untrusted, includes nick + sender header.
-	got = b.composePrompt("help", false, "alice", "team@muc.x.com", "alice@x.com", "", "", "")
-	if !strings.Contains(got, "NON-OWNER") || !strings.Contains(got, "alice") ||
-		!strings.Contains(got, "help") || !strings.Contains(got, "sender: alice@x.com") {
-		t.Errorf("commentary framing wrong: %q", got)
+	if strings.Contains(got, "PINEAPPLE") {
+		t.Errorf("room body must not enter the prompt: %q", got)
 	}
-
-	// No buffered room chatter is prepended any more (#106): the prompt is the
-	// message, and nothing else.
-	got = b.composePrompt("do it", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
-	if strings.Contains(got, "room commentary") {
-		t.Errorf("composePrompt still prepends room commentary: %q", got)
+	if strings.Contains(got, "NON-OWNER") {
+		t.Errorf("the untrusted-commentary wrapper is retired: %q", got)
 	}
-	if !strings.Contains(got, "do it") {
-		t.Errorf("canonical room prompt wrong: %q", got)
+	if !strings.HasSuffix(got, `Check message using read_room(room="team@muc.x.com", limit=15).]`) {
+		t.Errorf("room block should end with the read_room call: %q", got)
 	}
 }
 
@@ -386,20 +383,20 @@ func TestComposePrompt(t *testing.T) {
 // optional context.
 func TestRoomsSeedOnce(t *testing.T) {
 	b := roomBridge()
-	got1 := b.composePrompt("go", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
+	got1 := b.composePrompt("go", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
 	if !strings.Contains(got1, "[pi-msg: rooms:") || !strings.Contains(got1, "team@muc.x.com") {
 		t.Errorf("first prompt should seed the room list: %q", got1)
 	}
 	if !strings.Contains(got1, "read_room") {
 		t.Errorf("the room seed should point at read_room: %q", got1)
 	}
-	got2 := b.composePrompt("again", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
+	got2 := b.composePrompt("again", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
 	if strings.Contains(got2, "[pi-msg: rooms:") {
 		t.Errorf("second prompt re-seeded the room list: %q", got2)
 	}
 	// A 1:1 account has no rooms to describe.
 	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
-	if got := b1.composePrompt("hi", true, "", "zach@x.com", "", "", "", ""); strings.Contains(got, "[pi-msg: rooms:") {
+	if got := b1.composePrompt("hi", "zach@x.com", "", "", "", "", nil); strings.Contains(got, "[pi-msg: rooms:") {
 		t.Errorf("1:1 account should not seed a room list: %q", got)
 	}
 }
@@ -407,19 +404,19 @@ func TestRoomsSeedOnce(t *testing.T) {
 func TestRoutingSeedOnce(t *testing.T) {
 	b := roomBridge() // room-mode account
 	// First prompt seeds the contract (once); room-mode only.
-	got1 := b.composePrompt("go", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
+	got1 := b.composePrompt("go", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
 	if !strings.Contains(got1, "[pi-msg: routing:") {
 		t.Errorf("first prompt should seed the routing contract: %q", got1)
 	}
 	// Subsequent prompts must NOT re-seed.
-	got2 := b.composePrompt("again", true, "", "team@muc.x.com", "zach@x.com", "", "", "")
+	got2 := b.composePrompt("again", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
 	if strings.Contains(got2, "[pi-msg: routing:") {
 		t.Errorf("second prompt re-seeded the contract: %q", got2)
 	}
 
 	// A non-room (1:1) account never seeds.
 	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
-	got := b1.composePrompt("hi", true, "", "zach@x.com", "", "", "", "")
+	got := b1.composePrompt("hi", "zach@x.com", "", "", "", "", nil)
 	if strings.Contains(got, "[pi-msg: routing:") {
 		t.Errorf("1:1 account should not seed the routing contract: %q", got)
 	}
@@ -436,7 +433,7 @@ func TestInitialPromptCompose(t *testing.T) {
 	// Fresh room-mode spawn: routingSeeded is false (an initial prompt forces a
 	// fresh session), so the first prompt seeds the routing contract once.
 	b := roomBridge()
-	got := b.composePrompt(task, true, "", b.acct.Owner, "", "", "", "")
+	got := b.composePrompt(task, b.acct.Owner, "", "", "", "", nil)
 	if !strings.Contains(got, "[pi-msg: routing:") {
 		t.Errorf("fresh room-mode initial prompt should seed the routing contract: %q", got)
 	}
@@ -449,7 +446,7 @@ func TestInitialPromptCompose(t *testing.T) {
 
 	// 1:1 account: the task is delivered verbatim, no routing contract.
 	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
-	if got := b1.composePrompt(task, true, "", "zach@x.com", "", "", "", ""); got != task {
+	if got := b1.composePrompt(task, "zach@x.com", "", "", "", "", nil); got != task {
 		t.Errorf("1:1 initial prompt = %q, want plain %q", got, task)
 	}
 }
@@ -991,8 +988,11 @@ func TestRedeliveredAddressedMessageKeepsItsVerdict(t *testing.T) {
 		Body: "and another thing", ReplyToID: "a-stanza-we-sent-before-the-restart",
 		Addressed: true,
 	})
-	if !strings.Contains(buf.String(), "and another thing") {
+	if !strings.Contains(buf.String(), "[pi-msg: room: You were tagged") || !strings.Contains(buf.String(), "stanza-id: r1") {
 		t.Errorf("a message addressed on arrival was not prompted after re-delivery: %q", buf.String())
+	}
+	if strings.Contains(buf.String(), "and another thing") {
+		t.Errorf("the body must not enter the prompt: %q", buf.String())
 	}
 
 	// Without the recorded verdict the same entry is dropped: the behaviour the
@@ -1006,7 +1006,7 @@ func TestRedeliveredAddressedMessageKeepsItsVerdict(t *testing.T) {
 		ID: "r2", Room: "team@muc.x", Nick: "peppy", From: "team@muc.x/peppy",
 		Body: "and another thing", ReplyToID: "a-stanza-we-sent-before-the-restart",
 	})
-	if strings.Contains(buf2.String(), "and another thing") {
+	if strings.Contains(buf2.String(), "[pi-msg: room: You were tagged") {
 		t.Errorf("an unclassified reply to an unknown stanza should not prompt: %q", buf2.String())
 	}
 }

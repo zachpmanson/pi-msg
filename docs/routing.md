@@ -208,6 +208,46 @@ In 1:1 mode the hint asks for no routing line at all — that account parses non
 so the literal text would reach the owner. It asks for the outstanding answers
 and offers `to: noop`, which works in both modes.
 
+## Room-triggered prompts are pointer blocks (#58)
+
+A room-triggered prompt does **not** carry the message body. The agent is told
+what reached it and given the addressing meta (the room, the sender, the stanza
+id), and pulls the text itself with the `read_room` tool. The body is reachable
+only through the archive; it never enters the prompt, so an unaddressed
+conversation cannot be reconstructed from stale prompt text and the agent must
+look rather than guess.
+
+The label is `[pi-msg: room: …]` for every case; the case lives in the first
+sentence of the commentary, not in the label:
+
+| Case | First sentence | Fields |
+|---|---|---|
+| a peer tagged us | `You were tagged in a room.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
+| several tags in one turn | `<N> messages tagged you in a room. One read covers all of them.` | `from:`, `react-to:`, then one list entry per tag |
+| the owner broadcast, naming nobody | `The owner broadcast to everyone in a room.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
+| a reaction ack | `<reactor> reacted <emoji> to your message "<our own message>"` | inline, no field lines |
+| a reply to our message | `Your message was replied to.` | `from:`, `sender:`, `stanza-id:`, `in-reply-to:` (parent id only), `react-to:` |
+
+Rules:
+
+- Commentary is sentence case; field names, the tool name and its arguments are
+  lowercase. A jid that appears in the meta lines is not repeated in the
+  commentary.
+- The `read_room` call is the last line (`limit=15`; `limit=30` for the
+  multi-tag block). It carries no failed-read clause: `read_room` already
+  reports its own failures.
+- Only the reaction ack carries an excerpt, and it is of **our own** message
+  being reacted to — the reactor reacts to something we said, so quoting the
+  reaction itself would say nothing. The excerpt comes from the stanza history,
+  which records outbound bodies at send time.
+- Every block still carries the routable stanza id, so `to: <stanza-id>` and
+  `to: <jid>` both keep working. The pointer text is bridge text, not an inbound
+  message, and is never counted as one.
+
+The multi-tag block is **not yet implemented**: each addressed message is one
+prompt today, and composing one block for several would need the run machinery
+that buffers a steer, so only the single-message cases ship (#58).
+
 ## Marking bridge text: `[pi-msg: <topic>: …]`
 
 Every prompt or block the bridge injects is wrapped in one square-bracket pair
@@ -216,10 +256,9 @@ and labelled, so the agent can always tell bridge text from a person's words:
 ```
 [pi-msg: routing: …]      the session seed, the routing nudge, the mention warning
 [pi-msg: rooms: …]        the room list and the one-addressing rule (#106)
-[pi-msg: muc: …]          the untrusted-commentary label
+[pi-msg: room: …]         a room pointer block (#58, see above)
 [pi-msg: unanswered: …]   the unanswered-message hint
 [pi-msg: recovery: …]     the empty-tail recovery prompt
-[pi-msg: reaction: …]     an inbound XEP-0444 reaction
 [pi-msg: read_room: …]    a read_room result (XEP-0313 transcript)
 [pi-msg: startup: …]      the resume volunteer turn
 ```
