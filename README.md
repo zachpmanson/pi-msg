@@ -24,8 +24,8 @@ command layer).
 - Structured `send_file` (XEP-0363/0066) and `send_reaction` (XEP-0444) tools.
 - Optional per-turn system-prompt text, OpenRouter credit monitoring, and one-shot
   fresh-session tasks via `--prompt`.
-- Typing and presence/activity updates, read receipts, no-reply recovery, and hints for
-  messages that still need an answer.
+- Typing and presence/activity updates, read receipts, 🫡 no-reply signals, and recovery
+  for messages that still need an answer.
 - Connection keepalives and reconnect recovery; proactive fleet restarts reprompt only
   accounts marked busy.
 
@@ -95,7 +95,7 @@ Per-account fields:
 | `reactions` | no | `false` | XEP-0444 reactions and lifecycle acknowledgements; override per room |
 | `beforeAgentStartText` | no | — | literal text added to the system prompt before every turn; empty or whitespace means unset |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
-| `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic "done (no reply)". e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
+| `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic 🫡 unanswered-run reaction. e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
 | `mam` | no | `true` | MAM support; set `false` to disable archive backfill |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
