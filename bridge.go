@@ -1223,17 +1223,23 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 		b.inboxDrop(reactID, "", "")
 		return
 	}
+	// Point the default reply/file destination at the message that arrived, BEFORE
+	// any dispatch. A control command produces no prompt of its own, so setting
+	// this only on the prompt path below would make a command inherit the
+	// destination of the previous turn: /export or /dump typed in the owner's 1:1
+	// would upload the session file to whatever room the agent spoke in last
+	// (zpm/beltino#56).
+	b.setTurnDest(origin, false) // the owner wrote it, so no tag is expected
 	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!")) && b.handleCommand(t) {
 		// Handled in-process: it never becomes a prompt, so nothing will ever
 		// settle for it (#104).
 		b.inboxDrop(reactID, "", "")
 		return
 	}
-	// A real prompt: point lifecycle/agent reactions at the message that drove it,
-	// and remember where a reply (or tool-driven file) should go by default.
+	// A real prompt: point lifecycle/agent reactions at the message that drove it.
+	// The reply/file destination was already set above, before the command check.
 	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
-	b.setTurnDest(origin, false) // the owner wrote it, so no tag is expected
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
 	b.rpc.Prompt(b.composePrompt(t, true, "", origin, sender, reactID, reactTo, replyTo), b.steerBehavior())
 	b.busyPresence("thinking…")
@@ -1374,10 +1380,9 @@ func (b *Bridge) handleExport(_ string) {
 	b.sendRenderedFile(slug+".html", tmpHTML)
 }
 
-// sendRenderedFile uploads a locally-rendered file to the current turn's
-// destination (falling back to the owner) via XEP-0363 HTTP Upload, the same
-// network round-trip path used by /dump. On failure it falls back to sending
-// the file content inline.
+// sendRenderedFile uploads a locally-rendered file to the owner via XEP-0363
+// HTTP Upload, the same network round-trip path used by /dump. On failure it
+// falls back to sending the file content inline.
 func (b *Bridge) sendRenderedFile(name, path string) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -1391,6 +1396,7 @@ func (b *Bridge) sendRenderedFile(name, path string) {
 // from disk — no LLM turn. It reads the session file path from pi's get_state,
 // then relays the file: verbatim JSONL by default, or a tab-separated table
 // (one record per row) when arg is "table" (or "pretty", its former name).
+// The upload always goes to the owner (never a room) — see sendDumpFile.
 func (b *Bridge) dumpSession(arg string) {
 	res, err := b.rpc.GetState(b.ctx)
 	if err != nil {
@@ -1434,24 +1440,31 @@ func (b *Bridge) dumpSession(arg string) {
 	b.sendDumpFile(name, content)
 }
 
-// sendDumpFile writes content to a temp file and uploads it to the current
-// turn's destination (falling back to the owner) via XEP-0363, so the dump
-// lands as a downloadable file rather than inline code. The upload is a
-// network round-trip, so it runs off the event loop; if it fails, the content
-// is sent inline instead (wrapped in a fence and split into self-contained
-// code blocks so it stays render-safe).
+// uploadDumpFile performs the XEP-0363 upload for a session dump or export. It
+// is a package-level seam so a test can observe the destination the upload
+// resolves to (see TestDumpUploadForcesOwnerOverRoom); production always uses
+// the XMPP bridge's SendFile.
+var uploadDumpFile = func(x *XMPPBridge, to, path string) (string, error) {
+	return x.SendFile(to, path)
+}
+
+// sendDumpFile writes content to a temp file and uploads it to the OWNER via
+// XEP-0363, so the dump lands as a downloadable file rather than inline code.
+// The destination is deliberately NOT the current turn's: a session dump or
+// export can contain 1:1 content, so it is never delivered to a MUC, even when
+// the command was typed in a room (owner decision, zpm/beltino#56). The upload
+// is a network round-trip, so it runs off the event loop; if it fails, the
+// content is sent inline instead (wrapped in a fence and split into
+// self-contained code blocks so it stays render-safe).
 func (b *Bridge) sendDumpFile(name string, content []byte) {
 	p := filepath.Join(os.TempDir(), fmt.Sprintf("pi-msg-%s-%d-%s", b.acct.Name, time.Now().UnixNano(), name))
 	if err := os.WriteFile(p, content, 0o600); err != nil {
 		b.reply("⚠️ cannot write temp file: " + err.Error())
 		return
 	}
-	dest := b.currentTurnDest()
-	if dest == "" || b.xmpp.classifyDest(dest) == destBlocked {
-		dest = b.acct.Owner
-	}
+	dest := b.acct.Owner
 	go func() {
-		if _, err := b.xmpp.SendFile(dest, p); err != nil {
+		if _, err := uploadDumpFile(b.xmpp, dest, p); err != nil {
 			b.reply(fmt.Sprintf("⚠️ file upload failed (%v); sending inline", err))
 			inline := string(content)
 			if len(inline) <= maxBody {
