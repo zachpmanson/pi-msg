@@ -1,18 +1,11 @@
 # pi-msg
 
-Drive the [Pi](https://pi.dev) coding agent **entirely from an XMPP chat client** —
-1:1 or in a group chat (MUC).
+Drive the [Pi](https://pi.dev) coding agent entirely over XMPP.
 
-`pi-msg` launches `pi --mode rpc`, then bridges Pi's JSONL event stream to XMPP
-(via [mellium.im/xmpp](https://mellium.im/xmpp)): the assistant's replies are relayed
-to you as chat messages, and your chat messages drive the agent — plain prompts **and**
-slash commands, exactly as if you'd typed them into Pi locally.
+`pi-msg` launches `pi --mode rpc`, then bridges Pi's JSONL event stream to XMPP, with command interception for system commands like `/new`.
 
-Because it runs Pi in RPC mode, commands like `/new` work over chat (an earlier
-in-process-extension version couldn't do this — `sendUserMessage` can't invoke Pi's
-command layer).
 
-## How it works
+## Comms
 
 ```mermaid
 sequenceDiagram
@@ -30,20 +23,17 @@ sequenceDiagram
 
 ## Supported features
 
-- Pi RPC bridge with sessions resumed across restarts; `/new` starts fresh, and Pi
-  slash commands work over chat.
-- XMPP 1:1 and group chat, with trigger/broadcast/reply addressing, owner-versus-peer
-  trust, threaded replies, allowlisted destinations, and `to: noop`. See
-  [routing details](docs/routing.md).
-- Room history via `read_room`; **MAM supported**. Only normal rooms are readable;
-  rooms must be non-anonymous, and error rooms are write-only.
-- Structured `send_file` (XEP-0363/0066) and `send_reaction` (XEP-0444) tools.
-- Optional per-turn system-prompt text, OpenRouter credit monitoring, and one-shot
-  fresh-session tasks via `--prompt`.
-- Typing and presence/activity updates, read receipts, 🫡 no-reply signals, and recovery
-  for messages that still need an answer.
-- Connection keepalives and reconnect recovery; proactive fleet restarts reprompt only
-  accounts marked busy.
+- Sessions resuming across restarts, `/new` to reset, 
+- Pi slash commands work over chat.
+- XMPP DMs and group chats with whitelisted destinations
+- Threaded replies, in-band routing
+- Room history via `read_room`
+- MAM supported
+- File transfer (XEP-0363/0066)
+- Reactions (XEP-0444)
+- Typing indicator
+- Presence updates
+- Read receipts
 
 ## Commands
 
@@ -66,12 +56,8 @@ Your chat messages → routed to Pi:
 | `/export` | render the current session to HTML via pi's `export_html` RPC and **send it as a file over XMPP** (XEP-0363 HTTP Upload) — **deterministic**, no agent turn; the rendered session lands as an inline, downloadable file |
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
 
-Every bridged command also works with a `!` prefix — `/new` and `!new` are
-interchangeable. A lone `!` (no command name after it) is the quick
-interrupt: it aborts the current run like `/abort`, but WITHOUT the queue
-flush — whatever you queued behind the running message is still evaluated
-next. The prefix only matters for the owner: non-owners' messages
-are always treated as literal text.
+`!` can also be used as command prefix — `/new` and `!new` are
+interchangeable.
 
 ## Configuration
 
@@ -117,26 +103,13 @@ Per-account fields:
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
 `PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
 
-## Run
+## Building
 
 ```bash
-go build -o pi-msg . && ./pi-msg     # from the repo
+make build
 ```
 
-### Supported pi version
-
-pi-msg targets **pi 0.84.0 or later**. Two reasons:
-
-- Pi 0.84.0 removed the cumulative `message` field and
-  `assistantMessageEvent.partial` from the `message_update` RPC event. pi-msg
-  drives the typing indicator and the presence label from the deltas alone
-  (`TestStreamDeltaContract` pins this), so it works on both shapes — but no
-  new code may reach for the removed fields.
-- `/abort` uses `clear_queue`, added in pi 0.84.4. On an older pi the command
-  is unknown, so pi-msg logs the failure at `info` and aborts exactly as
-  before, reporting no dropped messages.
-
-### Nix
+This is packaged for Nix.
 
 ```bash
 nix run   github:zachpmanson/pi-msg    # run the bridge
@@ -147,19 +120,11 @@ Dev shell (Go + gopls) via `nix develop`, or automatically with
 [direnv](https://direnv.net/) — the repo ships a `.envrc` (`use flake`); run
 `direnv allow` once.
 
-Set `PI_MSG_DEBUG=1` to print connection/status/stderr diagnostics. On startup the bot
-simply comes **online** in your roster (presence `listening`); on shutdown or a pi crash it
-goes **offline** with a `<status>` describing why and when — pi-msg no longer posts chat
-banners for these lifecycle events.
-
 ### On-demand spawns: `--prompt`
 
 `pi-msg --prompt "<task>"` (alias `--command`) spawns a **fresh, on-demand
-persona** with the task as its very first prompt — no separate XMPP-send hop
-needed to wake it. It intentionally does **not** resume the saved session
-(stateless by construction) and skips restart-gap replay; the reply routes to
-the owner per the normal routing contract. This backs the sentinel doer flow
-(zachpmanson/beltino#18).
+persona**. It intentionally does **not** resume the saved session
+(stateless by construction) or pick up any missed messages.
 
 The same payload can ride the existing one-shot start-directive file
 (`<config-dir>/<account>.start`, written via `writePromptDirective`):
@@ -172,12 +137,3 @@ resolve zachpmanson/pi-msg#35 and open a PR
 Either way the directive file is consumed (one-shot); an explicit `--prompt`
 flag overrides a file-delivered payload. Routine restarts that carry no prompt
 keep the existing resume + proactive/idle behavior unchanged.
-
-## Notes
-
-- Pi runs tools autonomously (no built-in approval prompts). If some other extension
-  raises a dialog (`select`/`confirm`/`input`/`editor`), pi-msg auto-dismisses it
-  (nobody's at the TUI) and tells you over chat — so approval-gated tools are declined
-  over the bridge.
-- Auth uses SASL SCRAM-SHA-256 (mellium negotiates it cleanly against ejabberd);
-  STARTTLS is required first.
