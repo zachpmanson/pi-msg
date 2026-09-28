@@ -114,9 +114,8 @@ func (b *XMPPBridge) FetchMAMLastPage(ctx context.Context, room string, max int)
 // Fetched stanzas are deliberately NOT recorded in the stanza history: a read
 // must not perturb routing state (see mamCollector.record).
 //
-// The returned page holds the messages strictly OLDER than the cursor (the RSM
-// page the server returns includes the cursor itself — see cursorPage), and an
-// unrecognised cursor is an error rather than a page of the newest messages.
+// A cursor read returns the messages the server pages to — everything strictly
+// OLDER than the cursor — and an unrecognised cursor is reported as an error.
 func (b *XMPPBridge) FetchMAMRoomWindow(ctx context.Context, room string, since time.Time, before string, max int) ([]InboundMessage, bool, error) {
 	if before == "" {
 		return b.fetchMAM(ctx, room, "", since, max, "", true, false)
@@ -124,48 +123,36 @@ func (b *XMPPBridge) FetchMAMRoomWindow(ctx context.Context, room string, since 
 	if max <= 0 {
 		max = roomReadDefaultLimit
 	}
-	// Ask for one more message than the caller wants: the cursor page ends AT the
-	// cursor stanza, and cursorPage drops that entry to hand back exactly `max`
-	// messages before it.
-	msgs, complete, err := b.fetchMAM(ctx, room, "", since, max+1, before, false, false)
+	msgs, complete, err := b.fetchMAM(ctx, room, "", since, max, before, false, false)
 	if err != nil {
 		return nil, false, err
 	}
-	page, err := cursorPage(msgs, before)
-	if err != nil {
-		return nil, false, err
-	}
-	if len(msgs) >= max+1 {
-		// The server filled the page we asked for, so history remains behind it.
-		complete = false
-	}
-	return page, complete, nil
-}
-
-// cursorPage converts an inclusive RSM page into the exclusive page the caller
-// asked for: everything strictly older than `cursor`.
-//
-// ejabberd's MAM `<before>id</before>` returns the page ENDING AT that stanza —
-// the cursor is the page's last item — not the messages before it (measured live
-// 2026-09-28: `before: <id>` with a limit of 1 returned the cursor message
-// alone). Chaining on that page's oldest id would therefore repeat one message
-// per step, so the cursor entry is dropped here.
-//
-// A page containing no stanza with the cursor id is the server's answer to an id
-// it does not recognise: it falls back to the newest page instead of failing
-// (measured live: a fabricated cursor returned the 27 newest messages under a
-// `before stanza <garbage>` label). Rendering that would end a walk backwards
-// with a page that looks valid, so it is reported as an error.
-func cursorPage(msgs []InboundMessage, cursor string) ([]InboundMessage, error) {
-	if cursor == "" {
-		return msgs, nil
-	}
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].ID == cursor {
-			return msgs[:i], nil
+	// An unknown or expired cursor is NOT an error on the server side: ejabberd
+	// answers it with the newest page instead (measured live 2026-09-28 — a
+	// fabricated cursor returned the 27 newest messages under a `before stanza
+	// <garbage>` label). That is the one failure a caller cannot detect from the
+	// page itself, so check it here: a cursor page can never contain the room's
+	// newest message, because the cursor is newer than everything on the page.
+	// Equality is therefore the signature of the fallback.
+	if len(msgs) > 0 {
+		newest, _, err := b.fetchMAM(ctx, room, "", since, 1, "", true, false)
+		if err != nil {
+			return nil, false, err
+		}
+		if cursorFallbackPage(msgs, newest) {
+			return nil, false, fmt.Errorf("cursor %q is not in this room's archive (unknown or expired stanza id)", before)
 		}
 	}
-	return nil, fmt.Errorf("cursor %q is not in the requested window (unknown or expired stanza id)", cursor)
+	return msgs, complete, nil
+}
+
+// cursorFallbackPage reports whether `page` is the newest page the server
+// substitutes for a cursor it does not recognise. A genuine cursor page holds
+// only messages strictly older than the cursor, so its newest message is the one
+// immediately before the cursor — never the room's newest. The substitution
+// always ends at the room's newest, which makes that equality the signature.
+func cursorFallbackPage(page, newest []InboundMessage) bool {
+	return len(page) > 0 && len(newest) > 0 && page[len(page)-1].ID == newest[len(newest)-1].ID
 }
 
 // fetchMAM is the shared XEP-0313 query. `before` is an optional stanza id

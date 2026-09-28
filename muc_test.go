@@ -904,30 +904,24 @@ func TestRoomReadCursor(t *testing.T) {
 	}
 }
 
-// A cursor page from the server ends AT the cursor stanza, so cursorPage drops it
-// (handing back the messages strictly older) and an unknown cursor — answered by
-// the server with the newest page rather than an error — must fail loudly instead
-// of being rendered as a valid window (#117).
-func TestCursorPage(t *testing.T) {
-	page := []InboundMessage{{ID: "p2"}, {ID: "p3"}, {ID: "p4"}, {ID: "c1"}}
-	got, err := cursorPage(page, "c1")
-	if err != nil || len(got) != 3 || got[2].ID != "p4" {
-		t.Errorf("cursor entry must be dropped: got (%v,%v)", got, err)
+// An unrecognised cursor is answered by the server with the NEWEST page rather
+// than an error, which is how a stale cursor once came back with the 27 newest
+// messages under a `before stanza <garbage>` label. That substitution is what
+// this check catches: a genuine cursor page ends strictly before the cursor, so
+// it can never end at the room's newest message (#117).
+func TestCursorFallbackPage(t *testing.T) {
+	page := []InboundMessage{{ID: "p1"}, {ID: "p2"}, {ID: "p3"}}
+	newest := []InboundMessage{{ID: "p4"}}
+	if cursorFallbackPage(page, newest) {
+		t.Error("a page ending before the newest message is a genuine cursor page")
 	}
-	// A cursor alone in the page (it is the archive's oldest message) is a valid
-	// empty read, not an error.
-	got, err = cursorPage([]InboundMessage{{ID: "c1"}}, "c1")
-	if err != nil || len(got) != 0 {
-		t.Errorf("a cursor with nothing older is an empty read: got (%v,%v)", got, err)
+	// The substitution: the page handed back for an unknown cursor ends at the
+	// room's newest message.
+	if !cursorFallbackPage([]InboundMessage{{ID: "p2"}, {ID: "p4"}}, newest) {
+		t.Error("a page ending at the newest message is the unknown-cursor substitution")
 	}
-	for _, unknown := range [][]InboundMessage{nil, {{ID: "x1"}, {ID: "x2"}}} {
-		if _, err := cursorPage(unknown, "c1"); err == nil {
-			t.Errorf("a page without the cursor must be an error: %v", unknown)
-		}
-	}
-	// No cursor: the page passes through untouched.
-	if got, err := cursorPage(page, ""); err != nil || len(got) != 4 {
-		t.Errorf("no cursor should pass the page through: got (%v,%v)", got, err)
+	if cursorFallbackPage(nil, newest) || cursorFallbackPage(page, nil) {
+		t.Error("an empty page or empty archive is not the substitution")
 	}
 }
 
