@@ -432,7 +432,7 @@ ${systemPrompt}`;
 				before: Type.Optional(
 					Type.String({
 						description:
-							"Pagination cursor: a stanza ID, typically the oldest ID from a previous read. Walks the archive backwards past the newest window. An unknown or expired ID is reported as an error rather than silently returning the newest page.",
+							"Pagination cursor: a stanza ID, typically the oldest ID printed on a previous read. Returns the messages strictly older than that ID, so a walk backwards never repeats the cursor message. An unknown or expired ID is reported as an error rather than silently returning the newest page.",
 					}),
 				),
 			}),

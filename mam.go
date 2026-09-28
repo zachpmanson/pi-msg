@@ -113,8 +113,59 @@ func (b *XMPPBridge) FetchMAMLastPage(ctx context.Context, room string, max int)
 // backwards, so repeated calls reach history older than the newest-N window.
 // Fetched stanzas are deliberately NOT recorded in the stanza history: a read
 // must not perturb routing state (see mamCollector.record).
+//
+// The returned page holds the messages strictly OLDER than the cursor (the RSM
+// page the server returns includes the cursor itself — see cursorPage), and an
+// unrecognised cursor is an error rather than a page of the newest messages.
 func (b *XMPPBridge) FetchMAMRoomWindow(ctx context.Context, room string, since time.Time, before string, max int) ([]InboundMessage, bool, error) {
-	return b.fetchMAM(ctx, room, "", since, max, before, before == "", false)
+	if before == "" {
+		return b.fetchMAM(ctx, room, "", since, max, "", true, false)
+	}
+	if max <= 0 {
+		max = roomReadDefaultLimit
+	}
+	// Ask for one more message than the caller wants: the cursor page ends AT the
+	// cursor stanza, and cursorPage drops that entry to hand back exactly `max`
+	// messages before it.
+	msgs, complete, err := b.fetchMAM(ctx, room, "", since, max+1, before, false, false)
+	if err != nil {
+		return nil, false, err
+	}
+	page, err := cursorPage(msgs, before)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(msgs) >= max+1 {
+		// The server filled the page we asked for, so history remains behind it.
+		complete = false
+	}
+	return page, complete, nil
+}
+
+// cursorPage converts an inclusive RSM page into the exclusive page the caller
+// asked for: everything strictly older than `cursor`.
+//
+// ejabberd's MAM `<before>id</before>` returns the page ENDING AT that stanza —
+// the cursor is the page's last item — not the messages before it (measured live
+// 2026-09-28: `before: <id>` with a limit of 1 returned the cursor message
+// alone). Chaining on that page's oldest id would therefore repeat one message
+// per step, so the cursor entry is dropped here.
+//
+// A page containing no stanza with the cursor id is the server's answer to an id
+// it does not recognise: it falls back to the newest page instead of failing
+// (measured live: a fabricated cursor returned the 27 newest messages under a
+// `before stanza <garbage>` label). Rendering that would end a walk backwards
+// with a page that looks valid, so it is reported as an error.
+func cursorPage(msgs []InboundMessage, cursor string) ([]InboundMessage, error) {
+	if cursor == "" {
+		return msgs, nil
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].ID == cursor {
+			return msgs[:i], nil
+		}
+	}
+	return nil, fmt.Errorf("cursor %q is not in the requested window (unknown or expired stanza id)", cursor)
 }
 
 // fetchMAM is the shared XEP-0313 query. `before` is an optional stanza id

@@ -832,22 +832,27 @@ func TestFormatRoomRead(t *testing.T) {
 
 	stamp := time.Now().Add(-3 * time.Minute)
 	msgs := []InboundMessage{
-		{Nick: "slippy", Body: "the parser   is flaky", Stamp: stamp},
-		{Nick: "peppy", Body: "on it", Stamp: stamp, ReplyToID: "abc123"},
-		{Nick: "zach", Body: "thanks", Stamp: stamp, FromOwner: true},
+		{ID: "s1", Nick: "slippy", Body: "the parser   is flaky", Stamp: stamp},
+		{ID: "p1", Nick: "peppy", Body: "on it", Stamp: stamp, ReplyToID: "abc123"},
+		{ID: "z1", Nick: "zach", Body: "thanks", Stamp: stamp, FromOwner: true},
 	}
 	got = formatRoomRead("team@muc.x", msgs, true, "newest 30")
 	if !strings.HasPrefix(got, "[pi-msg: read_room:") {
 		t.Errorf("read_room block must carry its header (the tool keys off it): %q", got)
 	}
-	if !strings.Contains(got, "slippy (3m ago): the parser is flaky") {
-		t.Errorf("sender/age/body line wrong: %q", got)
+	if !strings.Contains(got, "slippy (3m ago) [id s1]: the parser is flaky") {
+		t.Errorf("sender/age/id/body line wrong: %q", got)
 	}
-	if !strings.Contains(got, "owner (3m ago): thanks") {
+	if !strings.Contains(got, "owner (3m ago) [id z1]: thanks") {
 		t.Errorf("the owner should render as owner: %q", got)
 	}
 	if !strings.Contains(got, "[in reply to abc123]") {
 		t.Errorf("XEP-0461 stamp not surfaced: %q", got)
+	}
+	// The stanza id is what makes `before` usable: it must be printed, next to the
+	// reply stamp when there is one (#117).
+	if !strings.Contains(got, "peppy (3m ago) [id p1] [in reply to abc123]: on it") {
+		t.Errorf("stanza id must be printed alongside the reply stamp: %q", got)
 	}
 	if strings.Contains(got, "older history") {
 		t.Errorf("a complete window should not claim older history: %q", got)
@@ -896,6 +901,33 @@ func TestRoomReadCursor(t *testing.T) {
 		if _, err := roomReadCursor(bad); err == nil {
 			t.Errorf("cursor %q should be rejected", bad)
 		}
+	}
+}
+
+// A cursor page from the server ends AT the cursor stanza, so cursorPage drops it
+// (handing back the messages strictly older) and an unknown cursor — answered by
+// the server with the newest page rather than an error — must fail loudly instead
+// of being rendered as a valid window (#117).
+func TestCursorPage(t *testing.T) {
+	page := []InboundMessage{{ID: "p2"}, {ID: "p3"}, {ID: "p4"}, {ID: "c1"}}
+	got, err := cursorPage(page, "c1")
+	if err != nil || len(got) != 3 || got[2].ID != "p4" {
+		t.Errorf("cursor entry must be dropped: got (%v,%v)", got, err)
+	}
+	// A cursor alone in the page (it is the archive's oldest message) is a valid
+	// empty read, not an error.
+	got, err = cursorPage([]InboundMessage{{ID: "c1"}}, "c1")
+	if err != nil || len(got) != 0 {
+		t.Errorf("a cursor with nothing older is an empty read: got (%v,%v)", got, err)
+	}
+	for _, unknown := range [][]InboundMessage{nil, {{ID: "x1"}, {ID: "x2"}}} {
+		if _, err := cursorPage(unknown, "c1"); err == nil {
+			t.Errorf("a page without the cursor must be an error: %v", unknown)
+		}
+	}
+	// No cursor: the page passes through untouched.
+	if got, err := cursorPage(page, ""); err != nil || len(got) != 4 {
+		t.Errorf("no cursor should pass the page through: got (%v,%v)", got, err)
 	}
 }
 

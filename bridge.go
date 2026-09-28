@@ -693,16 +693,10 @@ func (b *Bridge) handleReadRoomRelay(id, room string, limit int, sinceArg, befor
 			b.rpc.RespondUIRelay(id, reason)
 			return
 		}
-		// An empty page for a cursor read means the server did not recognise the
-		// stanza id (or it has aged out of the archive), not that the room is
-		// quiet. Say so loudly: rendering "no messages" would look like a valid
-		// newest page and silently end the walk backwards.
-		if cursor != "" && len(msgs) == 0 {
-			reason := fmt.Sprintf("read_room %s failed: no archived messages before cursor %q (unknown or expired stanza id)", bare, cursor)
-			b.log("warning", reason)
-			b.rpc.RespondUIRelay(id, reason)
-			return
-		}
+		// An empty page for a cursor read is a successful read of an empty window
+		// (the cursor is the room's oldest archived message); an unrecognised
+		// cursor never reaches here, because FetchMAMRoomWindow reports it as an
+		// error rather than handing back the newest page.
 		b.rpc.RespondUIRelay(id, formatRoomRead(bare, msgs, complete, roomReadWindowLabel(limit, since, cursor)))
 	}()
 }
@@ -762,12 +756,13 @@ func roomReadWindowLabel(limit int, since time.Time, cursor string) string {
 }
 
 // formatRoomRead renders archived room messages for the model: oldest first, one
-// line each, with the sender, age and the stanza id it can be replied to. Every
-// return value starts with the `[pi-msg: read_room:` header — including the
-// empty case, which is a successful read of an empty window — because the
-// companion extension treats any other result as a failed tool call (#106
-// review). `window` names the slice read (newest N, since …, before …), so a
-// narrowed read is not mistaken for the whole recent conversation.
+// line each, with the sender, age and the stanza id it can be replied to (or
+// paged from — `before` takes any printed id). Every return value starts with
+// the `[pi-msg: read_room:` header — including the empty case, which is a
+// successful read of an empty window — because the companion extension treats
+// any other result as a failed tool call (#106 review). `window` names the slice
+// read (newest N, since …, before …), so a narrowed read is not mistaken for the
+// whole recent conversation.
 func formatRoomRead(room string, msgs []InboundMessage, complete bool, window string) string {
 	if len(msgs) == 0 {
 		return fmt.Sprintf("[pi-msg: read_room: no archived messages in %s (%s archive window).]", room, window)
@@ -790,7 +785,14 @@ func formatRoomRead(room string, msgs []InboundMessage, complete bool, window st
 		if m.ReplyToID != "" {
 			reply = fmt.Sprintf(" [in reply to %s]", m.ReplyToID)
 		}
-		fmt.Fprintf(&sb, "\n  %s (%s)%s: %s", who, when, reply, strings.Join(strings.Fields(m.Body), " "))
+		// The stanza id is printed so the agent can reply to a specific archived
+		// message AND page from it (`before`): without it the documented cursor —
+		// "the oldest id of a previous read" — has no source at all (#117).
+		id := ""
+		if m.ID != "" {
+			id = fmt.Sprintf(" [id %s]", m.ID)
+		}
+		fmt.Fprintf(&sb, "\n  %s (%s)%s%s: %s", who, when, id, reply, strings.Join(strings.Fields(m.Body), " "))
 	}
 	// The page is the newest `limit` messages, so a short result means the archive
 	// has nothing older to give, not that the page was cut short. `complete=false`
