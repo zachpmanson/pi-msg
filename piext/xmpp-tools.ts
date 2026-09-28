@@ -412,22 +412,41 @@ ${systemPrompt}`;
 			name: "read_room",
 			label: "Read room history (XMPP)",
 			description:
-				"Read the most recent messages from a group chat this bridge has joined, via the server's XEP-0313 archive (the last page, so a short result means the archive has no more history). The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns the newest N messages (default 30, max 100), oldest first, with sender, age and stanza ID. Reading does not reply to anything.",
+				"Read messages from a group chat this bridge has joined, via the server's XEP-0313 archive. Defaults to the NEWEST 30 (max 100) messages; `since` and `before` narrow the window. The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns messages oldest first, with sender, age and stanza ID. Reading does not reply to anything.",
 			promptSnippet: "Read recent history from a joined group chat",
 			promptGuidelines: [
 				"Use read_room when you need the wider room conversation — a handoff you were not named in, or context behind a message that addressed you.",
 				"Omit `room` when the account joins a single room; pass it when it joins several.",
+				"Pass `since` (an RFC 3339 stamp or a relative age like 2h) to bound the read, and `before` (the oldest stanza ID from a previous read) to page further back than the newest window.",
 				"read_room only reads. Send anything you want to say with a normal reply (a `to: <room jid>` line).",
 			],
 			parameters: Type.Object({
 				room: Type.Optional(Type.String({ description: "Room JID to read; defaults to the only joined room when the account joins one" })),
-				limit: Type.Optional(Type.Number({ description: "How many recent messages to fetch (default 30, max 100)" })),
+				limit: Type.Optional(Type.Number({ description: "How many messages to fetch (default 30, max 100)" })),
+				since: Type.Optional(
+					Type.String({
+						description:
+							"Lower bound on the window: an RFC 3339 timestamp (e.g. 2026-09-28T19:30:00+10:00) or a relative age (e.g. 2h, 90m). Omit for no lower bound.",
+					}),
+				),
+				before: Type.Optional(
+					Type.String({
+						description:
+							"Pagination cursor: a stanza ID, typically the oldest ID from a previous read. Walks the archive backwards past the newest window. An unknown or expired ID is reported as an error rather than silently returning the newest page.",
+					}),
+				),
 			}),
 			async execute(_toolCallId, params) {
-				const p = params as { room?: string; limit?: number };
+				const p = params as { room?: string; limit?: number; since?: string; before?: string };
 				const args: Record<string, unknown> = { room: p.room ?? "" };
 				if (typeof p.limit === "number" && Number.isFinite(p.limit)) {
 					args.limit = Math.trunc(p.limit);
+				}
+				if (typeof p.since === "string" && p.since.trim()) {
+					args.since = p.since.trim();
+				}
+				if (typeof p.before === "string" && p.before.trim()) {
+					args.before = p.before.trim();
 				}
 				const result = await relay("read_room", args);
 				// A successful read always starts with the pi-msg header; anything else
@@ -437,7 +456,7 @@ ${systemPrompt}`;
 				}
 				return {
 					content: [{ type: "text", text: result }],
-					details: { room: p.room ?? "", limit: args.limit },
+					details: { room: p.room ?? "", limit: args.limit, since: args.since, before: args.before },
 				};
 			},
 		});
