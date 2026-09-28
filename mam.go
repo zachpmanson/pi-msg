@@ -142,8 +142,31 @@ func (b *XMPPBridge) FetchMAMRoomWindow(ctx context.Context, room string, since 
 		if cursorFallbackPage(msgs, newest) {
 			return nil, false, fmt.Errorf("cursor %q is not in this room's archive (unknown or expired stanza id)", before)
 		}
+		return msgs, complete, nil
+	}
+	// An empty page is ambiguous, and the two meanings need different answers. A
+	// cursor at (or below) the room's oldest archived message is a successful read
+	// of an empty window; an id the archive does not hold at all pages to nothing
+	// and must not be rendered as “no messages” — measured live 2026-09-28: a
+	// cursor carrying the message id instead of the archive id quietly returned an
+	// empty window. The room's oldest archive id settles it: if the oldest stanza
+	// is not the cursor, an empty page cannot be the archive's beginning.
+	oldest, _, err := b.fetchMAM(ctx, room, "", time.Time{}, 1, "", false, false)
+	if err != nil {
+		return nil, false, err
+	}
+	if cursorEmptyPageUnknown(oldest, before) {
+		return nil, false, fmt.Errorf("cursor %q is not in this room's archive (unknown or expired stanza id)", before)
 	}
 	return msgs, complete, nil
+}
+
+// cursorEmptyPageUnknown reports whether an empty cursor page means the archive
+// does not hold the cursor: the room's oldest archived message is the cursor
+// when the page is genuinely the archive's beginning, so any other oldest id
+// means the server answered an unknown cursor with nothing.
+func cursorEmptyPageUnknown(oldest []InboundMessage, cursor string) bool {
+	return len(oldest) > 0 && oldest[0].ArchiveID != cursor
 }
 
 // cursorFallbackPage reports whether `page` is the newest page the server
