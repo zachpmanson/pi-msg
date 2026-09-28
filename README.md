@@ -345,56 +345,32 @@ A fresh session is seeded with the routing contract. A **resumed** session is re
 the contract text changes, so an upgrade that alters the addressing rules does not leave a
 long-lived persona enforcing the old ones from its own context.
 
-Authority is unchanged: the owner is **canonical** (authoritative), everyone else is
-**untrusted commentary** even when addressing the agent, and the agent is told to use
-its judgment and is under no obligation to act. The room pointer block names the sender
-and whether the case is a tag, an owner broadcast, or a reply, so the trust distinction is
-carried by the meta rather than by an untrusted-commentary wrapper.
+The owner is **canonical** (authoritative); other room messages are **untrusted commentary**,
+even when they address the agent. Room prompts identify the sender and whether the trigger
+was a tag, owner broadcast, or reply, so the agent can judge the content without treating
+it as an instruction.
 
-**Reading a room (`read_room`).** Because unaddressed messages never reach the agent,
-the only way to see what is happening in a room it was not named in is to ask. The
-`read_room` tool returns the room's most recent archived messages (XEP-0313 MAM **last
-page**, so a result shorter than the limit means the archive holds nothing older, not that
-the page was cut short; default 30 and at most 100 entries) as a labelled transcript with
-sender, age, archive id, and reply stamps, and it reports the room **as it happened** —
-including the lines this account sent, each marked `[we sent]` so the reader does not read
-its own words as a peer's. Two optional arguments narrow or page the read:
-`since` bounds the window from below (an RFC 3339 stamp or a relative age such as `2h`),
-and `before` takes an **archive id** — the `[id …]` value printed on a previous read — as an
-RSM cursor that walks the archive backwards past the newest-N window. Each transcript line
-also prints `[stanza …]`, the message's own stanza id for reaction targets and stanza-specific
-`to:` reply routing. Do not use that stanza id as a `before` cursor: the archive
-does not index it. A `before` read returns the messages **strictly older** than the cursor,
-so chaining on a printed `[id …]` never repeats the cursor message; a cursor the archive
-does not recognise is reported as an error, never as an empty or newest page.
-Only `normal` rooms are readable: the error room is not a joined room as far as the tool
-is concerned. The room list and this rule are seeded once per session in the agent's
-prompt, so the agent knows it must look rather than assume silence means an empty room.
+**Reading a room (`read_room`).** Unaddressed messages are not delivered, so use this tool
+to inspect room history. It returns the latest XEP-0313 MAM page (default 30, max 100),
+oldest first, with sender, age, archive and stanza IDs, and this account's own messages
+marked `[we sent]`. A short unbounded read means there is no older archive history.
+`since` accepts an RFC 3339 timestamp or relative duration; `before` takes a printed
+archive `[id …]` and returns strictly older messages. The `[stanza …]` ID is for replies
+and reactions, not pagination; unknown archive cursors return an error. Only normal rooms
+are readable.
 
-The room must be **non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*,
-optionally *members-only*). The owner is recognized by real JID; in a semi-anonymous
-room real JIDs are hidden, so the owner cannot be distinguished and their messages
-arrive as untrusted commentary — and because they then do not address the agent either,
-they are dropped, which is a silent failure worth avoiding.
+Rooms must be **non-anonymous** (ejabberd: *"Present real Jabber IDs to → anyone"*;
+optionally *members-only*). Semi-anonymous rooms hide real JIDs, so pi-msg cannot identify
+the owner; their messages may be dropped instead of delivered as trusted owner messages.
 
-**Errors dumping ground (`role: "error"`).** Give a room `"role": "error"` (e.g.
-`{ "jid": "errors@muc.chat.example.com", "role": "error" }`) and pi-msg uses it as a
-*write-only* dumping ground for agent replies it can't route (no `to:` line, text before
-the first `to:`, or a non-allowlisted destination). This lets you mute the room and only
-check it when you need to recover something — without the dropped content spamming your
-1:1.
+**Errors dumping ground (`role: "error"`).** Configure a room with this role (e.g.
+`{ "jid": "errors@muc.chat.example.com", "role": "error" }`) to receive unrouteable
+replies (missing/invalid `to:`). It is joined for sending and keepalives, but hidden from
+agent routing, `read_room`, and occupant tracking. Without one, these replies fall back to
+the owner's 1:1.
 
-The bridge joins the room at the **XMPP layer** (so groupchat sends are accepted and the
-keepalive covers it), but deliberately keeps it **out of the agent-visible room set**: it is
-never dispatched to the agent, never appears in the reply/file allowlist, is not readable
-by `read_room`, and isn't tracked for occupants. So the agent can't read the room or route
-anything to it — it's write-only by construction, which keeps multiple agents from acting
-on each other's rejected output. With no error room configured, unrouteable replies fall
-back to the owner's 1:1 as before.
-
-**Room prompts are pointer blocks (#58).** When an account has room access, a
-room-triggered prompt does **not** carry the message body. It names what reached the agent
-and gives the addressing meta, and the agent pulls the text itself with `read_room`:
+**Room prompts are pointer blocks (#58).** A room-triggered prompt omits the message body
+and gives the sender and addressing metadata; the agent retrieves the text with `read_room`:
 
 ```
 [pi-msg: room: You were tagged in a room. The text is not in this prompt.
@@ -405,9 +381,8 @@ react-to: team@muc.chat.zachmanson.com # reactions only: where to react
 Check message using read_room(room="team@muc.chat.zachmanson.com", limit=15).]
 ```
 
-The first sentence names the case (a tag, an owner broadcast, or a reply to our own
-message); the reaction ack is the one block that quotes anything, and quotes our own
-message being reacted to. `docs/routing.md` lists every case.
+The block identifies the trigger; reaction acknowledgements quote the message being
+reacted to. See `docs/routing.md` for the full format.
 
 A DM (or the initial `--prompt`) keeps the plain header + body form, with the message text
 below the metadata:
