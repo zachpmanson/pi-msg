@@ -48,6 +48,7 @@ Your chat messages → routed to Pi:
 | `/model <provider/id>` or `/model <search>` | `set_model` |
 | `/models` | list available models with the current one marked (no LLM turn) |
 | `/session` | session stats — id, file, message counts, tokens, cost (no LLM turn) |
+| `/status` | same session and context stats, explicitly not Codex plan quota data (no LLM turn) |
 | `/name [name]` | show the session display name, or set it |
 | `/think <off\|low\|medium\|high\|…>` | `set_thinking_level` |
 | `/abort` (or `/stop`) | `clear_queue`, then `abort` — stops the run AND flushes pi's queued messages: a steer that landed mid-run can't start a fresh run the instant the aborted one stops. The reply names how many queued messages it dropped. |

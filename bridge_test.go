@@ -48,6 +48,7 @@ func TestSplitCommand(t *testing.T) {
 		{"/COMPACT  keep the api notes ", "compact", "keep the api notes"},
 		{"!new", "new", ""},
 		{"!session", "session", ""},
+		{"/status", "status", ""},
 		{"!model deepseek/", "model", "deepseek/"},
 		{"!", "", ""}, // bare prefix → empty name; handleCommand special-cases it
 	}
