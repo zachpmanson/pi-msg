@@ -228,47 +228,6 @@ anything sent to a room while the bridge was down is simply lost.
 - **Skipped for on-demand spawns** (`--prompt`), matching the replay path: a
   stateless doer starts with only its task, not stale chat.
 
-## Durable inbound queue
-
-Inbound messages are recorded before they are handed to pi, and acknowledged once
-the run that took them in has settled:
-
-- **Append-before-prompt** — every inbound message (reactions aside) is written to
-  `<config-dir>/<account>.inbox.jsonl` from one hook ahead of the direct, room and
-  commentary paths.
-- **Ack-at-settle** — a settled run acknowledges the messages it took in: an
-  entry it was handed (pi has it) that the run then read — a message entered its
-  context after that hand-off, whether the prompt itself, a steer pi injected at
-  its yield point, or the assistant's next turn. Entries that were never handed
-  to pi at all are acknowledged once they have been pending longer than 5s, which
-  matters for a run that ends the moment a message arrives. An entry handed over
-  but never read (a steer pi did not yield, or a message that landed as the run
-  finished) stays pending, so a stop before the next run still re-delivers it
-  (issues [#96](https://github.com/zachpmanson/pi-msg/issues/96),
-  [#104](https://github.com/zachpmanson/pi-msg/issues/104)).
-- **Never queued** — a message that cannot become a prompt is dropped instead of
-  waiting for a settle that will never come: an unaddressed room message (see
-  [Group chat](#group-chat-muc)), a bridge command handled in-process, a dropped
-  own-echo, an empty body. These used to sit in the file and be announced as
-  unacknowledged catch-up on every restart
-  ([#104](https://github.com/zachpmanson/pi-msg/issues/104)).
-- **Re-delivery at start** — anything still unacknowledged is handed to the
-  resumed session with the rest of the catch-up, re-classified exactly as it was
-  the first time (a room message that no longer addresses the agent is dropped
-  rather than prompted), and marked with a note saying it may repeat something
-  already in context.
-
-This is what makes a **steer survivable**. pi injects a steered message at the next
-tool yield, so a stop before that yield — a deploy, a crash, a reboot — used to
-discard an instruction that the server had already delivered and so would never
-replay: on 2026-09-22 an owner instruction steered into a running turn was killed
-by a config switch 55 seconds later and never arrived. Delivery is
-**at-least-once**, not exactly-once, but the window is bounded by a turn rather
-than left open: only a message the settling run never read survives it, so a
-restart cannot re-announce an instruction the agent already acted on. In steady
-state the file is absent — a settle rewrites whatever remains — and a run that
-never settles is bounded at 500 entries.
-
 ## Group chat (MUC)
 
 Set `rooms` on an account and pi-msg **also** joins each one. **The owner's 1:1 stays
