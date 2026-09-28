@@ -785,9 +785,11 @@ func formatRoomRead(room string, msgs []InboundMessage, complete bool, window st
 		if m.ReplyToID != "" {
 			reply = fmt.Sprintf(" [in reply to %s]", m.ReplyToID)
 		}
-		// The stanza id is printed so the agent can reply to a specific archived
-		// message AND page from it (`before`): without it the documented cursor —
-		// "the oldest id of a previous read" — has no source at all (#117).
+		// The id is printed so the agent can page from it (`before`): it is the
+		// message's own id, which the server accepts as an RSM cursor (measured
+		// live 2026-09-28 — a printed id paged back to exactly the messages before
+		// it). Without it the documented cursor — "the oldest id of a previous
+		// read" — has no source at all (#117).
 		id := ""
 		if m.ID != "" {
 			id = fmt.Sprintf(" [id %s]", m.ID)
