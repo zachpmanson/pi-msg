@@ -428,6 +428,55 @@ func TestReplayWindowMarkers(t *testing.T) {
 	}
 }
 
+// TestBusyMarkerTracksWorkInFlight covers the per-account busy marker that the
+// fleet deploy reads: present while a run streams or a background process
+// runs, absent once the agent is idle, and cleared at startup after a previous
+// process died mid-run.
+func TestBusyMarkerTracksWorkInFlight(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PI_MSG_CONFIG", filepath.Join(dir, "config.json"))
+	acct := ResolvedAccount{Name: "slippy", Owner: "zach@x"}
+	marker := busyMarkerPath(acct.Name)
+
+	clearBusyMarker(acct.Name)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("marker should start absent, stat err = %v", err)
+	}
+
+	b := NewBridge(acct, false)
+	b.setStreaming(true)
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("busy marker missing while a run streams: %v", err)
+	}
+	b.setStreaming(false)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("busy marker should be gone once idle")
+	}
+
+	// A background process alone counts as busy. b.xmpp is nil here and the
+	// marker must not depend on presence.
+	b.setBgProcesses(1)
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("busy marker missing with a background process running: %v", err)
+	}
+	b.setStreaming(true) // a run starts while the process still runs
+	b.setStreaming(false)
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("marker dropped while a background process still runs: %v", err)
+	}
+	b.setBgProcesses(0)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("busy marker should be gone with no work in flight")
+	}
+
+	// A stale marker from a process killed mid-run is removed at startup.
+	markBusy(nil, acct.Name, true)
+	clearBusyMarker(acct.Name)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("clearBusyMarker should remove the stale marker")
+	}
+}
+
 func TestStartDirectiveRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "config.json")

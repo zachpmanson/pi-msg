@@ -75,6 +75,7 @@ type Bridge struct {
 
 	mu             sync.Mutex
 	streamingRun   bool
+	busyMarked     bool // on-disk <acct>.busy reflects work in flight (see syncBusyMarker)
 	repliedThisRun bool
 	shuttingDown   bool
 	routingNudges  int           // mis-routed-reply corrections sent this user turn (bounded)
@@ -257,6 +258,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// "awake" for a fresh start.
 	kind, dirPayload := loadStartDirective(b.acct.Name)
 	b.startDir = kind
+	// A marker left by a previous process that died mid-run describes a state
+	// that no longer exists: this launch is idle until its first run starts.
+	clearBusyMarker(b.acct.Name)
 	if b.initialPrompt == "" {
 		b.initialPrompt = dirPayload // "prompt" directive payload; "" unless kind was StartPrompt
 	}
@@ -3874,6 +3878,7 @@ func (b *Bridge) setBgProcesses(n int) {
 	b.bgProcesses = n
 	streaming := b.streamingRun
 	b.mu.Unlock()
+	b.syncBusyMarker()
 	if !changed || b.xmpp == nil {
 		return
 	}
@@ -4096,10 +4101,30 @@ func (b *Bridge) lifecycleReact(emojis ...string) {
 	b.xmpp.SendReaction(to, id, emojis...)
 }
 
-func (b *Bridge) setStreaming(v bool) { b.mu.Lock(); b.streamingRun = v; b.mu.Unlock() }
-func (b *Bridge) streaming() bool     { b.mu.Lock(); defer b.mu.Unlock(); return b.streamingRun }
-func (b *Bridge) setReplied(v bool)   { b.mu.Lock(); b.repliedThisRun = v; b.mu.Unlock() }
-func (b *Bridge) replied() bool       { b.mu.Lock(); defer b.mu.Unlock(); return b.repliedThisRun }
+func (b *Bridge) setStreaming(v bool) {
+	b.mu.Lock()
+	b.streamingRun = v
+	b.mu.Unlock()
+	b.syncBusyMarker()
+}
+
+// syncBusyMarker keeps the on-disk busy marker in step with the agent's real
+// state: the file is present while a run streams or a background process runs,
+// absent once the agent is idle. `deploy-service pi-msg --proactive` reads it
+// to decide which accounts to reprompt on resume; an idle agent is left silent.
+func (b *Bridge) syncBusyMarker() {
+	b.mu.Lock()
+	busy := b.streamingRun || b.bgProcesses > 0
+	changed := busy != b.busyMarked
+	b.busyMarked = busy
+	b.mu.Unlock()
+	if changed {
+		markBusy(b.log, b.acct.Name, busy)
+	}
+}
+func (b *Bridge) streaming() bool   { b.mu.Lock(); defer b.mu.Unlock(); return b.streamingRun }
+func (b *Bridge) setReplied(v bool) { b.mu.Lock(); b.repliedThisRun = v; b.mu.Unlock() }
+func (b *Bridge) replied() bool     { b.mu.Lock(); defer b.mu.Unlock(); return b.repliedThisRun }
 
 // steerBehavior returns "steer" when a run is already in flight, else "".
 func (b *Bridge) steerBehavior() string {
