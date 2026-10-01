@@ -314,7 +314,7 @@ func TestAmbientRoomChatterIsNotQueued(t *testing.T) {
 	// a bridge-handled command take the same drop path (the command half is
 	// unit-tested in TestInboxDropsMessagesThatNeverPrompt).
 	b.inbox.append(inboxEntry{ID: "c1", From: "zach@x/phone", Body: "   ", Direct: true, FromOwner: true})
-	b.handleCanonical("   ", "", "zach@x", "", "", "c1", "", nil)
+	b.handleCanonical("   ", "", "zach@x", "", "", "c1", "", nil, false)
 	if n := b.inbox.len(); n != 1 {
 		t.Errorf("a handled command left %d entries, want the count unchanged", n)
 	}

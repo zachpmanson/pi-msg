@@ -1609,7 +1609,7 @@ func TestCommandReplyUsesItsOwnOrigin(t *testing.T) {
 
 	// ...then an owner command arrives in the 1:1. The destination must move to
 	// the owner, not stay in the room.
-	b.handleCanonical("/interrupt", "", b.acct.Owner, "", "", "", "", nil)
+	b.handleCanonical("/interrupt", "", b.acct.Owner, "", "", "", "", nil, false)
 	if got := b.currentTurnDest(); got != b.acct.Owner {
 		t.Errorf("1:1 command turnDest = %q, want owner %q", got, b.acct.Owner)
 	}
@@ -1619,7 +1619,7 @@ func TestCommandReplyUsesItsOwnOrigin(t *testing.T) {
 
 	// And the reverse: a command typed in a room replies in that room.
 	b.setTurnDest(b.acct.Owner, false)
-	b.handleCanonical("/interrupt", "zach", "team@muc.x.com", "", "", "", "", nil)
+	b.handleCanonical("/interrupt", "zach", "team@muc.x.com", "", "", "", "", nil, false)
 	if got := b.currentTurnDest(); got != "team@muc.x.com" {
 		t.Errorf("room command turnDest = %q, want room", got)
 	}

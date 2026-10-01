@@ -154,7 +154,35 @@ type Bridge struct {
 	// only a peer handoff is warned about an untagged room reply — a status
 	// report written for the owner alone is not a mistake.
 	peerRun bool
+
+	// pendingMarkers are XEP-0333 "displayed" markers awaiting the moment pi
+	// actually starts the matching user message (#73). A 1:1 owner stanza is
+	// accepted (and possibly queued as a steer) before pi reads it, so the
+	// marker is registered here with the exact prompt text handed to pi and
+	// sent only when a user `message_start` carries that text. Guarded by mu.
+	pendingMarkers []pendingMarker
+	// markerSender lets tests observe the deferred marker without a live XMPP
+	// session. Nil in production, where SendDisplayedMarker goes to the
+	// transport.
+	markerSender func(to, id string) error
 }
+
+// pendingMarker is one deferred XEP-0333 "displayed" marker: the exact prompt
+// text handed to pi, and the message it acknowledges (the stanza id and the
+// full from-JID it routes back to). The prompt text is the correlation key —
+// pi's RPC `message_start` echoes the prompt it accepted, and there is no
+// other identifier on the wire (#73).
+type pendingMarker struct {
+	prompt string
+	to     string
+	id     string
+}
+
+// maxPendingMarkers bounds the deferred-marker queue. A marker whose prompt
+// never starts (a steer pi never yielded, or one cleared by /abort) stays
+// pending by design, so the queue needs a ceiling rather than an unbounded
+// leak. Oldest entries are dropped first.
+const maxPendingMarkers = 64
 
 // cascadeCap bounds consecutive commentary-triggered turns with no intervening
 // owner (canonical) message, so two agents addressing each other cannot loop
@@ -559,6 +587,10 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 			b.log("info", "pi: user message_start (prompt entered context)")
 		}
 		b.noteRunActivity()
+		// The same moment is when a deferred XEP-0333 "displayed" marker becomes
+		// true: pi has actually started the user message, not merely accepted or
+		// queued it (#73).
+		b.ackDisplayedMarker(ev)
 	case "message_end":
 		msg := ev.Obj("message")
 		if msg == nil || msg.Str("role") != "assistant" {
@@ -1005,7 +1037,7 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	if m.Direct {
 		// Owner 1:1: origin is the owner; no separate sender. The reaction target
 		// is this message (routed to its full from-JID).
-		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil)
+		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil, m.Markable)
 		return
 	}
 	b.handleRoom(m)
@@ -1333,7 +1365,7 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 		if b.acct.ReactionsFor(m.Room) {
 			reactTo = m.Room
 		}
-		b.handleCanonical(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID, b.replyContext(m), b.roomNoticeFor(m))
+		b.handleCanonical(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID, b.replyContext(m), b.roomNoticeFor(m), false)
 	case actionCommentary:
 		reactTo := ""
 		if b.acct.ReactionsFor(m.Room) {
@@ -1371,8 +1403,10 @@ func senderName(nick, sender, origin string) string {
 // jid the message arrived on (owner or room); sender is the individual (room
 // only), both surfaced to the agent for explicit reply routing. nick is the
 // sender's occupant nick in a room, "" in a 1:1 — it only names the sender in
-// the unanswered-message hint's history.
-func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, replyTo string, notice *roomNotice) {
+// the unanswered-message hint's history. markable is the inbound XEP-0333 flag
+// for a 1:1 owner message; with it, the deferred "displayed" marker is
+// registered against the prompt so it fires only when pi reads the message.
+func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, replyTo string, notice *roomNotice, markable bool) {
 	t := strings.TrimSpace(text)
 	if t == "" {
 		b.inboxDrop(reactID, "", "")
@@ -1396,8 +1430,90 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
-	b.rpc.Prompt(b.composePrompt(t, origin, sender, reactID, reactTo, replyTo, notice), b.steerBehavior())
+	prompt := b.composePrompt(t, origin, sender, reactID, reactTo, replyTo, notice)
+	// A markable 1:1 message is acknowledged only once pi starts it: register the
+	// marker against the exact prompt text and let the matching user
+	// `message_start` fire it (#73). A message with no usable stanza id, or a
+	// room message, carries no marker — the previous policy, unchanged.
+	b.promptMarked(prompt, markable, reactTo, reactID)
 	b.busyPresence("thinking…")
+}
+
+// promptMarked hands a prompt to pi and, for a markable 1:1 owner message,
+// registers a deferred XEP-0333 "displayed" marker against it. The marker is
+// not sent now: it waits for the user `message_start` that proves pi has read
+// the message, so a stanza merely accepted or queued as a steer is not marked
+// read (#73).
+func (b *Bridge) promptMarked(prompt string, markable bool, to, id string) {
+	if markable {
+		b.addPendingMarker(prompt, to, id)
+	}
+	b.rpc.Prompt(prompt, b.steerBehavior())
+}
+
+// addPendingMarker queues a deferred "displayed" marker keyed by the exact
+// prompt text handed to pi. An empty target or stanza id cannot be acknowledged
+// on the wire, so it is not queued at all (the same guard the old
+// accept-time receipt had).
+func (b *Bridge) addPendingMarker(prompt, to, id string) {
+	if prompt == "" || to == "" || id == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pendingMarkers = append(b.pendingMarkers, pendingMarker{prompt: prompt, to: to, id: id})
+	if over := len(b.pendingMarkers) - maxPendingMarkers; over > 0 {
+		b.pendingMarkers = b.pendingMarkers[over:]
+		b.log("warning", fmt.Sprintf("pending chat markers over %d; dropped the oldest %d", maxPendingMarkers, over))
+	}
+}
+
+// ackDisplayedMarker fires the deferred marker for a user message pi has just
+// started. It matches on the message content — the RPC `message_start` echoes
+// the prompt text and carries no other identifier — and only for a user-role
+// message, so an assistant turn or an unrelated run can never acknowledge a
+// pending stanza. A start whose text matches nothing is left alone.
+func (b *Bridge) ackDisplayedMarker(ev Event) {
+	msg := ev.Obj("message")
+	if msg == nil || msg.Str("role") != "user" {
+		return
+	}
+	prompt := extractText(msg["content"])
+	if prompt == "" {
+		return
+	}
+	b.mu.Lock()
+	idx := -1
+	for i := range b.pendingMarkers {
+		if b.pendingMarkers[i].prompt == prompt {
+			idx = i
+			break
+		}
+	}
+	var m pendingMarker
+	if idx >= 0 {
+		m = b.pendingMarkers[idx]
+		b.pendingMarkers = append(b.pendingMarkers[:idx], b.pendingMarkers[idx+1:]...)
+	}
+	b.mu.Unlock()
+	if idx < 0 {
+		return
+	}
+	if err := b.sendDisplayedMarker(m.to, m.id); err != nil {
+		b.log("warning", "chat marker failed: "+err.Error())
+	}
+}
+
+// sendDisplayedMarker sends one XEP-0333 marker through the transport, or the
+// test hook when one is installed.
+func (b *Bridge) sendDisplayedMarker(to, id string) error {
+	if b.markerSender != nil {
+		return b.markerSender(to, id)
+	}
+	if b.xmpp == nil {
+		return fmt.Errorf("no xmpp transport")
+	}
+	return b.xmpp.SendDisplayedMarker(to, id)
 }
 
 // dispatchCommentary sends a non-owner addressed message as a room pointer
@@ -4458,7 +4574,7 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
 		b.xmpp.markSeen(m.ID)
 		b.noteInboundHandled()
 		if m.Direct {
-			b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil)
+			b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil, m.Markable)
 		} else {
 			b.handleRoom(m)
 		}
@@ -4515,7 +4631,7 @@ func (b *Bridge) deliverInbox(e inboxEntry) {
 	}
 	m.Body = strings.TrimSpace(m.Body) + "\n\n" + inboxNote
 	if m.Direct {
-		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil)
+		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil, m.Markable)
 		return
 	}
 	b.handleRoom(m)
@@ -4595,6 +4711,7 @@ func (b *Bridge) inboxAppend(m InboundMessage) {
 		Direct:    m.Direct,
 		Addressed: true,
 		ReplyToID: m.ReplyToID,
+		Markable:  m.Markable,
 		At:        time.Now(),
 	})
 }

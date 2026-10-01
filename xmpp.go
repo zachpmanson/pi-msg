@@ -330,6 +330,12 @@ type InboundMessage struct {
 	// in-process stanza history holds that id, and a restart empties it — so the
 	// verdict travels with the message instead of being re-derived (#106 review).
 	Addressed bool
+
+	// Markable carries the inbound XEP-0333 <markable/> flag for a 1:1 owner
+	// message, so the deferred "displayed" marker can be sent once the message
+	// actually enters pi's context (see Bridge.ackDisplayedMarker, #73). It is
+	// dropped for room traffic, which never sends chat markers.
+	Markable bool
 }
 
 // XMPPBridge owns a single account's XMPP connection: it maintains a
@@ -1165,6 +1171,7 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 			b.bufferReplay(InboundMessage{
 				Body: m.body, RealJID: b.ownerBare, FromOwner: true,
 				Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp,
+				Markable: m.markable,
 			})
 			return
 		}
@@ -1182,13 +1189,15 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if m.id != "" {
 		b.recordInboundMessage(m.id, m.from, m.body, true)
 	}
-	// The agent is about to take this in — acknowledge it as read/delivered.
-	b.sendReceipts(m)
+	// The "displayed" chat marker is NOT sent here: accepting or queueing the
+	// stanza is not the same as pi reading it. Markable travels with the message
+	// so the bridge can send the marker once the matching pi user message has
+	// actually started (#73).
 	if m.markable && m.id != "" {
 		b.log("info", fmt.Sprintf("chat marker: inbound stanza dispatched to bridge stanza_id=%q", m.id))
 	}
 	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp, Reactions: m.reactions, ReactionID: m.reactionFor,
-		ReplyToID: m.replyToID, ReplyToJID: m.replyToJID})
+		ReplyToID: m.replyToID, ReplyToJID: m.replyToJID, Markable: m.markable})
 }
 
 // dispatchRoom applies groupchat guards and forwards room messages to onMsg,
@@ -1651,25 +1660,25 @@ func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) e
 	return b.encode(ctx, session, msg)
 }
 
-// sendReceipts acknowledges an accepted 1:1 owner message with a single
-// XEP-0333 "displayed" chat marker if the message was markable — a genuine
-// read receipt, since the agent is about to act on it. Sent to the message's
-// full from-JID so it routes back to the originating resource. Only one ack is
-// sent per message (a lone XEP-0333 marker, not both a delivery receipt AND a
-// marker), so chat clients don't show a doubled acknowledgment. Best-effort;
-// failures are logged, not fatal.
-func (b *XMPPBridge) sendReceipts(m incomingMsg) {
-	if m.id == "" || m.from == "" {
-		return
+// SendDisplayedMarker acknowledges a 1:1 owner message with a single XEP-0333
+// "displayed" chat marker. Sent to the message's full from-JID so it routes
+// back to the originating resource. Only one ack is sent per message (a lone
+// XEP-0333 marker, not both a delivery receipt AND a marker), so chat clients
+// don't show a doubled acknowledgment. The caller decides WHEN — the bridge
+// defers this until pi has actually started the corresponding user message, so
+// a stanza that is merely accepted or queued is not marked read (#73).
+// Best-effort; failures are logged by the caller, not fatal.
+func (b *XMPPBridge) SendDisplayedMarker(to, id string) error {
+	if to == "" || id == "" {
+		return nil
 	}
-	if m.markable {
-		b.log("info", fmt.Sprintf("chat marker: XEP-0333 displayed send start stanza_id=%q", m.id))
-		if err := b.encodeReceipt(m.from, chatMarkersNS, "displayed", m.id); err != nil {
-			b.log("warning", fmt.Sprintf("chat marker: XEP-0333 displayed send failed stanza_id=%q: %v", m.id, err))
-			return
-		}
-		b.log("info", fmt.Sprintf("chat marker: XEP-0333 displayed sent stanza_id=%q", m.id))
+	b.log("info", fmt.Sprintf("chat marker: XEP-0333 displayed send start stanza_id=%q", id))
+	if err := b.encodeReceipt(to, chatMarkersNS, "displayed", id); err != nil {
+		b.log("warning", fmt.Sprintf("chat marker: XEP-0333 displayed send failed stanza_id=%q: %v", id, err))
+		return err
 	}
+	b.log("info", fmt.Sprintf("chat marker: XEP-0333 displayed sent stanza_id=%q", id))
+	return nil
 }
 
 // encodeReceipt sends a bodyless message to `to` carrying a single ack element
