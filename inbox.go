@@ -284,6 +284,11 @@ func (in *inbox) ackSettled(p ackPolicy) int {
 	for _, e := range in.entries {
 		consumed := !e.deliveredAt.IsZero() && !p.LastActive.IsZero() && !p.LastActive.Before(e.deliveredAt)
 		if consumed || p.Now.Sub(e.At) >= inboxAckGrace {
+			reason := "grace_period"
+			if consumed {
+				reason = "run_activity_after_delivery"
+			}
+			in.logf("info", fmt.Sprintf("inbox: acknowledged stanza_id=%q reason=%s", e.ID, reason))
 			acked++
 			continue
 		}

@@ -555,6 +555,9 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// injected at its yield point, or the assistant's next turn). Anything
 		// handed to pi before this moment has been read, which is exactly what
 		// lets the settle acknowledge it without waiting out the grace (#104).
+		if msg := ev.Obj("message"); msg != nil && msg.Str("role") == "user" {
+			b.log("info", "pi: user message_start (prompt entered context)")
+		}
 		b.noteRunActivity()
 	case "message_end":
 		msg := ev.Obj("message")
@@ -4529,6 +4532,7 @@ func (b *Bridge) ackInboxSettled() {
 		return
 	}
 	p := ackPolicy{Now: time.Now(), LastActive: b.lastRunActivity()}
+	b.log("info", fmt.Sprintf("inbox: run settled; pending=%d", b.inbox.len()))
 	if n := b.inbox.ackSettled(p); n > 0 {
 		b.log("info", fmt.Sprintf("inbox: acknowledged %d message(s)", n))
 	}
@@ -4541,7 +4545,9 @@ func (b *Bridge) inboxMarkDelivered(id string) {
 	if b.inbox == nil || id == "" {
 		return
 	}
-	b.inbox.markDelivered(id, "", "", time.Now())
+	if n := b.inbox.markDelivered(id, "", "", time.Now()); n > 0 {
+		b.log("info", fmt.Sprintf("inbox: prompt dispatch starting stanza_id=%q", id))
+	}
 }
 
 // inboxDrop removes a message that will never become a prompt — an unaddressed

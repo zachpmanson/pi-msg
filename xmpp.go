@@ -1184,6 +1184,9 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	}
 	// The agent is about to take this in — acknowledge it as read/delivered.
 	b.sendReceipts(m)
+	if m.markable && m.id != "" {
+		b.log("info", fmt.Sprintf("chat marker: inbound stanza dispatched to bridge stanza_id=%q", m.id))
+	}
 	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp, Reactions: m.reactions, ReactionID: m.reactionFor,
 		ReplyToID: m.replyToID, ReplyToJID: m.replyToJID})
 }
@@ -1660,9 +1663,12 @@ func (b *XMPPBridge) sendReceipts(m incomingMsg) {
 		return
 	}
 	if m.markable {
+		b.log("info", fmt.Sprintf("chat marker: XEP-0333 displayed send start stanza_id=%q", m.id))
 		if err := b.encodeReceipt(m.from, chatMarkersNS, "displayed", m.id); err != nil {
-			b.log("warning", "chat marker failed: "+err.Error())
+			b.log("warning", fmt.Sprintf("chat marker: XEP-0333 displayed send failed stanza_id=%q: %v", m.id, err))
+			return
 		}
+		b.log("info", fmt.Sprintf("chat marker: XEP-0333 displayed sent stanza_id=%q", m.id))
 	}
 }
 
