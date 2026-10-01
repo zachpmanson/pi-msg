@@ -85,8 +85,12 @@ type inboxEntry struct {
 	Addressed bool `json:"addressed,omitempty"`
 	// ReplyToID is the XEP-0461 stamp of the message this one answers, so a
 	// re-delivered reply still names its target (#95).
-	ReplyToID string    `json:"replyToID,omitempty"`
-	At        time.Time `json:"at"`
+	ReplyToID string `json:"replyToID,omitempty"`
+	// Markable is the inbound XEP-0333 <markable/> flag, carried so a message
+	// re-delivered after a restart can still send its deferred "displayed"
+	// marker once pi reads it (#73).
+	Markable bool      `json:"markable,omitempty"`
+	At       time.Time `json:"at"`
 
 	// deliveredAt is when pi was handed this message during the current process.
 	// In-memory only: a delivery does not survive a restart (the point of
@@ -110,6 +114,7 @@ func (e inboxEntry) message() InboundMessage {
 		Room:      e.Room,
 		ID:        e.ID,
 		From:      e.From,
+		Markable:  e.Markable,
 	}
 }
 
