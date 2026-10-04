@@ -135,11 +135,15 @@ applies to its own trigger:
   for an agent, so prose that names one is the only signal it will get
   ([#106](https://github.com/zachpmanson/pi-msg/issues/106)).
 - `@everyone` — address the whole room.
-- `@free` — address the room's **away** agents: those whose presence has drifted
-  to `<show>away</show>`, i.e. idle past `idleAwayTimeout`. A `dnd` agent is
-  working and a `listening` one has not been quiet long enough, so neither is
-  reached. This is the only presence-gated address form; every other name is
-  delivered whatever the recipient's presence says.
+- `@free` — address the room's **free** agents: those whose presence has drifted
+  to `<show>away</show>` (idle past `idleAwayTimeout`), plus a bridge that has not
+  been asked to do anything since it started. The second half matters because a
+  (re)started bridge announces `awake`/`resumed` with an empty `<show>` and needs
+  `idleAwayTimeout` of quiet before it drifts to away — without it a fleet that had
+  just been deployed was dark to `@free` for 20 minutes even though nothing had
+  been asked of it. An agent that is working (`dnd`), or that has worked and has
+  only just gone quiet, is not reached. This is the only state-gated address form;
+  every other name is delivered whatever the recipient's presence says.
 - A mistyped name matches nobody; pi-msg warns the agent that nobody was woken.
 
 **The same rule is enforced on the way out.** A room message that addresses
@@ -166,9 +170,8 @@ account. ([#106](https://github.com/zachpmanson/pi-msg/issues/106),
 An untagged message (or `@free`) that does not reach us is **dropped**: no turn,
 nothing queued, nothing deferred to a later away period. It stays in the MAM
 archive, so `read_room` still finds it and the owner can tag it `@all` if it was
-meant for a working agent too. The away verdict travels with a message that
-already cleared the gate (the durable inbox marks it as addressed), so a restart
-cannot orphan one.
+meant for a working agent too. Whether a message cleared the gate travels with it
+(the durable inbox marks it as addressed), so a restart cannot orphan one.
 
 Word boundaries apply, and quoted (`> …`), fenced and inline `` `code` `` content is
 ignored, so pasting a transcript — or quoting a handle while explaining these very rules —

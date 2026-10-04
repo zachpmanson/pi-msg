@@ -122,6 +122,7 @@ type Bridge struct {
 	hintPending       bool
 	idleSince         time.Time // when the agent last became idle; zero while a run is in flight
 	awayAnnounced     bool      // the away transition has been announced this idle period
+	ranSinceStart     bool      // a run has started on this bridge (see freeForSummons)
 	lastAwayStatus    string    // the last pithy activity shown while away (skip repeats across periods)
 	bgProcesses       int       // background processes pi has running (relayed by the pi-processes extension)
 	pendingHeartbeats []string  // long-running-process alarms queued while a run was in flight
@@ -489,6 +490,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 	switch ev.Type() {
 	case "agent_start":
 		b.setStreaming(true)
+		b.markRan() // this bridge has work behind it now, so @free no longer reaches it (#130)
 		b.setReplied(false)
 		b.setHandleWarned(false)
 		b.setUntaggedWarned(false)
@@ -1189,9 +1191,10 @@ const (
 // takes a turn, or it does not and is dropped entirely (#106). There is no third
 // tier — the ambient buffer that used to hold unaddressed chatter is gone.
 //
-// @free is the one address form gated on our own presence (#130). It summons the
-// room's away agents and nobody else, so a dnd (working) or listening (online,
-// not yet idle long enough) agent is not addressed by it at all.
+// @free is the one address form gated on our own state (#130). It summons the
+// room's free agents — the away ones, plus a bridge nothing has been asked of
+// yet (see freeForSummons) — so an agent that is working, or that has worked and
+// not yet drifted away, is not addressed by it at all.
 //
 // The second return is the body to prompt with, and the third is the bare trigger
 // word when a bare mention was the only reason we were addressed (else "") —
@@ -1206,13 +1209,13 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 			b.log("notice", fmt.Sprintf("bare-name mention %q from %q in %s addressed us", mention, m.Nick, m.Room))
 		}
 	}
-	// The presence gate: an @free body reaches us only while our presence has
-	// drifted to away. m.Addressed means the message cleared this gate when it
-	// first arrived and is being re-delivered from the durable queue (a restart
-	// empties the presence we would re-derive it from), so the verdict travels
-	// with it rather than being recomputed.
-	if !m.Addressed && !explicit && freeOnlyBroadcast(m.Body) && !b.isAway() {
-		b.log("info", fmt.Sprintf("free broadcast in %s from %q skipped: we are not away", m.Room, m.Nick))
+	// The presence gate: an @free body reaches us only while we are free — away,
+	// or a bridge nothing has been asked of yet. m.Addressed means the message
+	// cleared this gate when it first arrived and is being re-delivered from the
+	// durable queue (a restart empties the presence we would re-derive it from),
+	// so the verdict travels with it rather than being recomputed.
+	if !m.Addressed && !explicit && freeOnlyBroadcast(m.Body) && !b.freeForSummons() {
+		b.log("info", fmt.Sprintf("free broadcast in %s from %q skipped: we are not free", m.Room, m.Nick))
 		return actionNotOurs, m.Body, ""
 	}
 	switch {
@@ -1236,10 +1239,10 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 			return actionNotOurs, m.Body, ""
 		}
 		// The owner named nobody, so the message is an @free summons: it reaches
-		// the room's away agents rather than every agent (#130). An owner who
-		// wants the whole room writes @everyone.
-		if !m.Addressed && !b.isAway() {
-			b.log("info", fmt.Sprintf("owner broadcast in %s skipped: we are not away", m.Room))
+		// the free agents rather than every agent (#130). An owner who wants the
+		// whole room writes @everyone.
+		if !m.Addressed && !b.freeForSummons() {
+			b.log("info", fmt.Sprintf("owner broadcast in %s skipped: we are not free", m.Room))
 			return actionNotOurs, m.Body, ""
 		}
 		return actionCanonical, m.Body, ""
@@ -2036,7 +2039,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. \"@everyone\" reaches the whole room, and \"@free\" reaches only the agents whose presence is away (idle) — an agent that is working, or that has only just gone quiet, is not reached by @free. The owner's own rule differs: an owner room message that names nobody acts as @free and so reaches the room's idle agents only, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. \"@everyone\" reaches the whole room, and \"@free\" reaches only the free agents — the ones whose presence is away (idle), plus a bridge that has not been asked to do anything since it started. An agent that is working, or that has worked and has only just gone quiet, is not reached by @free. The owner's own rule differs: an owner room message that names nobody acts as @free and so reaches the room's free agents only, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
@@ -2311,17 +2314,58 @@ func freeOnlyBroadcast(body string) bool {
 	return scan != "" && containsFreeBroadcast(scan) && !containsBroadcast(scan)
 }
 
-// isAway reports whether our own presence has drifted to <show>away</show> — the
-// state @free addresses (#130). It reads the same presence the room sees rather
-// than a local idle flag, so "I am away" and "the roster shows me away" cannot
-// disagree. Reconnecting no longer clears the away state (see reconnectPresence),
-// which is what makes it safe to key delivery on.
-func (b *Bridge) isAway() bool {
+// isAway reports whether our own presence has drifted to <show>away</show> — one
+// of the two states @free addresses (#130). It reads the same presence the room
+// sees rather than a local idle flag, so "I am away" and "the roster shows me
+// away" cannot disagree. Reconnecting no longer clears the away state (see
+// reconnectPresence), which is what makes it safe to key delivery on.
+func (b *Bridge) isAway() bool { return b.presenceShow() == "away" }
+
+// presenceShow is our own current <show> ("" = available), or "" when there is
+// no connection to ask.
+func (b *Bridge) presenceShow() string {
 	if b.xmpp == nil {
-		return false
+		return ""
 	}
 	show, _ := b.xmpp.currentPresence()
-	return show == "away"
+	return show
+}
+
+// freeForSummons reports whether an @free summons reaches us: either our
+// presence has drifted to away, or nothing has been asked of us since this
+// bridge came up (#130 follow-up).
+//
+// The fresh-bridge half is what makes a deploy summonable. A (re)started bridge
+// announces "awake"/"resumed" with an empty <show>, and the idle watcher needs
+// idleAwayTimeout (20 min) of quiet before it drifts to away — so without this a
+// fleet that had just been deployed was dark to @free (and to an untagged owner
+// message) until every agent had sat still for 20 minutes, even though none of
+// them had been asked to do anything. An agent that has worked and has not yet
+// drifted away stays out of reach: waking it is a deliberate act, so tag it or
+// write @everyone.
+func (b *Bridge) freeForSummons() bool {
+	if b.hasRun() {
+		return b.isAway()
+	}
+	// Nothing has been asked of this bridge yet. It counts as free unless it is
+	// visibly working: a start directive sets dnd a moment before pi emits
+	// agent_start, which is what sets the flag above.
+	return b.presenceShow() != "dnd"
+}
+
+// markRan records that a run has started on this bridge. Never cleared: the
+// property belongs to the bridge rather than to the run, so it survives an XMPP
+// reconnect — only a process restart makes a bridge fresh again.
+func (b *Bridge) markRan() {
+	b.mu.Lock()
+	b.ranSinceStart = true
+	b.mu.Unlock()
+}
+
+func (b *Bridge) hasRun() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ranSinceStart
 }
 
 // bareMention returns the trigger word when a bare mention is the ONLY reason
@@ -2364,12 +2408,14 @@ func (b *Bridge) bareMention(room, body string) string {
 // that had been decommissioned).
 var broadcastHandles = []string{"everyone", "all", "here"}
 
-// freeHandles address only the room's AWAY agents (#130). "Free" means idle
-// enough that our presence has drifted to <show>away</show>, not merely online:
-// a dnd agent is working and a listening one has not been quiet long enough to
-// have been announced away. An agent reached this way still answers in the room
-// like any other turn, so it must not talk over work in flight or wake a fleet
-// that has not settled.
+// freeHandles address only the room's FREE agents (#130). "Free" means our
+// presence has drifted to <show>away</show>, or we are a bridge nothing has been
+// asked of since it came up — the state a freshly deployed fleet is in, which
+// would otherwise be unreachable for idleAwayTimeout. A dnd agent is working; a
+// listening one that has already run is available but has deliberately not been
+// handed anything for the quiet period. An agent reached this way still answers
+// in the room like any other turn, so it must not talk over work in flight or
+// wake a fleet that is mid-round.
 var freeHandles = []string{"free"}
 
 // containsBroadcast reports whether scan addresses the whole room via "@everyone"

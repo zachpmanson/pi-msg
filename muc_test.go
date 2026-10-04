@@ -168,34 +168,37 @@ func TestOwnerMessageRouting(t *testing.T) {
 		reply  string
 		owner  bool
 		show   string
+		ran    bool
 		action roomAction
 	}{
-		{"untagged owner message summons the idle agents", "status update please", "", true, "away", actionCanonical},
-		{"untagged owner message skips a working agent", "status update please", "", true, "dnd", actionNotOurs},
-		{"untagged owner message skips a listening agent", "status update please", "", true, "", actionNotOurs},
-		{"owner @free reaches an away agent", "@free status please", "", true, "away", actionCanonical},
-		{"owner @free skips a listening agent", "@free status please", "", true, "", actionNotOurs},
-		{"owner @everyone reaches an idle fleet", "@everyone standup in 5", "", true, "", actionCanonical},
-		{"owner @handle picks one account", "@peppy have a look", "", true, "", actionNotOurs},
-		{"owner colon form picks one account", "peppy: have a look", "", true, "", actionNotOurs},
-		{"owner bare name picks one account", "peppy have a look at the parser", "", true, "", actionNotOurs},
-		{"owner naming us is ours", "@pi take this one", "", true, "", actionCanonical},
-		{"owner naming us among others is ours", "@peppy and @pi sort it out", "", true, "", actionCanonical},
-		{"a fenced name is not a tag", "```\npeppy: do it\n```", "", true, "away", actionCanonical},
-		{"a quoted name is not a tag", "> peppy: do it", "", true, "away", actionCanonical},
-		{"owner reply to a peer belongs to the peer", "", "peppy-id", true, "away", actionNotOurs},
-		{"owner reply to the owner's own names nobody, so it is @free", "", "owner-id", true, "away", actionCanonical},
-		{"owner reply to us is ours", "", "our-id", true, "", actionCanonical},
-		{"an unresolvable reply follows the same rule", "", "unknown-id", true, "away", actionCanonical},
-		{"a peer naming another peer is still not ours", "@beltino yours", "", false, "away", actionNotOurs},
-		{"a peer naming nobody is still dropped", "no name here", "", false, "away", actionNotOurs},
+		{"untagged owner message reaches a fresh bridge", "status update please", "", true, "", false, actionCanonical},
+		{"untagged owner message summons the idle agents", "status update please", "", true, "away", true, actionCanonical},
+		{"untagged owner message skips a settled agent", "status update please", "", true, "", true, actionNotOurs},
+		{"untagged owner message skips a working agent", "status update please", "", true, "dnd", true, actionNotOurs},
+		{"owner @free reaches a fresh bridge", "@free status please", "", true, "", false, actionCanonical},
+		{"owner @free reaches an away agent", "@free status please", "", true, "away", true, actionCanonical},
+		{"owner @free skips a settled agent", "@free status please", "", true, "", true, actionNotOurs},
+		{"owner @everyone reaches an idle fleet", "@everyone standup in 5", "", true, "", true, actionCanonical},
+		{"owner @handle picks one account", "@peppy have a look", "", true, "", true, actionNotOurs},
+		{"owner colon form picks one account", "peppy: have a look", "", true, "", true, actionNotOurs},
+		{"owner bare name picks one account", "peppy have a look at the parser", "", true, "", true, actionNotOurs},
+		{"owner naming us is ours", "@pi take this one", "", true, "", true, actionCanonical},
+		{"owner naming us among others is ours", "@peppy and @pi sort it out", "", true, "", true, actionCanonical},
+		{"a fenced name is not a tag", "```\npeppy: do it\n```", "", true, "away", true, actionCanonical},
+		{"a quoted name is not a tag", "> peppy: do it", "", true, "away", true, actionCanonical},
+		{"owner reply to a peer belongs to the peer", "", "peppy-id", true, "away", true, actionNotOurs},
+		{"owner reply to the owner's own names nobody, so it is @free", "", "owner-id", true, "away", true, actionCanonical},
+		{"owner reply to us is ours", "", "our-id", true, "", true, actionCanonical},
+		{"an unresolvable reply follows the same rule", "", "unknown-id", true, "away", true, actionCanonical},
+		{"a peer naming another peer is still not ours", "@beltino yours", "", false, "away", true, actionNotOurs},
+		{"a peer naming nobody is still dropped", "no name here", "", false, "away", true, actionNotOurs},
 	}
 	for _, c := range cases {
-		x.SetPresence(c.show, "test")
+		setShow(b, c.show, c.ran)
 		m := InboundMessage{Body: c.body, Nick: "zach", Room: room, FromOwner: c.owner, ReplyToID: c.reply}
 		action, _, _ := b.classify(m)
 		if action != c.action {
-			t.Errorf("%s: classify(%q, reply=%q, owner=%v, show=%q) = %d, want %d", c.name, c.body, c.reply, c.owner, c.show, action, c.action)
+			t.Errorf("%s: classify(%q, reply=%q, owner=%v, show=%q, ran=%v) = %d, want %d", c.name, c.body, c.reply, c.owner, c.show, c.ran, action, c.action)
 		}
 	}
 
@@ -204,7 +207,7 @@ func TestOwnerMessageRouting(t *testing.T) {
 	// through the @free gate, since it names nobody.
 	empty := roomBridge()
 	empty.xmpp = NewXMPPBridge(empty.acct, func(InboundMessage) {}, empty.log)
-	empty.xmpp.SetPresence("away", "test")
+	setShow(empty, "away", true)
 	if action, _, _ := empty.classify(InboundMessage{Body: "@peppy look", Room: room, FromOwner: true}); action != actionCanonical {
 		t.Errorf("owner message with an empty roster = %d, want actionCanonical", action)
 	}
