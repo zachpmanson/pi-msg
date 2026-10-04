@@ -23,9 +23,9 @@ sequenceDiagram
 
 ## Supported features
 
-- Sessions resuming across restarts, `/new` to reset, 
-- Pi slash commands work over chat.
-- XMPP DMs and group chats with whitelisted destinations
+- Sessions resuming across restarts, `/new` to reset
+- Pi slash commands work over chat
+- XMPP DMs and group chats
 - Threaded replies, in-band routing
 - Room history via `read_room`
 - MAM supported
