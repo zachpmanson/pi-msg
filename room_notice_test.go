@@ -65,7 +65,7 @@ func TestRoomPointerBlocks(t *testing.T) {
 			notice: &roomNotice{kind: noticeOwnerBroadcast},
 			sender: owner,
 			id:     osid,
-			want: "[pi-msg: room: The owner broadcast to the room's idle agents. The text is not in this prompt.\n" +
+			want: "[pi-msg: room: The owner spoke to the room without naming anyone. The text is not in this prompt.\n" +
 				"from: " + room + "\n" +
 				"sender: " + owner + "\n" +
 				"stanza-id: " + osid + "\n" +

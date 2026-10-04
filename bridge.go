@@ -1238,11 +1238,13 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 			b.log("notice", fmt.Sprintf("owner message in %s is directed at %s (%s), not us — not delivering", m.Room, who, why))
 			return actionNotOurs, m.Body, ""
 		}
-		// The owner named nobody, so the message is an @free summons: it reaches
-		// the free agents rather than every agent (#130). An owner who wants the
-		// whole room writes @everyone.
-		if !m.Addressed && !b.freeForSummons() {
-			b.log("info", fmt.Sprintf("owner broadcast in %s skipped: we are not free", m.Room))
+		// The owner named nobody, so the message is the room continuing: it
+		// reaches the free agents (#130) and anyone who spoke here recently
+		// (#130 follow-up) — if you were part of the conversation, the next turn
+		// of it is yours to hear. An owner who wants the whole room writes
+		// @everyone.
+		if !m.Addressed && !b.freeForSummons() && !b.participated(m.Room) {
+			b.log("info", fmt.Sprintf("owner broadcast in %s skipped: we are not free and have not spoken here recently", m.Room))
 			return actionNotOurs, m.Body, ""
 		}
 		return actionCanonical, m.Body, ""
@@ -2044,7 +2046,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. \"@everyone\" reaches the whole room, and \"@free\" reaches only the free agents — the ones whose presence is away (idle), plus a bridge that has not been asked to do anything since it started or was reset with /new. An agent that is working, or that has worked and has only just gone quiet, is not reached by @free. The owner's own rule differs: an owner room message that names nobody acts as @free and so reaches the room's free agents only, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. \"@everyone\" reaches the whole room, and \"@free\" reaches only the free agents — the ones whose presence is away (idle), plus a bridge that has not been asked to do anything since it started or was reset with /new. An agent that is working, or that has worked and has only just gone quiet, is not reached by @free. The owner's own rule differs: an owner room message that names nobody reaches the room's free agents and any agent that has spoken in the room within the last 20 minutes, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
@@ -2208,7 +2210,7 @@ func (b *Bridge) seedContracts(sb *strings.Builder) {
 func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sender, reactID, reactTo string) {
 	switch n.kind {
 	case noticeOwnerBroadcast:
-		sb.WriteString("[pi-msg: room: The owner broadcast to the room's idle agents. The text is not in this prompt.\n")
+		sb.WriteString("[pi-msg: room: The owner spoke to the room without naming anyone. The text is not in this prompt.\n")
 	case noticeFreeBroadcast:
 		sb.WriteString("[pi-msg: room: The room's idle agents were summoned. The text is not in this prompt.\n")
 	case noticeReplyToOwn:
@@ -2356,6 +2358,13 @@ func (b *Bridge) freeForSummons() bool {
 	// visibly working: a start directive sets dnd a moment before pi emits
 	// agent_start, which is what sets the flag above.
 	return b.presenceShow() != "dnd"
+}
+
+// participated reports whether we were recently part of this room's
+// conversation, by having sent a message to it within ParticipationHorizon
+// (#130 follow-up).
+func (b *Bridge) participated(room string) bool {
+	return b.xmpp != nil && b.xmpp.RecentlySpoke(room)
 }
 
 // markRan records that a run has started on this bridge. Cleared only by
@@ -4134,6 +4143,17 @@ func (b *Bridge) settleLocally() {
 // idleAwayTimeout is how long the agent may sit idle before its presence
 // drifts from available to "away". Any inbound activity resets the clock.
 const idleAwayTimeout = 20 * time.Minute
+
+// ParticipationHorizon is how long a message we sent to a room keeps that room's
+// untagged owner traffic reaching us (#130 follow-up): if you were part of the
+// conversation, the next turn of it is yours to hear.
+//
+// It deliberately matches idleAwayTimeout. The horizon at which an agent that
+// stops talking has drifted away is the same one at which its participation
+// stops counting, so at any moment a room's untagged owner traffic reaches an
+// agent that either spoke there recently or has been quiet long enough to count
+// as away.
+const ParticipationHorizon = idleAwayTimeout
 
 // awayActivities are pithy, fictional "what I've been up to" lines shown as
 // the presence status while the bot is away (rotated randomly by the watcher).
