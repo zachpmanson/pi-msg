@@ -390,6 +390,12 @@ type XMPPBridge struct {
 	// oldest is evicted when full.
 	msgHistory map[string]msgHistoryEntry
 
+	// spokeAt records when we last sent a groupchat message to each joined room,
+	// keyed by bare room JID. A message we sent to a room keeps that room's
+	// untagged owner traffic reaching us for ParticipationHorizon, so an agent
+	// that was part of a conversation hears the next turn of it (#130 follow-up).
+	spokeAt map[string]time.Time
+
 	// mamPending holds the in-flight XEP-0313 backfill collectors, keyed by MAM
 	// query id. The read loop appends archived messages; FetchMAM drains them
 	// once the terminating IQ result arrives.
@@ -428,6 +434,7 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		occupants:   make(map[string]map[string]string),
 		selfNick:    make(map[string]string),
 		msgHistory:  make(map[string]msgHistoryEntry),
+		spokeAt:     make(map[string]time.Time),
 		mamPending:  make(map[string]*mamCollector),
 	}
 	b.loadAvatar()
@@ -1433,6 +1440,24 @@ func (b *XMPPBridge) SendChatReply(to, text string, reply *replyTarget) string {
 	return lastID
 }
 
+// noteSpoke records that we sent a groupchat message to room, which keeps the
+// room's untagged owner traffic reaching us for ParticipationHorizon.
+func (b *XMPPBridge) noteSpoke(room string) {
+	b.mu.Lock()
+	b.spokeAt[bareJid(room)] = time.Now()
+	b.mu.Unlock()
+}
+
+// RecentlySpoke reports whether we sent a groupchat message to room within
+// ParticipationHorizon — that is, whether we were part of the conversation the
+// room is still having.
+func (b *XMPPBridge) RecentlySpoke(room string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.spokeAt[bareJid(room)]
+	return ok && time.Since(t) < ParticipationHorizon
+}
+
 // destKind classifies an agent-chosen reply destination for delivery policy.
 type destKind int
 
@@ -2163,6 +2188,7 @@ func (b *XMPPBridge) SendRoomReply(room, text string, reply *replyTarget) string
 	}
 	if lastID != "" {
 		b.markOutbound()
+		b.noteSpoke(room)
 	}
 	return lastID
 }

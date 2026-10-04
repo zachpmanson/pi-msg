@@ -1,6 +1,17 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+// spokeAgo forces a room's participation timestamp: SendRoomReply only ever
+// records "now", so a table that revisits the window needs the explicit setter.
+func spokeAgo(b *Bridge, room string, d time.Duration) {
+	b.xmpp.mu.Lock()
+	b.xmpp.spokeAt[bareJid(room)] = time.Now().Add(-d)
+	b.xmpp.mu.Unlock()
+}
 
 // setRan forces the has-run flag. markRan only ever sets it, so a table that
 // revisits both sides of the gate needs the explicit setter.
@@ -129,6 +140,89 @@ func TestFreeBroadcastGating(t *testing.T) {
 // asked of it, so @free must reach it again rather than leaving it in the settled
 // window for idleAwayTimeout. The dnd guard still holds — /new does not kill
 // background processes.
+// An owner room message that names nobody is the room continuing, so it reaches
+// the free agents and also anyone who spoke in that room recently (#130
+// follow-up): if you were part of the conversation, the next turn of it is yours
+// to hear, without the owner having to re-tag anyone.
+func TestUntaggedOwnerReachesRecentParticipants(t *testing.T) {
+	settled := func() (*Bridge, string) {
+		b, r := roomWith("peppy")
+		setShow(b, "", true) // has worked and settled, but is not away yet
+		return b, r
+	}
+	owner := func(b *Bridge, room, body string) roomAction {
+		action, _, _ := b.classify(InboundMessage{Room: room, Nick: "zach", Body: body, FromOwner: true})
+		return action
+	}
+
+	b, room := settled()
+	if got := owner(b, room, "status please"); got != actionNotOurs {
+		t.Fatalf("settled and silent: untagged owner message = %v, want actionNotOurs", got)
+	}
+
+	// Taking part in the conversation puts us back in earshot...
+	spokeAgo(b, room, 5*time.Minute)
+	if got := owner(b, room, "status please"); got != actionCanonical {
+		t.Errorf("after speaking here: untagged owner message = %v, want actionCanonical", got)
+	}
+
+	// ...for the window, and no longer: the horizon is the conversation's, not
+	// ours to extend.
+	spokeAgo(b, room, ParticipationHorizon+time.Minute)
+	if got := owner(b, room, "status please"); got != actionNotOurs {
+		t.Errorf("after the window: untagged owner message = %v, want actionNotOurs", got)
+	}
+
+	// Participation is per room — a conversation in one room says nothing about
+	// another.
+	spokeAgo(b, room, time.Minute)
+	if got := owner(b, "other@muc.x.com", "status please"); got != actionNotOurs {
+		t.Errorf("spoke in another room: untagged owner message = %v, want actionNotOurs", got)
+	}
+
+	// It does not widen @free. That form is a summons to the idle, and an owner
+	// who writes it is deliberately not asking the agents already in the
+	// conversation.
+	spokeAgo(b, room, time.Minute)
+	if got := owner(b, room, "@free report in"); got != actionNotOurs {
+		t.Errorf("@free while participating: = %v, want actionNotOurs", got)
+	}
+
+	// A peer's untagged message still reaches nobody: participation is the
+	// owner's default, not a general rule for room traffic.
+	spokeAgo(b, room, time.Minute)
+	action, _, _ := b.classify(InboundMessage{Room: room, Nick: "slippy", Body: "status please"})
+	if action != actionNotOurs {
+		t.Errorf("peer untagged while participating: = %v, want actionNotOurs", action)
+	}
+}
+
+// A message we send to a room is what records participation, and only a real
+// send does: a noop, a 1:1 reply or a reaction must not put the room back in
+// earshot.
+func TestParticipationRecordedOnRoomSend(t *testing.T) {
+	b, room := roomWith("peppy")
+	x := b.xmpp
+	if x.RecentlySpoke(room) {
+		t.Fatal("a bridge that has sent nothing must not count as a participant")
+	}
+	x.noteSpoke(room)
+	if !x.RecentlySpoke(room) {
+		t.Error("a room we just sent to must count as participated")
+	}
+	// Bare vs full JID is the same room.
+	if !x.RecentlySpoke(room + "/peppy") {
+		t.Error("participation must be keyed by bare room JID")
+	}
+	spokeAgo(b, room, ParticipationHorizon+time.Second)
+	if x.RecentlySpoke(room) {
+		t.Error("participation must lapse after ParticipationHorizon")
+	}
+	if x.RecentlySpoke("elsewhere@muc.x.com") {
+		t.Error("a room we never sent to must not count as participated")
+	}
+}
+
 func TestNewMakesAnAgentFree(t *testing.T) {
 	b, _ := roomWith("peppy")
 

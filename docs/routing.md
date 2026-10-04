@@ -160,9 +160,18 @@ did reach the room, so the correction only has to reach other agents if one must
 act on it.
 
 **The owner's messages follow the same names, but with the untagged case
-defaulted.** An owner room message that names nobody is an **`@free` summons**:
-it reaches the room's away agents and nobody else, so a working or merely
-listening fleet is not interrupted. One that tags an agent or replies to an
+defaulted.** An owner room message that names nobody reaches the room's **free**
+agents plus **anyone who has spoken in that room in the last 20 minutes**: if you
+were part of the conversation, the next turn of it is yours to hear, so a live
+exchange keeps its participants without anyone having to re-tag them
+([#130](https://github.com/zachpmanson/pi-msg/issues/130) follow-up). An agent
+that is working, or that has gone quiet in a conversation it was not part of, is
+not interrupted. The participation window is per room and matches
+`idleAwayTimeout`, so a room's untagged owner traffic always reaches exactly those
+agents that either spoke there recently or have been away long enough to count as
+idle. Participation does **not** widen `@free`: that form stays a summons to the
+idle only, and an owner who tags `@free` is deliberately not asking the agents
+who are already in the conversation. One that tags an agent or replies to an
 agent's stanza is routed to that account alone; an `@everyone` reaches the whole
 room, working agents included. A reply target the bridge has never seen (it may
 be its own message from before a restart) and a name that matches no known
@@ -244,7 +253,7 @@ sentence of the commentary, not in the label:
 |---|---|---|
 | a peer tagged us | `You were tagged in a room.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
 | several tags in one turn | `<N> messages tagged you in a room. One read covers all of them.` | `from:`, `react-to:`, then one list entry per tag |
-| the owner broadcast, naming nobody (or `@free`) | `The owner broadcast to the room's idle agents.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
+| the owner spoke to the room, naming nobody (or `@free`) | `The owner spoke to the room without naming anyone.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
 | an `@free` summons from a peer | `The room's idle agents were summoned.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
 | a reaction ack | `<reactor> reacted <emoji> to your message "<our own message>"` | inline, no field lines |
 | a reply to our message | `Your message was replied to.` | `from:`, `sender:`, `stanza-id:`, `in-reply-to:` (parent id only), `react-to:` |
