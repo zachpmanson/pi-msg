@@ -125,6 +125,45 @@ func TestFreeBroadcastGating(t *testing.T) {
 	}
 }
 
+// A /new is a fresh start in-process: the agent has a blank session and nothing
+// asked of it, so @free must reach it again rather than leaving it in the settled
+// window for idleAwayTimeout. The dnd guard still holds — /new does not kill
+// background processes.
+func TestNewMakesAnAgentFree(t *testing.T) {
+	b, _ := roomWith("peppy")
+
+	// Settled after work: a run has happened and we have not drifted away.
+	setShow(b, "", true)
+	if b.freeForSummons() {
+		t.Fatal("a settled bridge must not be free")
+	}
+
+	// /new drops the agent back to the fresh state, so an untagged owner
+	// message reaches it again immediately.
+	b.markFresh()
+	if !b.freeForSummons() {
+		t.Error("a /new bridge must be free again")
+	}
+	action, _, _ := b.classify(InboundMessage{Room: "team@muc.x.com", Nick: "zach", Body: "status please", FromOwner: true})
+	if action != actionCanonical {
+		t.Errorf("untagged owner message after /new = %d, want actionCanonical", action)
+	}
+
+	// Work started after the /new puts it back out of reach.
+	b.markRan()
+	if b.freeForSummons() {
+		t.Error("a bridge that has run since the /new must not be free")
+	}
+
+	// A /new that settles into a background process is not free either: dnd
+	// outranks fresh.
+	b.markFresh()
+	setShow(b, "dnd", false)
+	if b.freeForSummons() {
+		t.Error("a /new'd bridge waiting on a process must not be free")
+	}
+}
+
 // A gate keyed on the wire presence is only safe if the presence survives a
 // reconnect: awayAnnounced stops the idle watcher re-announcing, so a reconnect
 // that reset show to "" would drop an idle agent out of @free until its next

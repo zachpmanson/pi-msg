@@ -1613,6 +1613,11 @@ func (b *Bridge) handleCommand(t string) bool {
 			// A fresh session has no routing contract in context yet — re-seed
 			// it on the next prompt (once).
 			b.routingSeeded = false
+			// /new leaves the agent with a blank session and nothing asked of it,
+			// which is the state a fresh bridge is in: make it free to @free again
+			// rather than leaving it in the settled window for idleAwayTimeout
+			// (#130). A run that starts off the back of this sets the flag again.
+			b.markFresh()
 		}
 	case "compact":
 		res, err := b.rpc.Compact(b.ctx, arg)
@@ -2039,7 +2044,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. \"@everyone\" reaches the whole room, and \"@free\" reaches only the free agents — the ones whose presence is away (idle), plus a bridge that has not been asked to do anything since it started. An agent that is working, or that has worked and has only just gone quiet, is not reached by @free. The owner's own rule differs: an owner room message that names nobody acts as @free and so reaches the room's free agents only, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. \"@everyone\" reaches the whole room, and \"@free\" reaches only the free agents — the ones whose presence is away (idle), plus a bridge that has not been asked to do anything since it started or was reset with /new. An agent that is working, or that has worked and has only just gone quiet, is not reached by @free. The owner's own rule differs: an owner room message that names nobody acts as @free and so reaches the room's free agents only, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
@@ -2353,12 +2358,25 @@ func (b *Bridge) freeForSummons() bool {
 	return b.presenceShow() != "dnd"
 }
 
-// markRan records that a run has started on this bridge. Never cleared: the
-// property belongs to the bridge rather than to the run, so it survives an XMPP
-// reconnect — only a process restart makes a bridge fresh again.
+// markRan records that a run has started on this bridge. Cleared only by
+// markFresh (/new): the property belongs to the bridge rather than to the run,
+// so it survives an XMPP reconnect — only a process restart or a session reset
+// makes a bridge fresh again.
 func (b *Bridge) markRan() {
 	b.mu.Lock()
 	b.ranSinceStart = true
+	b.mu.Unlock()
+}
+
+// markFresh clears the has-run flag: the bridge is back to "nothing has been
+// asked of me", so @free reaches it again. Called by /new, which swaps in a
+// blank session in-process (#130); a restart gets there by construction. The
+// dnd guard in freeForSummons still holds — /new does not kill background
+// processes, so an agent that settles into "waiting on N processes" stays out
+// of reach.
+func (b *Bridge) markFresh() {
+	b.mu.Lock()
+	b.ranSinceStart = false
 	b.mu.Unlock()
 }
 

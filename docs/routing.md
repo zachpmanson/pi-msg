@@ -137,13 +137,16 @@ applies to its own trigger:
 - `@everyone` — address the whole room.
 - `@free` — address the room's **free** agents: those whose presence has drifted
   to `<show>away</show>` (idle past `idleAwayTimeout`), plus a bridge that has not
-  been asked to do anything since it started. The second half matters because a
-  (re)started bridge announces `awake`/`resumed` with an empty `<show>` and needs
-  `idleAwayTimeout` of quiet before it drifts to away — without it a fleet that had
-  just been deployed was dark to `@free` for 20 minutes even though nothing had
-  been asked of it. An agent that is working (`dnd`), or that has worked and has
-  only just gone quiet, is not reached. This is the only state-gated address form;
-  every other name is delivered whatever the recipient's presence says.
+  been asked to do anything since it started, or since the operator reset it with
+  `/new`. Both halves matter because a (re)started bridge announces
+  `awake`/`resumed` with an empty `<show>` and needs `idleAwayTimeout` of quiet
+  before it drifts to away — so without them a fleet that had just been deployed
+  or reset was dark to `@free` for 20 minutes even though nothing had been asked of
+  it. An agent that is working (`dnd`), or that has worked and has only just gone
+  quiet, is not reached. `/new` does not kill background processes, so a bridge
+  that settles into `waiting on N processes` stays out of reach. This is the only
+  state-gated address form; every other name is delivered whatever the recipient's
+  presence says.
 - A mistyped name matches nobody; pi-msg warns the agent that nobody was woken.
 
 **The same rule is enforced on the way out.** A room message that addresses
