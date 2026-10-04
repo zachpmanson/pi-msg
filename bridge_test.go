@@ -8,12 +8,65 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// An extension_error report must name the extension that threw: the error alone
+// says what broke, and pi's extensionPath/event are the only fields that say who
+// broke it. Either may be missing, and a missing half is dropped rather than
+// rendered as "unknown" (#135).
+func TestDescribeExtensionError(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   Event
+		want string
+	}{
+		{"both fields", Event{"extensionPath": "/home/x/ext/thing.ts", "event": "agent_settled"}, " in /home/x/ext/thing.ts (on agent_settled)"},
+		{"path only", Event{"extensionPath": "/home/x/ext/thing.ts"}, " in /home/x/ext/thing.ts"},
+		{"event only", Event{"event": "tool_call"}, " (on tool_call)"},
+		{"neither", Event{"error": "boom"}, ""},
+		{"wrong types", Event{"extensionPath": 7, "event": nil}, ""},
+	}
+	for _, c := range cases {
+		if got := describeExtensionError(c.ev); got != c.want {
+			t.Errorf("%s: describeExtensionError = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// The relay and the journal must both carry the name. The journal half is the
+// one that survives: the owner may only see the chat line, and the error is
+// recurring, so without a log line a later investigation has nothing to read.
+func TestExtensionErrorNamesTheExtension(t *testing.T) {
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	b.handleRPCEvent(Event{
+		"type":          "extension_error",
+		"extensionPath": "/home/beltino/.pi/personas/fox/npm/node_modules/pi-subagents/ext.ts",
+		"event":         "agent_settled",
+		"error":         "Agent is already processing a prompt.",
+	})
+	os.Stderr = old
+	w.Close()
+	logged, _ := io.ReadAll(r)
+
+	want := "extension error in /home/beltino/.pi/personas/fox/npm/node_modules/pi-subagents/ext.ts (on agent_settled): Agent is already processing a prompt."
+	if !strings.Contains(string(logged), want) {
+		t.Errorf("journal line missing the thrower:\n got %q\n want it to contain %q", string(logged), want)
+	}
+}
 
 func TestExtractText(t *testing.T) {
 	if got := extractText("  hi  "); got != "hi" {

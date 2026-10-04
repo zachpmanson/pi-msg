@@ -626,7 +626,13 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 			b.clearToolSinceDelivery()
 		}
 	case "extension_error":
-		b.reply("⚠️ extension error: " + orUnknown(ev.Str("error")))
+		// Name the thrower. pi attaches the offending extension's path and the
+		// event it was handling, and the relay used to drop both — leaving the
+		// owner with a recurring error whose author could not be identified from
+		// the message or from the journal (#135).
+		where := describeExtensionError(ev)
+		b.log("warning", "extension error"+where+": "+orUnknown(ev.Str("error")))
+		b.reply("⚠️ extension error" + where + ": " + orUnknown(ev.Str("error")))
 	case "extension_ui_request":
 		b.handleUIRequest(ev)
 	}
@@ -4985,4 +4991,23 @@ func orUnknown(s string) string {
 		return "unknown"
 	}
 	return s
+}
+
+// describeExtensionError names the extension that threw, for the "in <path> (on
+// <event>)" clause of an extension_error report (#135). pi sends
+// {extensionPath, event, error}: the error alone says what broke, and the two
+// extra fields are the only way to say who broke it. Either may be absent, so
+// each half is dropped rather than filled with "unknown" — a path-less report
+// should read as one clause short, not as a path literally named unknown.
+func describeExtensionError(ev Event) string {
+	path, event := ev.Str("extensionPath"), ev.Str("event")
+	switch {
+	case path == "" && event == "":
+		return ""
+	case path == "":
+		return " (on " + event + ")"
+	case event == "":
+		return " in " + path
+	}
+	return " in " + path + " (on " + event + ")"
 }
