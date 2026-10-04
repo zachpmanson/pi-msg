@@ -93,17 +93,20 @@ func TestMatchTriggerPerRoom(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	b := roomBridge()
+	b, room := roomWith("alice")
+	// The untagged owner case below is an @free summons (#130): it reaches an
+	// agent that is away, so put this one in that state.
+	b.xmpp.SetPresence("away", "reading obscure RFCs")
 	cases := []struct {
 		m      InboundMessage
 		action roomAction
 		body   string
 	}{
-		{InboundMessage{Body: "just chatting", Nick: "alice", FromOwner: false}, actionNotOurs, "just chatting"},
-		{InboundMessage{Body: "pi: help alice", Nick: "alice", FromOwner: false}, actionCommentary, "help alice"},
-		{InboundMessage{Body: "ask pi about it", Nick: "alice", FromOwner: false}, actionCommentary, "ask pi about it"},
-		{InboundMessage{Body: "do it", Nick: "zach", FromOwner: true}, actionCanonical, "do it"},
-		{InboundMessage{Body: "pi: do it", Nick: "zach", FromOwner: true}, actionCanonical, "do it"},
+		{InboundMessage{Room: room, Body: "just chatting", Nick: "alice", FromOwner: false}, actionNotOurs, "just chatting"},
+		{InboundMessage{Room: room, Body: "pi: help alice", Nick: "alice", FromOwner: false}, actionCommentary, "help alice"},
+		{InboundMessage{Room: room, Body: "ask pi about it", Nick: "alice", FromOwner: false}, actionCommentary, "ask pi about it"},
+		{InboundMessage{Room: room, Body: "do it", Nick: "zach", FromOwner: true}, actionCanonical, "do it"},
+		{InboundMessage{Room: room, Body: "pi: do it", Nick: "zach", FromOwner: true}, actionCanonical, "do it"},
 	}
 	for _, c := range cases {
 		action, body, _ := b.classify(c.m)
@@ -140,10 +143,11 @@ func TestClassifyReplyToOwnMessage(t *testing.T) {
 	}
 }
 
-// An owner room message is trusted traffic: naming nobody means it is for every
-// agent in the room, the same fan-out as @everyone. A tag or a stanza reply
-// picks out one account, and the message belongs to that account alone (#106) —
-// without this, every agent answers a note the owner wrote to one of them.
+// An owner room message is trusted traffic. Naming nobody makes it an @free
+// summons (#130): it reaches the room's away agents, not every agent — the owner
+// writes @everyone to reach a working fleet. A tag or a stanza reply picks out
+// one account, and the message belongs to that account alone (#106) — without
+// this, every agent answers a note the owner wrote to one of them.
 func TestOwnerMessageRouting(t *testing.T) {
 	b := roomBridge() // owner zach@x.com, nick pi, trigger pi, room team@muc.x.com
 	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
@@ -163,36 +167,44 @@ func TestOwnerMessageRouting(t *testing.T) {
 		body   string
 		reply  string
 		owner  bool
+		show   string
 		action roomAction
 	}{
-		{"untagged owner message is a broadcast", "status update please", "", true, actionCanonical},
-		{"owner @handle picks one account", "@peppy have a look", "", true, actionNotOurs},
-		{"owner colon form picks one account", "peppy: have a look", "", true, actionNotOurs},
-		{"owner bare name picks one account", "peppy have a look at the parser", "", true, actionNotOurs},
-		{"owner naming us is ours", "@pi take this one", "", true, actionCanonical},
-		{"owner naming us among others is ours", "@peppy and @pi sort it out", "", true, actionCanonical},
-		{"owner @everyone is ours", "@everyone standup in 5", "", true, actionCanonical},
-		{"a fenced name is not a tag", "```\npeppy: do it\n```", "", true, actionCanonical},
-		{"a quoted name is not a tag", "> peppy: do it", "", true, actionCanonical},
-		{"owner reply to a peer belongs to the peer", "", "peppy-id", true, actionNotOurs},
-		{"owner reply to the owner's own is a broadcast", "", "owner-id", true, actionCanonical},
-		{"owner reply to us is ours", "", "our-id", true, actionCanonical},
-		{"an unresolvable reply is delivered, not lost", "", "unknown-id", true, actionCanonical},
-		{"a peer naming another peer is still not ours", "@beltino yours", "", false, actionNotOurs},
-		{"a peer naming nobody is still dropped", "no name here", "", false, actionNotOurs},
+		{"untagged owner message summons the idle agents", "status update please", "", true, "away", actionCanonical},
+		{"untagged owner message skips a working agent", "status update please", "", true, "dnd", actionNotOurs},
+		{"untagged owner message skips a listening agent", "status update please", "", true, "", actionNotOurs},
+		{"owner @free reaches an away agent", "@free status please", "", true, "away", actionCanonical},
+		{"owner @free skips a listening agent", "@free status please", "", true, "", actionNotOurs},
+		{"owner @everyone reaches an idle fleet", "@everyone standup in 5", "", true, "", actionCanonical},
+		{"owner @handle picks one account", "@peppy have a look", "", true, "", actionNotOurs},
+		{"owner colon form picks one account", "peppy: have a look", "", true, "", actionNotOurs},
+		{"owner bare name picks one account", "peppy have a look at the parser", "", true, "", actionNotOurs},
+		{"owner naming us is ours", "@pi take this one", "", true, "", actionCanonical},
+		{"owner naming us among others is ours", "@peppy and @pi sort it out", "", true, "", actionCanonical},
+		{"a fenced name is not a tag", "```\npeppy: do it\n```", "", true, "away", actionCanonical},
+		{"a quoted name is not a tag", "> peppy: do it", "", true, "away", actionCanonical},
+		{"owner reply to a peer belongs to the peer", "", "peppy-id", true, "away", actionNotOurs},
+		{"owner reply to the owner's own names nobody, so it is @free", "", "owner-id", true, "away", actionCanonical},
+		{"owner reply to us is ours", "", "our-id", true, "", actionCanonical},
+		{"an unresolvable reply follows the same rule", "", "unknown-id", true, "away", actionCanonical},
+		{"a peer naming another peer is still not ours", "@beltino yours", "", false, "away", actionNotOurs},
+		{"a peer naming nobody is still dropped", "no name here", "", false, "away", actionNotOurs},
 	}
 	for _, c := range cases {
+		x.SetPresence(c.show, "test")
 		m := InboundMessage{Body: c.body, Nick: "zach", Room: room, FromOwner: c.owner, ReplyToID: c.reply}
 		action, _, _ := b.classify(m)
 		if action != c.action {
-			t.Errorf("%s: classify(%q, reply=%q, owner=%v) = %d, want %d", c.name, c.body, c.reply, c.owner, action, c.action)
+			t.Errorf("%s: classify(%q, reply=%q, owner=%v, show=%q) = %d, want %d", c.name, c.body, c.reply, c.owner, c.show, action, c.action)
 		}
 	}
 
 	// With no occupant roster there is nothing to check a name against, so the
-	// message stays a broadcast rather than silently reaching nobody.
+	// message stays a broadcast rather than silently reaching nobody — still
+	// through the @free gate, since it names nobody.
 	empty := roomBridge()
 	empty.xmpp = NewXMPPBridge(empty.acct, func(InboundMessage) {}, empty.log)
+	empty.xmpp.SetPresence("away", "test")
 	if action, _, _ := empty.classify(InboundMessage{Body: "@peppy look", Room: room, FromOwner: true}); action != actionCanonical {
 		t.Errorf("owner message with an empty roster = %d, want actionCanonical", action)
 	}

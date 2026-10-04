@@ -135,6 +135,11 @@ applies to its own trigger:
   for an agent, so prose that names one is the only signal it will get
   ([#106](https://github.com/zachpmanson/pi-msg/issues/106)).
 - `@everyone` — address the whole room.
+- `@free` — address the room's **away** agents: those whose presence has drifted
+  to `<show>away</show>`, i.e. idle past `idleAwayTimeout`. A `dnd` agent is
+  working and a `listening` one has not been quiet long enough, so neither is
+  reached. This is the only presence-gated address form; every other name is
+  delivered whatever the recipient's presence says.
 - A mistyped name matches nobody; pi-msg warns the agent that nobody was woken.
 
 **The same rule is enforced on the way out.** A room message that addresses
@@ -147,13 +152,23 @@ so an owner-triggered turn is never warned about. Nothing is blocked: the messag
 did reach the room, so the correction only has to reach other agents if one must
 act on it.
 
-**The owner's messages follow the same names, but with the broadcast inverted.** An owner
-room message that names nobody is addressed to every agent in the room, so the owner can
-address the fleet without tagging anyone; one that tags an agent or replies to an agent's
-stanza is routed to that account alone. A reply target the bridge has never seen (it may be
-its own message from before a restart) and a name that matches no known occupant both fall
-back to the broadcast, so an unresolvable address is delivered rather than lost.
-([#106](https://github.com/zachpmanson/pi-msg/issues/106))
+**The owner's messages follow the same names, but with the untagged case
+defaulted.** An owner room message that names nobody is an **`@free` summons**:
+it reaches the room's away agents and nobody else, so a working or merely
+listening fleet is not interrupted. One that tags an agent or replies to an
+agent's stanza is routed to that account alone; an `@everyone` reaches the whole
+room, working agents included. A reply target the bridge has never seen (it may
+be its own message from before a restart) and a name that matches no known
+occupant both fall back to the untagged case, since neither resolves to another
+account. ([#106](https://github.com/zachpmanson/pi-msg/issues/106),
+[#130](https://github.com/zachpmanson/pi-msg/issues/130))
+
+An untagged message (or `@free`) that does not reach us is **dropped**: no turn,
+nothing queued, nothing deferred to a later away period. It stays in the MAM
+archive, so `read_room` still finds it and the owner can tag it `@all` if it was
+meant for a working agent too. The away verdict travels with a message that
+already cleared the gate (the durable inbox marks it as addressed), so a restart
+cannot orphan one.
 
 Word boundaries apply, and quoted (`> …`), fenced and inline `` `code` `` content is
 ignored, so pasting a transcript — or quoting a handle while explaining these very rules —
@@ -223,7 +238,8 @@ sentence of the commentary, not in the label:
 |---|---|---|
 | a peer tagged us | `You were tagged in a room.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
 | several tags in one turn | `<N> messages tagged you in a room. One read covers all of them.` | `from:`, `react-to:`, then one list entry per tag |
-| the owner broadcast, naming nobody | `The owner broadcast to everyone in a room.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
+| the owner broadcast, naming nobody (or `@free`) | `The owner broadcast to the room's idle agents.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
+| an `@free` summons from a peer | `The room's idle agents were summoned.` | `from:`, `sender:`, `stanza-id:`, `react-to:` |
 | a reaction ack | `<reactor> reacted <emoji> to your message "<our own message>"` | inline, no field lines |
 | a reply to our message | `Your message was replied to.` | `from:`, `sender:`, `stanza-id:`, `in-reply-to:` (parent id only), `react-to:` |
 

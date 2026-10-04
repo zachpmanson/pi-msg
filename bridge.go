@@ -1138,6 +1138,7 @@ const (
 	noticeTag            roomNoticeKind = iota // A: someone tagged us
 	noticeOwnerBroadcast                       // C: the owner spoke to the room, naming nobody
 	noticeReplyToOwn                           // E: someone replied to one of our messages
+	noticeFreeBroadcast                        // F: someone summoned the room's away agents (@free, #130)
 )
 
 // roomNotice is the pointer-block variant for a room-triggered prompt.
@@ -1147,9 +1148,15 @@ type roomNotice struct {
 }
 
 // roomNoticeFor selects the pointer block for a room-triggered prompt (#58): E
-// when the message replies to one of ours, C when the owner broadcast to the
-// room without naming anyone, A otherwise. It returns nil for a non-room turn,
-// which keeps the header+body form (owner DMs, initial prompts).
+// when the message replies to one of ours, C when the owner spoke to the room
+// without naming anyone, F when someone summoned the room's away agents with
+// @free, A otherwise. It returns nil for a non-room turn, which keeps the
+// header+body form (owner DMs, initial prompts).
+//
+// The owner's C block covers both an untagged message and an @free one (#130) —
+// they are the same thing now — but not @everyone, which is an aimed broadcast
+// and still reads as a tag. C is deliberately not selectable by a peer: only the
+// owner can speak to the room without naming anyone.
 func (b *Bridge) roomNoticeFor(m InboundMessage) *roomNotice {
 	if m.Room == "" {
 		return nil
@@ -1157,9 +1164,12 @@ func (b *Bridge) roomNoticeFor(m InboundMessage) *roomNotice {
 	if m.ReplyToID != "" && b.replyToOwnMessage(m) {
 		return &roomNotice{kind: noticeReplyToOwn, parentID: m.ReplyToID}
 	}
-	addressed, _ := b.matchTrigger(m.Room, m.Body)
-	if m.FromOwner && !addressed {
+	explicit, _ := b.matchTriggerExplicit(m.Room, m.Body)
+	if m.FromOwner && !explicit && !broadcastsToAll(m.Body) {
 		return &roomNotice{kind: noticeOwnerBroadcast}
+	}
+	if !explicit && freeOnlyBroadcast(m.Body) {
+		return &roomNotice{kind: noticeFreeBroadcast}
 	}
 	return &roomNotice{kind: noticeTag}
 }
@@ -1179,17 +1189,31 @@ const (
 // takes a turn, or it does not and is dropped entirely (#106). There is no third
 // tier — the ambient buffer that used to hold unaddressed chatter is gone.
 //
+// @free is the one address form gated on our own presence (#130). It summons the
+// room's away agents and nobody else, so a dnd (working) or listening (online,
+// not yet idle long enough) agent is not addressed by it at all.
+//
 // The second return is the body to prompt with, and the third is the bare trigger
 // word when a bare mention was the only reason we were addressed (else "") —
 // the false-trigger counter.
 func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 	addressed, stripped := b.matchTrigger(m.Room, m.Body)
+	explicit, _ := b.matchTriggerExplicit(m.Room, m.Body)
 	mention := ""
 	if addressed {
 		mention = b.bareMention(m.Room, m.Body)
 		if mention != "" {
 			b.log("notice", fmt.Sprintf("bare-name mention %q from %q in %s addressed us", mention, m.Nick, m.Room))
 		}
+	}
+	// The presence gate: an @free body reaches us only while our presence has
+	// drifted to away. m.Addressed means the message cleared this gate when it
+	// first arrived and is being re-delivered from the durable queue (a restart
+	// empties the presence we would re-derive it from), so the verdict travels
+	// with it rather than being recomputed.
+	if !m.Addressed && !explicit && freeOnlyBroadcast(m.Body) && !b.isAway() {
+		b.log("info", fmt.Sprintf("free broadcast in %s from %q skipped: we are not away", m.Room, m.Nick))
+		return actionNotOurs, m.Body, ""
 	}
 	switch {
 	case m.FromOwner:
@@ -1198,13 +1222,24 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 		// a broadcast. A tag or a stanza reply picks out an account, and the
 		// message belongs to that account alone (#106).
 		if addressed {
-			return actionCanonical, stripped, ""
+			if explicit {
+				return actionCanonical, stripped, ""
+			}
+			// @everyone / @free (and we are away): a broadcast, body intact.
+			return actionCanonical, m.Body, ""
 		}
 		if b.replyToOwnMessage(m) {
 			return actionCanonical, m.Body, ""
 		}
 		if who, why := b.ownerDirectedElsewhere(m); who != "" {
 			b.log("notice", fmt.Sprintf("owner message in %s is directed at %s (%s), not us — not delivering", m.Room, who, why))
+			return actionNotOurs, m.Body, ""
+		}
+		// The owner named nobody, so the message is an @free summons: it reaches
+		// the room's away agents rather than every agent (#130). An owner who
+		// wants the whole room writes @everyone.
+		if !m.Addressed && !b.isAway() {
+			b.log("info", fmt.Sprintf("owner broadcast in %s skipped: we are not away", m.Room))
 			return actionNotOurs, m.Body, ""
 		}
 		return actionCanonical, m.Body, ""
@@ -2001,7 +2036,7 @@ func compactArgs(args Event) string {
 // not on every message; the full spec lives in docs/routing.md. Ownership of
 // the routing protocol belongs to pi-msg, not to any fleet agent config.
 func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline, or \"@everyone\" for the whole room; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. The owner's own rule differs: an owner room message that names nobody is addressed to every agent in the room, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. \"@everyone\" reaches the whole room, and \"@free\" reaches only the agents whose presence is away (idle) — an agent that is working, or that has only just gone quiet, is not reached by @free. The owner's own rule differs: an owner room message that names nobody acts as @free and so reaches the room's idle agents only, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
@@ -2165,7 +2200,9 @@ func (b *Bridge) seedContracts(sb *strings.Builder) {
 func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sender, reactID, reactTo string) {
 	switch n.kind {
 	case noticeOwnerBroadcast:
-		sb.WriteString("[pi-msg: room: The owner broadcast to everyone in a room. The text is not in this prompt.\n")
+		sb.WriteString("[pi-msg: room: The owner broadcast to the room's idle agents. The text is not in this prompt.\n")
+	case noticeFreeBroadcast:
+		sb.WriteString("[pi-msg: room: The room's idle agents were summoned. The text is not in this prompt.\n")
 	case noticeReplyToOwn:
 		sb.WriteString("[pi-msg: room: Your message was replied to. The text is not in this prompt.\n")
 	default:
@@ -2195,6 +2232,8 @@ func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sen
 //	"… @pi …"          anywhere       → addressed; body kept intact
 //	"… pi …"           anywhere       → addressed; body kept intact (bare mention)
 //
+// plus the room-wide handles (@everyone and friends, @free).
+//
 // Agents address each other mid-message far more often than at position 0, so
 // restricting to the leading form drops most handoffs on the floor (#21). The
 // colon form is honoured anywhere for the same reason.
@@ -2206,7 +2245,32 @@ func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sen
 // deliberate trade for not losing handoffs, and why the old code restricted
 // inline matching to the colon form. Matching is word-boundary and excludes
 // code fences and quoted lines, so a pasted transcript cannot trigger an agent.
+//
+// This is the syntactic question — "does the body name us or the room?" — and it
+// deliberately does NOT apply the @free presence gate; classify does that, since
+// only it decides delivery. Callers asking whether a message reached us must go
+// through classify.
 func (b *Bridge) matchTrigger(room, body string) (bool, string) {
+	if ok, stripped := b.matchTriggerExplicit(room, body); ok {
+		return true, stripped
+	}
+	if b.acct.TriggerFor(room) == "" {
+		return false, ""
+	}
+	t := strings.TrimSpace(body)
+	scan := stripUnquoted(t)
+	if scan != "" && (containsBroadcast(scan) || containsFreeBroadcast(scan)) {
+		return true, t
+	}
+	return false, ""
+}
+
+// matchTriggerExplicit reports whether body addresses THIS agent by name — the
+// leading "trig:" / "trig," form, an "@trig" handle, or a bare mention — leaving
+// the room-wide handles to matchTrigger. classify needs the split because the two
+// are gated differently (#130): a name is aimed, so it is delivered whatever our
+// presence says, while @free reaches an away agent only.
+func (b *Bridge) matchTriggerExplicit(room, body string) (bool, string) {
 	trig := b.acct.TriggerFor(room)
 	if trig == "" {
 		return false, ""
@@ -2221,12 +2285,43 @@ func (b *Bridge) matchTrigger(room, body string) (bool, string) {
 	}
 	// Inline forms: the address is part of the sentence, so the body is passed
 	// through unchanged — stripping would discard content.
-	if scan := stripUnquoted(t); scan != "" {
-		if containsAddress(scan, trig) || containsBroadcast(scan) || containsMention(scan, trig) {
-			return true, t
-		}
+	scan := stripUnquoted(t)
+	if scan == "" {
+		return false, ""
+	}
+	if containsAddress(scan, trig) || containsMention(scan, trig) {
+		return true, t
 	}
 	return false, ""
+}
+
+// broadcastsToAll reports whether body carries an unconditional room-wide handle
+// (@everyone / @all / @here): the form that reaches every agent in the room
+// whatever its presence.
+func broadcastsToAll(body string) bool {
+	scan := stripUnquoted(strings.TrimSpace(body))
+	return scan != "" && containsBroadcast(scan)
+}
+
+// freeOnlyBroadcast reports whether body's only claim on the room is @free: it
+// carries the tag and no unconditional broadcast. @all alongside @free wins, so
+// the presence gate never narrows the forcing function (#130).
+func freeOnlyBroadcast(body string) bool {
+	scan := stripUnquoted(strings.TrimSpace(body))
+	return scan != "" && containsFreeBroadcast(scan) && !containsBroadcast(scan)
+}
+
+// isAway reports whether our own presence has drifted to <show>away</show> — the
+// state @free addresses (#130). It reads the same presence the room sees rather
+// than a local idle flag, so "I am away" and "the roster shows me away" cannot
+// disagree. Reconnecting no longer clears the away state (see reconnectPresence),
+// which is what makes it safe to key delivery on.
+func (b *Bridge) isAway() bool {
+	if b.xmpp == nil {
+		return false
+	}
+	show, _ := b.xmpp.currentPresence()
+	return show == "away"
 }
 
 // bareMention returns the trigger word when a bare mention is the ONLY reason
@@ -2269,12 +2364,30 @@ func (b *Bridge) bareMention(room, body string) string {
 // that had been decommissioned).
 var broadcastHandles = []string{"everyone", "all", "here"}
 
+// freeHandles address only the room's AWAY agents (#130). "Free" means idle
+// enough that our presence has drifted to <show>away</show>, not merely online:
+// a dnd agent is working and a listening one has not been quiet long enough to
+// have been announced away. An agent reached this way still answers in the room
+// like any other turn, so it must not talk over work in flight or wake a fleet
+// that has not settled.
+var freeHandles = []string{"free"}
+
 // containsBroadcast reports whether scan addresses the whole room via "@everyone"
 // / "@all" / "@here". The "@" sigil is required: "all" and "here" are ordinary
 // words, and matching them bare would trigger on half of normal prose.
-func containsBroadcast(scan string) bool {
+func containsBroadcast(scan string) bool { return containsSigilHandle(scan, broadcastHandles) }
+
+// containsFreeBroadcast reports whether scan summons the room's away agents via
+// "@free" (#130). Like the unconditional handles, the sigil is required — "free"
+// on its own is ordinary prose ("free to take this").
+func containsFreeBroadcast(scan string) bool { return containsSigilHandle(scan, freeHandles) }
+
+// containsSigilHandle reports whether scan carries "@<handle>" for one of handles.
+// The sigil is required, and the handle must end at a word boundary so
+// "@freely" and "@allocate" are not handles.
+func containsSigilHandle(scan string, handles []string) bool {
 	lower := strings.ToLower(scan)
-	for _, h := range broadcastHandles {
+	for _, h := range handles {
 		for i := 0; ; {
 			j := strings.Index(lower[i:], "@"+h)
 			if j < 0 {
@@ -2282,7 +2395,7 @@ func containsBroadcast(scan string) bool {
 			}
 			at := i + j
 			i = at + 1 + len(h)
-			// Reject "@everyones" / "@allocate": the handle must end here.
+			// Reject "@everyones" / "@freely": the handle must end here.
 			if i < len(lower) && isWordByte(lower[i]) {
 				continue
 			}
@@ -2532,8 +2645,11 @@ func (b *Bridge) handleIssues(room, body string) (unknown []string, selfTag stri
 		known[strings.ToLower(b.acct.Owner[:i])] = struct{}{}
 	}
 	// "@everyone" and friends address the whole room, so they are real handles,
-	// not typos.
+	// not typos — and so is @free, which addresses the room's away agents.
 	for _, h := range broadcastHandles {
+		known[h] = struct{}{}
+	}
+	for _, h := range freeHandles {
 		known[h] = struct{}{}
 	}
 	seen := map[string]struct{}{}
@@ -2683,6 +2799,9 @@ func (b *Bridge) addressesRoom(room, body string) bool {
 		bare[strings.ToLower(b.acct.Owner[:i])] = struct{}{}
 	}
 	for _, h := range broadcastHandles {
+		handles[h] = struct{}{}
+	}
+	for _, h := range freeHandles {
 		handles[h] = struct{}{}
 	}
 	for _, name := range mentionsIn(body) {

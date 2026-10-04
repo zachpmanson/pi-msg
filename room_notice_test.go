@@ -65,10 +65,22 @@ func TestRoomPointerBlocks(t *testing.T) {
 			notice: &roomNotice{kind: noticeOwnerBroadcast},
 			sender: owner,
 			id:     osid,
-			want: "[pi-msg: room: The owner broadcast to everyone in a room. The text is not in this prompt.\n" +
+			want: "[pi-msg: room: The owner broadcast to the room's idle agents. The text is not in this prompt.\n" +
 				"from: " + room + "\n" +
 				"sender: " + owner + "\n" +
 				"stanza-id: " + osid + "\n" +
+				"react-to: " + room + "\n" +
+				`Check message using read_room(room="` + room + `", limit=15).]`,
+		},
+		{
+			name:   "F the room's idle agents were summoned",
+			notice: &roomNotice{kind: noticeFreeBroadcast},
+			sender: fox,
+			id:     sid,
+			want: "[pi-msg: room: The room's idle agents were summoned. The text is not in this prompt.\n" +
+				"from: " + room + "\n" +
+				"sender: " + fox + "\n" +
+				"stanza-id: " + sid + "\n" +
 				"react-to: " + room + "\n" +
 				`Check message using read_room(room="` + room + `", limit=15).]`,
 		},
@@ -203,6 +215,9 @@ func TestRoomNoticeFor(t *testing.T) {
 		{"peer tag", InboundMessage{Room: room, Body: "pi: hi"}, noticeTag},
 		{"owner tag", InboundMessage{Room: room, Body: "pi: hi", FromOwner: true}, noticeTag},
 		{"owner broadcast", InboundMessage{Room: room, Body: "everyone please note", FromOwner: true}, noticeOwnerBroadcast},
+		{"owner @free", InboundMessage{Room: room, Body: "@free report in", FromOwner: true}, noticeOwnerBroadcast},
+		{"peer @free", InboundMessage{Room: room, Body: "@free report in"}, noticeFreeBroadcast},
+		{"peer @free naming us too", InboundMessage{Room: room, Body: "@free and pi: report in"}, noticeTag},
 		{"owner broadcast to all", InboundMessage{Room: room, Body: "@everyone hello", FromOwner: true}, noticeTag},
 		{"reply to ours", InboundMessage{Room: room, Body: "and another thing", ReplyToID: ours}, noticeReplyToOwn},
 	}
