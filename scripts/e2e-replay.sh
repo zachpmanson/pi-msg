@@ -126,7 +126,7 @@ wait_online() {
 # ---- preconditions ----
 command -v persona-ctl >/dev/null || die "persona-ctl not on PATH (run as beltino with sudo perms)."
 command -v jq >/dev/null || die "jq required."
-[ -x "$MSG_BIN" ] || { log "building msg…"; ( cd "$MSG_DIR" && go build -o msg . ); }
+[ -x "$MSG_BIN" ] || { log "building msg…"; ( cd "$MSG_DIR" && go build -o msg ./cmd/pi-msg ); }
 [ -f "$CONFIG" ] || die "no pi-msg config at $CONFIG"
 jq -e --arg b "$BRIDGE" '.accounts | has($b)' "$CONFIG" >/dev/null 2>&1 \
   || die "bridge persona '${BRIDGE}' not in pi-msg config — create it first (beltino: scripts/persona.sh create ${BRIDGE})"

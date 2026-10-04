@@ -103,6 +103,13 @@ Per-account fields:
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
 `PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
 
+## Project layout
+
+- `cmd/pi-msg/` — executable entry point
+- `internal/pimsg/` — bridge implementation and tests
+- `internal/pimsg/piext/` — embedded Pi extension source
+- `docs/`, `scripts/` — project documentation and tooling
+
 ## Building
 
 ```bash

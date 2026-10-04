@@ -1,4 +1,4 @@
-package main
+package pimsg
 
 import (
 	_ "embed"
@@ -8,7 +8,7 @@ import (
 
 // xmppToolsExt is the companion Pi extension source, embedded into the binary
 // so there's nothing to install separately. pi-msg writes it to a temp file at
-// startup and launches pi with `-e <that file>`. See piext/xmpp-tools.ts.
+// startup and launches pi with `-e <that file>`. See internal/pimsg/piext/xmpp-tools.ts.
 //
 //go:embed piext/xmpp-tools.ts
 var xmppToolsExt string

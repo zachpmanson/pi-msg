@@ -1,6 +1,5 @@
-// Command pi-msg bridges the Pi coding agent (`pi --mode rpc`) to XMPP, so the
-// agent can be driven from a chat client. See README.md.
-package main
+// Package pimsg contains the XMPP bridge and its command-line runner.
+package pimsg
 
 import (
 	"context"
@@ -14,14 +13,8 @@ import (
 	"syscall"
 )
 
-func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "[pi-msg] %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func run() error {
+// Run parses command-line flags and runs the bridge.
+func Run() error {
 	// Invocation-time initial prompt: spawn a fresh, on-demand persona with this
 	// task as its very first prompt (beltino#18 doer flow). --command is an
 	// alias; both are explicit "stateless spawn" requests, so the saved session

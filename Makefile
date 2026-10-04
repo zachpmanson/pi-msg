@@ -1,7 +1,7 @@
 .PHONY: build typecheck clean format deploy e2e-replay
 
 build:
-	go build -o pi-msg .
+	go build -o pi-msg ./cmd/pi-msg
 
 typecheck:
 	go vet ./...
