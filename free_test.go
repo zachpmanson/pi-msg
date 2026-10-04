@@ -2,13 +2,20 @@ package main
 
 import "testing"
 
-// setShow puts the bridge's own presence into the given show state — the one
-// fact the @free gate reads (#130).
-func setShow(b *Bridge, show string) {
-	if show == "" {
-		// A fresh bridge is already available with the start label; nothing to do.
-		return
-	}
+// setRan forces the has-run flag. markRan only ever sets it, so a table that
+// revisits both sides of the gate needs the explicit setter.
+func setRan(b *Bridge, ran bool) {
+	b.mu.Lock()
+	b.ranSinceStart = ran
+	b.mu.Unlock()
+}
+
+// setShow puts the bridge's own presence into the given show state, and ran says
+// whether a run has already happened on it — the two facts freeForSummons reads
+// (#130). It sets the show explicitly rather than only when non-empty, so a table
+// that visits "away" before "" lands on the available state it asked for.
+func setShow(b *Bridge, show string, ran bool) {
+	setRan(b, ran)
 	b.xmpp.SetPresence(show, "test")
 }
 
@@ -45,46 +52,75 @@ func TestFreeHandleSyntax(t *testing.T) {
 	}
 }
 
-// The gate, in one table: @free and an untagged owner message reach an away
-// agent and nobody else, while every aimed form — a name, @everyone — is
-// delivered whatever the presence says.
+// freeForSummons is the gate itself: away, or a bridge nothing has been asked of.
+// The fresh half is what keeps a just-deployed fleet summonable; the settled half
+// is what keeps a peer from waking an agent that has worked and has deliberately
+// been left alone since.
+func TestFreeForSummons(t *testing.T) {
+	cases := []struct {
+		name string
+		show string
+		ran  bool
+		want bool
+	}{
+		{"fresh bridge, available", "", false, true},
+		{"fresh bridge, visibly working", "dnd", false, false},
+		{"settled bridge, available", "", true, false},
+		{"settled bridge, working", "dnd", true, false},
+		{"settled bridge, away", "away", true, true},
+		{"fresh bridge, away", "away", false, true},
+	}
+	for _, c := range cases {
+		b, _ := roomWith("peppy")
+		setShow(b, c.show, c.ran)
+		if got := b.freeForSummons(); got != c.want {
+			t.Errorf("%s (show=%q, ran=%v): freeForSummons = %v, want %v", c.name, c.show, c.ran, got, c.want)
+		}
+	}
+}
+
+// The gate, in one table: @free and an untagged owner message reach a free agent
+// and nobody else, while every aimed form — a name, @everyone — is delivered
+// whatever the state says.
 func TestFreeBroadcastGating(t *testing.T) {
 	cases := []struct {
 		name      string
 		body      string
 		fromOwner bool
 		show      string
+		ran       bool
 		addressed bool // m.Addressed: already admitted on first arrival
 		want      roomAction
 	}{
-		{"owner untagged, away", "status please", true, "away", false, actionCanonical},
-		{"owner untagged, listening", "status please", true, "", false, actionNotOurs},
-		{"owner untagged, dnd", "status please", true, "dnd", false, actionNotOurs},
-		{"owner @free, away", "@free status please", true, "away", false, actionCanonical},
-		{"owner @free, listening", "@free status please", true, "", false, actionNotOurs},
-		{"owner @all, listening", "@all status please", true, "", false, actionCanonical},
-		{"owner @everyone, dnd", "@everyone status please", true, "dnd", false, actionCanonical},
-		{"owner names us, dnd", "pi: take this", true, "dnd", false, actionCanonical},
-		{"owner names a peer, away", "@peppy take this", true, "away", false, actionNotOurs},
-		{"owner untagged replayed, listening", "status please", true, "", true, actionCanonical},
-		{"peer @free, away", "@free status please", false, "away", false, actionCommentary},
-		{"peer @free, listening", "@free status please", false, "", false, actionNotOurs},
-		{"peer @free, dnd", "@free status please", false, "dnd", false, actionNotOurs},
-		{"peer @all, dnd", "@all report in", false, "dnd", false, actionCommentary},
-		{"peer names us, listening", "pi: report in", false, "", false, actionCommentary},
-		{"peer prose naming us, dnd", "ask pi for the path", false, "dnd", false, actionCommentary},
-		{"peer untagged, away", "just chatting", false, "away", false, actionNotOurs},
+		{"owner untagged, fresh", "status please", true, "", false, false, actionCanonical},
+		{"owner untagged, settled", "status please", true, "", true, false, actionNotOurs},
+		{"owner untagged, working", "status please", true, "dnd", true, false, actionNotOurs},
+		{"owner untagged, away", "status please", true, "away", true, false, actionCanonical},
+		{"owner @free, fresh", "@free status please", true, "", false, false, actionCanonical},
+		{"owner @free, settled", "@free status please", true, "", true, false, actionNotOurs},
+		{"owner @all, settled", "@all status please", true, "", true, false, actionCanonical},
+		{"owner @everyone, working", "@everyone status please", true, "dnd", true, false, actionCanonical},
+		{"owner names us, working", "pi: take this", true, "dnd", true, false, actionCanonical},
+		{"owner names a peer, away", "@peppy take this", true, "away", true, false, actionNotOurs},
+		{"owner untagged replayed, settled", "status please", true, "", true, true, actionCanonical},
+		{"peer @free, fresh", "@free status please", false, "", false, false, actionCommentary},
+		{"peer @free, settled", "@free status please", false, "", true, false, actionNotOurs},
+		{"peer @free, working", "@free status please", false, "dnd", true, false, actionNotOurs},
+		{"peer @all, working", "@all report in", false, "dnd", true, false, actionCommentary},
+		{"peer names us, settled", "pi: report in", false, "", true, false, actionCommentary},
+		{"peer prose naming us, working", "ask pi for the path", false, "dnd", true, false, actionCommentary},
+		{"peer untagged, away", "just chatting", false, "away", true, false, actionNotOurs},
 	}
 	for _, c := range cases {
 		b, room := roomWith("peppy")
-		setShow(b, c.show)
+		setShow(b, c.show, c.ran)
 		action, _, _ := b.classify(InboundMessage{
 			Room: room, Nick: "peppy", Body: c.body,
 			FromOwner: c.fromOwner, Addressed: c.addressed,
 		})
 		if action != c.want {
-			t.Errorf("%s: classify(%q, owner=%v, show=%q) = %d, want %d",
-				c.name, c.body, c.fromOwner, c.show, action, c.want)
+			t.Errorf("%s: classify(%q, owner=%v, show=%q, ran=%v) = %d, want %d",
+				c.name, c.body, c.fromOwner, c.show, c.ran, action, c.want)
 		}
 	}
 }
