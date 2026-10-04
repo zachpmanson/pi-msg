@@ -506,9 +506,9 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	b.online = true
 	// Re-assert the startup status on every (re)connect so the roster shows the
 	// correct label (fresh start "awake" vs resumed "resumed") rather than a
-	// stale idle label from a previous session.
-	b.show = ""
-	b.presence = b.startStatus
+	// stale idle label from a previous session — unless we are genuinely away,
+	// which is a fact about the agent rather than about this socket (#130).
+	b.show, b.presence = reconnectPresence(b.show, b.presence, b.startStatus)
 	show, status := b.show, b.presence
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
 	b.occupants = make(map[string]map[string]string)
@@ -2026,6 +2026,22 @@ func (b *XMPPBridge) currentPresence() (show, status string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.show, b.presence
+}
+
+// reconnectPresence decides what presence a (re)connect announces, given the
+// presence we already hold and the startup label. Normally the startup label
+// wins, so the roster shows "awake"/"resumed" rather than a stale idle label
+// from a previous session. An agent that is already away keeps its away
+// presence: away describes the agent, not the socket, and the idle watcher
+// announces an away period once (awayAnnounced), so a reconnect that cleared it
+// would leave the room reading "listening" until the agent next worked. That is
+// not cosmetic — @free addresses only away agents (#130), so a cleared away
+// state silently puts the agent out of reach of the room.
+func reconnectPresence(show, status, startStatus string) (string, string) {
+	if show == "away" {
+		return show, status
+	}
+	return "", startStatus
 }
 
 // encodePresenceTo sends one presence stanza. An empty "to" broadcasts

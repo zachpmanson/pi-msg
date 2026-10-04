@@ -34,10 +34,12 @@ func TestAddressesRoom(t *testing.T) {
 		{"peppy, the path is /srv/x", true},
 		{"@everyone report in", true},
 		{"@ALL report in", true},
+		{"@free report in", true}, // a real handle, like @everyone (addresses the away agents)
 		{"the path is /srv/x", false},
 		{"everyone should report in", false}, // bare broadcast word is prose
 		{"that's all from me", false},        // ditto
 		{"we're all here", false},            // ditto
+		{"we are free to go", false},         // ditto, for @free's word
 		{"@nosuchhandle the path is /srv/x", false},
 		{"@pi the path is /srv/x", false}, // our own handle addresses nobody
 		{"```\n@peppy in a fence\n```", false},
