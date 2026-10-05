@@ -130,6 +130,9 @@ type Account struct {
 	// messages (both owner and addressed non-owner commentary). Independent of
 	// the 1:1 reactions flag — you can opt into one, both, or neither.
 	RoomReactions bool `json:"roomReactions,omitempty"`
+	// ResetSessionOnAway starts a fresh Pi session when this account transitions
+	// from idle/available to away. Disabled by default.
+	ResetSessionOnAway bool `json:"resetSessionOnAway,omitempty"`
 	// BeforeAgentStartText, when set, is injected into the agent's system prompt
 	// at the start of every turn (via the companion extension's
 	// before_agent_start hook). Re-applying it each turn is the point: a steer
@@ -212,17 +215,18 @@ type Config struct {
 // ResolvedAccount is a fully-resolved account ready to connect with, defaults
 // applied. RoomMode reports whether any room was set.
 type ResolvedAccount struct {
-	Name          string
-	JID           string
-	Password      string
-	Owner         string
-	Service       string
-	Resource      string
-	ToolActivity  bool
-	Reactions     bool
-	RoomReactions bool
-	Model         string
-	Workdir       string
+	Name               string
+	JID                string
+	Password           string
+	Owner              string
+	Service            string
+	Resource           string
+	ToolActivity       bool
+	Reactions          bool
+	RoomReactions      bool
+	ResetSessionOnAway bool
+	Model              string
+	Workdir            string
 	// Rooms is the joined room JIDs (normal rooms only — the error room is not
 	// in here, and must never be). It is derived from RoomSpecs at resolve time.
 	Rooms []string
@@ -773,22 +777,23 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 	}
 
 	return ResolvedAccount{
-		Name:          name,
-		JID:           acct.JID,
-		Password:      acct.Password,
-		Owner:         acct.Owner,
-		Service:       service,
-		Resource:      resource,
-		ToolActivity:  acct.ToolActivity,
-		Reactions:     acct.Reactions,
-		RoomReactions: acct.RoomReactions,
-		Model:         acct.Model,
-		Workdir:       acct.Workdir,
-		Rooms:         rooms,
-		RoomSpecs:     specs,
-		Nick:          nick,
-		RoomTrigger:   trigger,
-		UploadService: strings.TrimSpace(acct.UploadService),
+		Name:               name,
+		JID:                acct.JID,
+		Password:           acct.Password,
+		Owner:              acct.Owner,
+		Service:            service,
+		Resource:           resource,
+		ToolActivity:       acct.ToolActivity,
+		Reactions:          acct.Reactions,
+		RoomReactions:      acct.RoomReactions,
+		ResetSessionOnAway: acct.ResetSessionOnAway,
+		Model:              acct.Model,
+		Workdir:            acct.Workdir,
+		Rooms:              rooms,
+		RoomSpecs:          specs,
+		Nick:               nick,
+		RoomTrigger:        trigger,
+		UploadService:      strings.TrimSpace(acct.UploadService),
 		// Trimmed so a whitespace-only value counts as "not set" rather than
 		// injecting a blank paragraph every turn.
 		BeforeAgentStartText: strings.TrimSpace(acct.BeforeAgentStartText),

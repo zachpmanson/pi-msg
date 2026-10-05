@@ -73,19 +73,22 @@ type Bridge struct {
 	// (see fireInitialPrompt). Used by the sentinel doer flow (beltino#18).
 	initialPrompt string
 
-	mu             sync.Mutex
-	streamingRun   bool
-	busyMarked     bool // on-disk <acct>.busy reflects work in flight (see syncBusyMarker)
-	repliedThisRun bool
-	shuttingDown   bool
-	routingNudges  int           // mis-routed-reply corrections sent this user turn (bounded)
-	pendingNudge   *pendingNudge // staged routing correction, decided at agent_settled (#16)
-	reactTo        string        // full JID of the owner message the current run reacts to
-	reactID        string        // stanza id of that message (XEP-0444 target); "" disables
-	turnDest       string        // reply destination for the current turn (owner or room jid)
-	routingSeeded  bool          // the pi-msg routing contract has been injected into this session (once)
-	reactionAckRun bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
-	heartbeatRun   bool          // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
+	mu sync.Mutex
+	// sessionTransitionMu serializes an idle-triggered fresh-session swap with
+	// inbound delivery, so a message at the away boundary lands in one session.
+	sessionTransitionMu sync.Mutex
+	streamingRun        bool
+	busyMarked          bool // on-disk <acct>.busy reflects work in flight (see syncBusyMarker)
+	repliedThisRun      bool
+	shuttingDown        bool
+	routingNudges       int           // mis-routed-reply corrections sent this user turn (bounded)
+	pendingNudge        *pendingNudge // staged routing correction, decided at agent_settled (#16)
+	reactTo             string        // full JID of the owner message the current run reacts to
+	reactID             string        // stanza id of that message (XEP-0444 target); "" disables
+	turnDest            string        // reply destination for the current turn (owner or room jid)
+	routingSeeded       bool          // the pi-msg routing contract has been injected into this session (once)
+	reactionAckRun      bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
+	heartbeatRun        bool          // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
 	// runActive is when the current run last took a message into its context —
 	// an injected steer or a fresh assistant turn begins one. The inbox compares
 	// it with a delivery stamp at settle to tell a message the run consumed from
@@ -992,6 +995,8 @@ type HeartbeatProcess struct {
 // commands that need a response block only this handler, not pi's event
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
+	b.sessionTransitionMu.Lock()
+	defer b.sessionTransitionMu.Unlock()
 	// Everything that reaches here has been taken in by the agent, so the
 	// persistent last-inbound cursor advances with it. Written after the
 	// hand-off, not before: if the process dies while the run is in flight the
@@ -4332,6 +4337,8 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 // once per idle period, once the agent has been idle past idleAwayTimeout.
 // Split out from idleWatcher so it's callable directly from tests.
 func (b *Bridge) idleTick() {
+	b.sessionTransitionMu.Lock()
+	defer b.sessionTransitionMu.Unlock()
 	b.mu.Lock()
 	idle := !b.idleSince.IsZero()
 	elapsed := time.Since(b.idleSince)
@@ -4341,6 +4348,32 @@ func (b *Bridge) idleTick() {
 	if !idle || b.streamingRun || b.bgProcesses > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
 		b.mu.Unlock()
 		return
+	}
+	// First tick past the threshold: optionally start a fresh session before
+	// announcing away. If reset fails, leave the transition unannounced so the
+	// next tick can retry rather than silently keeping stale context.
+	if b.acct.ResetSessionOnAway {
+		if b.rpc == nil {
+			b.mu.Unlock()
+			b.log("warning", "resetSessionOnAway: pi RPC unavailable; deferring away transition")
+			return
+		}
+		b.mu.Unlock()
+		res, err := b.rpc.NewSession(b.ctx)
+		if err != nil {
+			b.log("warning", "resetSessionOnAway: new session failed: "+err.Error())
+			return
+		}
+		if !res.success() {
+			b.log("warning", "resetSessionOnAway: new session failed: "+res.errText())
+			return
+		}
+		b.refreshSessionFile()
+		b.routingSeeded = false
+		b.markFresh()
+		b.mu.Lock()
+		// The transition mutex prevents inbound activity from changing this
+		// idle period while the RPC session swap is in progress.
 	}
 	// First tick past the threshold: announce away once, picking an
 	// activity different from the previous away period's.
