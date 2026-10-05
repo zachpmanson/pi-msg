@@ -23,6 +23,36 @@ func writeConfig(t *testing.T, cfg Config) string {
 	return path
 }
 
+func TestResolveAccountResetSessionOnAway(t *testing.T) {
+	cfg := &Config{Accounts: map[string]Account{
+		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com"},
+	}}
+	got, err := resolveAccount(cfg, "")
+	if err != nil {
+		t.Fatalf("resolveAccount default: %v", err)
+	}
+	if got.ResetSessionOnAway {
+		t.Fatal("ResetSessionOnAway = true by default, want false")
+	}
+
+	cfg.Accounts["default"] = Account{
+		JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com",
+		ResetSessionOnAway: true,
+	}
+	path := writeConfig(t, *cfg)
+	loaded, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	got, err = resolveAccount(loaded, "")
+	if err != nil {
+		t.Fatalf("resolveAccount enabled: %v", err)
+	}
+	if !got.ResetSessionOnAway {
+		t.Fatal("ResetSessionOnAway = false, want true from config")
+	}
+}
+
 func TestResolveAccountDefaults(t *testing.T) {
 	cfg := &Config{Accounts: map[string]Account{
 		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com"},
