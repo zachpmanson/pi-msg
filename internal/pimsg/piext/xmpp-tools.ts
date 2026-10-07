@@ -15,14 +15,8 @@
 // server refusing an upload as too large) reaches the LLM as the tool error
 // instead of a bare boolean (pi-msg issue #34).
 //
-// Which tools are registered is chosen by pi-msg via the PI_MSG_TOOLS env var
-// (comma-separated); this mirrors the account's config (e.g. send_reaction is
-// gated on the `reactions` opt-in, read_room on the account having joined a
-// room). This is the "structured tool call instead
-// of in-band text" path from issue #8 / docs/subagents.md. Routing (`to:`)
-// intentionally stays prompt-injected; only discrete side-effect actions move
-// to tools — read_room is the one read-side tool, and with no ambient buffer
-// (#106) it is how an agent inspects a room it was not addressed in.
+// Message sending and conversation history are explicit tools in every account
+// mode. The bridge selects this extension's tool set through PI_MSG_TOOLS.
 //
 // Types are erased by jiti at load time, so the `import type` never resolves at
 // runtime; only the value import (`typebox`) is resolved, against Pi's own deps.
@@ -355,7 +349,7 @@ ${systemPrompt}`;
 	// Unset (e.g. running the extension standalone) enables both.
 	const raw = process.env.PI_MSG_TOOLS;
 	const enabled =
-		raw === undefined ? new Set(["file", "reaction", "room"]) : new Set(raw.split(",").map((s) => s.trim()));
+		raw === undefined ? new Set(["file", "reaction", "messages", "messaging"]) : new Set(raw.split(",").map((s) => s.trim()));
 
 	// relay hands an action to pi-msg and blocks for its string result: "ok" on
 	// success, or a failure reason that becomes the tool error the model sees.
@@ -407,21 +401,60 @@ ${systemPrompt}`;
 		});
 	}
 
-	if (enabled.has("room")) {
+	if (enabled.has("messaging")) {
 		pi.registerTool({
-			name: "read_room",
-			label: "Read room history (XMPP)",
+			name: "send_message",
+			label: "Send chat message (XMPP)",
 			description:
-				"Read messages from a group chat this bridge has joined, via the server's XEP-0313 archive. Defaults to the NEWEST 30 (max 100) messages; `since` and `before` narrow the window. The bridge does NOT deliver or buffer room messages that do not address you, so this is the only way to see what was said. Returns messages oldest first with sender, age, and distinct IDs: `[id …]` is the MAM archive ID for `before` pagination; `[stanza …]` is the message stanza ID for reactions and `to: <stanza-id>` replies. It also reports the room as it happened, including the lines this account sent, marked `[we sent]`. Reading does not reply to anything.",
-			promptSnippet: "Read recent history from a joined group chat",
+				"Send a message explicitly to the owner, a joined room, or a known room occupant. Other valid JIDs are allowed only when account config `allowArbitraryJid` is true. Final assistant text is internal to the harness and is never sent automatically. Use `reply_to` with a `[stanza …]` message ID to thread a reply; never use an archive `[id …]` cursor.",
+			promptSnippet: "Send a message to an XMPP conversation",
 			promptGuidelines: [
-				"Use read_room when you need the wider room conversation — a handoff you were not named in, or context behind a message that addressed you.",
-				"Omit `room` when the account joins a single room; pass it when it joins several.",
-				"Pass `since` (an RFC 3339 stamp or a relative age like 2h) to bound the read, and `before` (an archive id printed as `[id …]` on a previous read) to page further back than the newest window.",
-				"read_room only reads. Send anything you want to say with a normal reply (a `to: <room jid>` line).",
+				"Use send_message for every outbound chat message; a final assistant response is not delivered to chat.",
+				"Choose `to` from the conversation JID (`from:`) or sender JID (`sender:`); use the owner JID to message the owner.",
+				"Use `reply_to` only when replying to a specific stanza; a message ID from read_messages is valid. Multiple recipients require multiple calls.",
+				"Only the owner, joined rooms, and known occupants are allowed by default. `allowArbitraryJid: true` permits other valid JIDs.",
 			],
 			parameters: Type.Object({
-				room: Type.Optional(Type.String({ description: "Room JID to read; defaults to the only joined room when the account joins one" })),
+				to: Type.String({ description: "Destination JID: owner, joined room, or known occupant; arbitrary JIDs require allowArbitraryJid=true" }),
+				text: Type.String({ description: "Message body to send" }),
+				reply_to: Type.Optional(Type.String({ description: "Optional stanza ID from an incoming message or read_messages result to thread this reply under" })),
+			}),
+			async execute(_toolCallId, params) {
+				const p = params as { to?: string; text?: string; reply_to?: string };
+				const to = String(p.to ?? "").trim();
+				const text = String(p.text ?? "").trim();
+				if (!to) throw new Error("to is required");
+				if (!text) throw new Error("text is required");
+				const result = await relay("send_message", { to, text, replyTo: p.reply_to ?? "" });
+				if (!result.startsWith("sent:")) {
+					throw new Error("pi-msg could not send the message: " + result);
+				}
+				return {
+					content: [{ type: "text", text: `Message sent to ${to}.` }],
+					details: { to, reply_to: p.reply_to ?? "", result },
+				};
+			},
+		});
+	}
+
+	if (enabled.has("messages")) {
+		pi.registerTool({
+			name: "read_messages",
+			label: "Read conversation history (XMPP)",
+			description:
+				"Read an XMPP room or 1:1 chat from its XEP-0313 archive. Defaults to the newest 30 (max 100) messages; `since` and `before` narrow/page the window. By default, only the owner JID and configured rooms are readable; account config `allowArbitraryJid` can permit other peers. Returns messages oldest first with `[id …]` as the archive pagination cursor and `[stanza …]` as the message ID for send_message's `reply_to`. Includes sent lines marked `[we sent]`. Reading does not send a message.",
+			promptSnippet: "Read room or 1:1 conversation history",
+			promptGuidelines: [
+				"Use read_messages when you need earlier context or a room conversation you were not addressed in.",
+				"Pass a room or peer JID as `target`. With no target, a single-room account defaults to that room; a 1:1 account defaults to the owner.",
+				"By default, only the owner and configured rooms are readable. Other peers require `allowArbitraryJid: true` in account config.",
+				"Pass `since` (RFC 3339 timestamp or relative age like 2h) to bound the read, and `before` using an archive `[id …]` cursor to page older.",
+				"To reply, call send_message; use `[stanza …]` as its optional `reply_to`, never `[id …]`.",
+				"read_messages only reads. Use send_message to send a chat message; final assistant text is internal to the harness.",
+			],
+			parameters: Type.Object({
+				target: Type.Optional(Type.String({ description: "Owner or joined room JID; omitted defaults to the sole room or, for 1:1 accounts, the owner" })),
+
 				limit: Type.Optional(Type.Number({ description: "How many messages to fetch (default 30, max 100)" })),
 				since: Type.Optional(
 					Type.String({
@@ -429,16 +462,12 @@ ${systemPrompt}`;
 							"Lower bound on the window: an RFC 3339 timestamp (e.g. 2026-09-28T19:30:00+10:00) or a relative age (e.g. 2h, 90m). Omit for no lower bound.",
 					}),
 				),
-				before: Type.Optional(
-					Type.String({
-						description:
-							"Pagination cursor: an archive id, printed as `[id …]` on a previous read. Do not use the separate `[stanza …]` id here: it is the message's own stanza ID, for reactions and reply routing, and the archive does not index it. Returns the messages strictly older than the archive id given. An unknown or expired id is reported as an error rather than silently returning the newest page.",
-					}),
-				),
+				before: Type.Optional(Type.String({ description: "Archive cursor from `[id …]` on a previous read; returns strictly older messages. Do not use a `[stanza …]` message ID here." })),
+
 			}),
 			async execute(_toolCallId, params) {
-				const p = params as { room?: string; limit?: number; since?: string; before?: string };
-				const args: Record<string, unknown> = { room: p.room ?? "" };
+				const p = params as { target?: string; limit?: number; since?: string; before?: string };
+				const args: Record<string, unknown> = { target: p.target ?? "" };
 				if (typeof p.limit === "number" && Number.isFinite(p.limit)) {
 					args.limit = Math.trunc(p.limit);
 				}
@@ -448,15 +477,13 @@ ${systemPrompt}`;
 				if (typeof p.before === "string" && p.before.trim()) {
 					args.before = p.before.trim();
 				}
-				const result = await relay("read_room", args);
-				// A successful read always starts with the pi-msg header; anything else
-				// is the failure reason, which must reach the model as the tool error.
-				if (!result.startsWith("[pi-msg: read_room:")) {
-					throw new Error("read_room failed: " + result);
+				const result = await relay("read_messages", args);
+				if (!result.startsWith("[pi-msg: read_messages:")) {
+					throw new Error("read_messages failed: " + result);
 				}
 				return {
 					content: [{ type: "text", text: result }],
-					details: { room: p.room ?? "", limit: args.limit, since: args.since, before: args.before },
+					details: { target: p.target ?? "", limit: args.limit, since: args.since, before: args.before },
 				};
 			},
 		});
@@ -467,10 +494,10 @@ ${systemPrompt}`;
 			name: "send_file",
 			label: "Send file (XMPP)",
 			description:
-				"Upload a local file and deliver it to the human over XMPP (XEP-0363 HTTP Upload). The path must be absolute and readable on this host. Defaults to the current conversation; pass `to` to target a specific allowed JID. Returns the share URL of the uploaded file, but DO NOT repeat the URL in the XMPP chat itself — the recipient can already see the file there. The URL is only for reuse in other places (e.g. a GitHub PR description).",
+				"Upload a local file and deliver it to the human over XMPP (XEP-0363 HTTP Upload). The path must be absolute and readable on this host. Defaults to the current conversation; pass `to` to target a specific allowed JID. Sending a file does not count as a chat reply; use send_message if a response is needed. Returns the share URL of the uploaded file, but DO NOT repeat the URL in the XMPP chat itself — the recipient can already see the file there. The URL is only for reuse in other places (e.g. a GitHub PR description).",
 			promptSnippet: "Send a local file (log, diff, image) to the human over chat",
 			promptGuidelines: [
-				"Use send_file to deliver a real local file to the human; give an absolute path. It is for files, not for pasting text.",
+				"Use send_file to deliver a real local file to the human; give an absolute path. It is for files, not for pasting text, and it does not replace send_message when a chat reply is required.",
 				"The tool result includes the share URL — reuse it (e.g. in a PR description or follow-up message) instead of describing the file.",
 			],
 			parameters: Type.Object({

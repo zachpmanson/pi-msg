@@ -87,7 +87,7 @@ func TestLiveMAMQuery(t *testing.T) {
 
 // Live check of the read path's paging: FetchMAMLastPage must return the NEWEST
 // messages, not the archive's first page. The distinction is invisible in a unit
-// test (it is server behaviour), and getting it wrong made read_room hand the
+// test (it is server behaviour), and getting it wrong made read_messages hand the
 // agent the room's oldest messages while claiming they were the latest.
 //
 // Run with the same env as TestLiveMAMQuery plus PI_MSG_LIVE_LASTPAGE=1.

@@ -26,7 +26,7 @@ func capturedPrompt(t *testing.T, buf *bytes.Buffer) string {
 }
 
 // The five room pointer blocks (#58): the agent is told what reached it and
-// given the addressing meta, and pulls the text itself with read_room. These
+// given the addressing meta, and pulls the text itself with read_messages. These
 // strings are character-comparable against the issue's spec, with the JIDs
 // substituted.
 func TestRoomPointerBlocks(t *testing.T) {
@@ -39,7 +39,7 @@ func TestRoomPointerBlocks(t *testing.T) {
 		parent = "f37efb047ec9978c"
 	)
 	b := newTestBridge(ResolvedAccount{Owner: owner, Rooms: []string{room}, Nick: "pi", RoomTrigger: "pi"})
-	b.routingSeeded = true // skip the seed; these tests assert the block alone
+	b.messagingSeeded = true // skip the seed; these tests assert the block alone
 
 	cases := []struct {
 		name   string
@@ -58,7 +58,7 @@ func TestRoomPointerBlocks(t *testing.T) {
 				"sender: " + fox + "\n" +
 				"stanza-id: " + sid + "\n" +
 				"react-to: " + room + "\n" +
-				`Check message using read_room(room="` + room + `", limit=15).]`,
+				`Check message using read_messages(target="` + room + `", limit=15).]`,
 		},
 		{
 			name:   "C the owner broadcast",
@@ -70,7 +70,7 @@ func TestRoomPointerBlocks(t *testing.T) {
 				"sender: " + owner + "\n" +
 				"stanza-id: " + osid + "\n" +
 				"react-to: " + room + "\n" +
-				`Check message using read_room(room="` + room + `", limit=15).]`,
+				`Check message using read_messages(target="` + room + `", limit=15).]`,
 		},
 		{
 			name:   "F the room's idle agents were summoned",
@@ -82,7 +82,7 @@ func TestRoomPointerBlocks(t *testing.T) {
 				"sender: " + fox + "\n" +
 				"stanza-id: " + sid + "\n" +
 				"react-to: " + room + "\n" +
-				`Check message using read_room(room="` + room + `", limit=15).]`,
+				`Check message using read_messages(target="` + room + `", limit=15).]`,
 		},
 		{
 			name:   "E a reply to our message",
@@ -95,7 +95,7 @@ func TestRoomPointerBlocks(t *testing.T) {
 				"stanza-id: " + sid + "\n" +
 				"in-reply-to: " + parent + "\n" +
 				"react-to: " + room + "\n" +
-				`Check message using read_room(room="` + room + `", limit=15).]`,
+				`Check message using read_messages(target="` + room + `", limit=15).]`,
 		},
 	}
 	for _, tc := range cases {
@@ -110,12 +110,12 @@ func TestRoomPointerBlocks(t *testing.T) {
 }
 
 // A tagged room message produces a prompt with no body text in it (#58): the
-// body is reachable only through read_room.
+// body is reachable only through read_messages.
 func TestTaggedRoomMessagePromptHasNoBody(t *testing.T) {
 	const room = "team@muc.x"
 	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{room}, Nick: "pi", RoomTrigger: "pi"}
 	b := newTestBridge(acct)
-	b.routingSeeded = true
+	b.messagingSeeded = true
 	var buf bytes.Buffer
 	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
 
@@ -153,7 +153,7 @@ func TestReactionAckQuotesOurOwnMessage(t *testing.T) {
 		ReactionID: target, Reactions: []string{"✅"},
 	})
 
-	want := `[pi-msg: room: fox reacted ✅ to your message "**D.** Baton → @slippy for **E**". You may acknowledge, act on it, or ignore — reply with "to: noop" if you have nothing to add.]`
+	want := `[pi-msg: room: fox reacted ✅ to your message "**D.** Baton → @slippy for **E**". You may acknowledge, act on it, or ignore; no reply is required unless you need to send a message with send_message.]`
 	if got := capturedPrompt(t, &buf); got != want {
 		t.Errorf("reaction ack:\n got: %q\nwant: %q", got, want)
 	}

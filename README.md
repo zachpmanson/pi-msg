@@ -14,8 +14,9 @@ sequenceDiagram
     participant Pi as pi --mode rpc
     You->>Bridge: "fix the build"
     Bridge->>Pi: prompt
-    Pi-->>Bridge: message_end event
-    Bridge-->>You: assistant text
+    Pi-->>Bridge: send_message tool call
+    Bridge-->>You: explicit XMPP message
+    Note over Pi,Bridge: final assistant text stays internal
     You->>Bridge: "/new"
     Bridge->>Pi: {type:"new_session"}
     Note over Pi: fresh session
@@ -26,12 +27,12 @@ sequenceDiagram
 - Sessions resuming across restarts, `/new` to reset
 - Pi slash commands work over chat
 - XMPP DMs and group chats
-- Threaded replies, in-band routing
-- Room history via `read_room`
+- Explicit outbound messages via `send_message`; final assistant text is internal
+- Threaded replies via `reply_to`
+- Room and 1:1 history via `read_messages`
 - MAM supported
 - File transfer (XEP-0363/0066)
 - Reactions (XEP-0444)
-- Typing indicator
 - Presence updates
 - Read receipts
 
@@ -95,6 +96,7 @@ Per-account fields:
 | `uploadService` | no | auto-probed | XEP-0363 upload component JID for file transfer (e.g. `upload.chat.example.com`) |
 | `pingInterval` | no | `60s` | keepalive cadence (Go duration): XEP-0199 server ping + XEP-0410 MUC self-ping; `0` disables |
 | `reactions` | no | `false` | XEP-0444 reactions and lifecycle acknowledgements; override per room |
+| `allowArbitraryJid` | no | `false` | Allow `send_message` and `read_messages` to target valid peer JIDs outside the owner/configured-room default allowlist; configured rooms must still be configured |
 | `resetSessionOnAway` | no | `false` | Start a fresh Pi session when the account becomes idle/away; prior session files are retained |
 | `beforeAgentStartText` | no | — | literal text added to the system prompt before every turn; empty or whitespace means unset |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
@@ -102,7 +104,7 @@ Per-account fields:
 | `mam` | no | `true` | MAM support; set `false` to disable archive backfill |
 
 Multiple accounts: add more keys under `accounts`; `default` is used unless you set
-`PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent.
+`PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent. Outbound chat is sent only by `send_message`; see [Messaging and Room Addressing](docs/routing.md).
 
 ## Project layout
 

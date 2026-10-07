@@ -60,7 +60,7 @@ type mamQueryPayload struct {
 // cursor. The pointer distinguishes the three states XEP-0313 needs: nil omits
 // <before> entirely (first page / backfill), a pointer to "" selects the LAST
 // page (§4.3.3), and a pointer to a stanza id pages BACKWARDS from that id
-// (§4.3.2) — read_room's `before` argument. With no cursor at all the server
+// (§4.3.2) — read_messages's `before` argument. With no cursor at all the server
 // returns the first page, which is the opposite of what an on-demand read wants.
 type mamRSMSet struct {
 	Max    int     `xml:"max"`
@@ -73,10 +73,9 @@ type mamCollector struct {
 	room string // bare room JID for a MUC-scoped query, "" for the owner 1:1
 	out  []InboundMessage
 	// record controls whether the fetched stanzas enter the stanza history.
-	// Backfill needs that (a later reply resolves through it); an on-demand read
-	// must not, because recording clears the "we sent this" flag on our own
-	// archived lines and can evict live ids that `to: <stanza-id>` routing
-	// depends on (#106 review).
+	// Backfill needs that (a later inbound reply resolves through it); on-demand
+	// reads keep their replyable IDs in a separate bounded cache so they do not
+	// change live dispatch classifications or evict live stanza history.
 	record bool
 }
 
@@ -98,7 +97,7 @@ func (b *XMPPBridge) FetchMAM(ctx context.Context, room, with string, since time
 // FetchMAMLastPage queries the most recent `max` archived messages of a room —
 // the XEP-0313 last page (RSM <before/>, no start bound). This is what an
 // on-demand read wants: a query with no RSM cursor returns the archive's FIRST
-// page, so read_room would hand the agent the room's oldest messages while
+// page, so read_messages would hand the agent the room's oldest messages while
 // claiming they were the latest (#106 review).
 //
 // Fetched stanzas are deliberately NOT recorded in the stanza history: a read
@@ -109,7 +108,7 @@ func (b *XMPPBridge) FetchMAMLastPage(ctx context.Context, room string, max int)
 
 // FetchMAMRoomWindow queries a room's archive for an explicit window: `since`
 // (zero means no lower bound) and `before` (a stanza id cursor; "" means the
-// newest page). It is read_room's paging path — a cursor walks the archive
+// newest page). It is read_messages's paging path — a cursor walks the archive
 // backwards, so repeated calls reach history older than the newest-N window.
 // Fetched stanzas are deliberately NOT recorded in the stanza history: a read
 // must not perturb routing state (see mamCollector.record).
@@ -117,46 +116,45 @@ func (b *XMPPBridge) FetchMAMLastPage(ctx context.Context, room string, max int)
 // A cursor read returns the messages the server pages to — everything strictly
 // OLDER than the cursor — and an unrecognised cursor is reported as an error.
 func (b *XMPPBridge) FetchMAMRoomWindow(ctx context.Context, room string, since time.Time, before string, max int) ([]InboundMessage, bool, error) {
+	return b.fetchMAMWindow(ctx, room, "", since, before, max)
+}
+
+// FetchMAMDirectWindow reads the account archive filtered to one peer JID.
+// Fetched stanzas are not recorded in live routing history.
+func (b *XMPPBridge) FetchMAMDirectWindow(ctx context.Context, peer string, since time.Time, before string, max int) ([]InboundMessage, bool, error) {
+	return b.fetchMAMWindow(ctx, "", peer, since, before, max)
+}
+
+func (b *XMPPBridge) fetchMAMWindow(ctx context.Context, room, with string, since time.Time, before string, max int) ([]InboundMessage, bool, error) {
+	fetch := func(start time.Time, count int, cursor string, lastPage bool) ([]InboundMessage, bool, error) {
+		return b.fetchMAM(ctx, room, with, start, count, cursor, lastPage, false)
+	}
 	if before == "" {
-		return b.fetchMAM(ctx, room, "", since, max, "", true, false)
+		return fetch(since, max, "", true)
 	}
 	if max <= 0 {
-		max = roomReadDefaultLimit
+		max = messagesReadDefaultLimit
 	}
-	msgs, complete, err := b.fetchMAM(ctx, room, "", since, max, before, false, false)
+	msgs, complete, err := fetch(since, max, before, false)
 	if err != nil {
 		return nil, false, err
 	}
-	// An unknown or expired cursor is NOT an error on the server side: ejabberd
-	// answers it with the newest page instead (measured live 2026-09-28 — a
-	// fabricated cursor returned the 27 newest messages under a `before stanza
-	// <garbage>` label). That is the one failure a caller cannot detect from the
-	// page itself, so check it here: a cursor page can never contain the room's
-	// newest message, because the cursor is newer than everything on the page.
-	// Equality is therefore the signature of the fallback.
 	if len(msgs) > 0 {
-		newest, _, err := b.fetchMAM(ctx, room, "", since, 1, "", true, false)
+		newest, _, err := fetch(since, 1, "", true)
 		if err != nil {
 			return nil, false, err
 		}
 		if cursorFallbackPage(msgs, newest) {
-			return nil, false, fmt.Errorf("cursor %q is not in this room's archive (unknown or expired stanza id)", before)
+			return nil, false, fmt.Errorf("cursor %q is not in this archive (unknown or expired stanza id)", before)
 		}
 		return msgs, complete, nil
 	}
-	// An empty page is ambiguous, and the two meanings need different answers. A
-	// cursor at (or below) the room's oldest archived message is a successful read
-	// of an empty window; an id the archive does not hold at all pages to nothing
-	// and must not be rendered as “no messages” — measured live 2026-09-28: a
-	// cursor carrying the message id instead of the archive id quietly returned an
-	// empty window. The room's oldest archive id settles it: if the oldest stanza
-	// is not the cursor, an empty page cannot be the archive's beginning.
-	oldest, _, err := b.fetchMAM(ctx, room, "", time.Time{}, 1, "", false, false)
+	oldest, _, err := fetch(time.Time{}, 1, "", false)
 	if err != nil {
 		return nil, false, err
 	}
 	if cursorEmptyPageUnknown(oldest, before) {
-		return nil, false, fmt.Errorf("cursor %q is not in this room's archive (unknown or expired stanza id)", before)
+		return nil, false, fmt.Errorf("cursor %q is not in this archive (unknown or expired stanza id)", before)
 	}
 	return msgs, complete, nil
 }
@@ -415,7 +413,7 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 		}
 	}
 	// The <result> element's own id is the ARCHIVE id (what RSM cursors address);
-	// the message's id attribute is the sender's. Keeping both lets read_room
+	// the message's id attribute is the sender's. Keeping both lets read_messages
 	// print a usable cursor without changing routing, which keys off the message
 	// id (#117).
 	m := InboundMessage{Body: body, ID: id, ArchiveID: attr(res.Attr, "id"), From: from, Stamp: stamp, Own: ownLine}
@@ -434,7 +432,7 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	} else {
 		m.Direct = true
 		m.RealJID = bareJid(from)
-		m.FromOwner = true
+		m.FromOwner = bareJid(from) == b.ownerBare
 	}
 	b.mamMu.Lock()
 	col.out = append(col.out, m)

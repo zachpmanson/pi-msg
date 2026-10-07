@@ -132,8 +132,8 @@ func TestUntaggedWarningGates(t *testing.T) {
 
 // The wording has to be usable from the inside: it must name the consequence
 // (nobody was delivered it), list the handles that would work, and NOT offer
-// "to: noop" — a fleet trained to prefer silence takes the cheap out, and this
-// message has already reached the room.
+// silence as the alternative — a fleet trained to prefer silence takes the cheap
+// out, and this message has already reached the room.
 func TestUntaggedRoomNotice(t *testing.T) {
 	got := untaggedRoomNotice([]string{"peppy", "slippy"})
 	for _, want := range []string{"tagged nobody", "@peppy", "@slippy", "@everyone"} {

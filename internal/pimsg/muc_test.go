@@ -249,7 +249,7 @@ func TestMessageHistoryKeepsAuthor(t *testing.T) {
 }
 
 // Quoted or fenced text never addresses anyone, and that has to include inline
-// `code` spans: on 2026-09-28 an agent explaining the routing rules wrote "it
+// `code` spans: on 2026-09-28 an agent explaining the messaging rules wrote "it
 // still reads a name without @ does not reach them, with no `@everyone`", and
 // the literal @everyone inside backticks woke every agent in the room.
 func TestInlineCodeDoesNotAddress(t *testing.T) {
@@ -358,8 +358,8 @@ func TestAddressedRoomMessageIsRecorded(t *testing.T) {
 }
 
 func TestComposePrompt(t *testing.T) {
-	b := roomBridge()      // owner zach@x.com, room team@muc.x.com
-	b.routingSeeded = true // this test exercises the non-seeding path
+	b := roomBridge()        // owner zach@x.com, room team@muc.x.com
+	b.messagingSeeded = true // this test exercises the non-seeding path
 
 	// Owner DM turn: "from:" is the owner, body follows directly (no sender
 	// line). No routing hint is appended (removed per issue #33).
@@ -387,13 +387,13 @@ func TestComposePrompt(t *testing.T) {
 	if strings.Contains(got, "NON-OWNER") {
 		t.Errorf("the untrusted-commentary wrapper is retired: %q", got)
 	}
-	if !strings.HasSuffix(got, `Check message using read_room(room="team@muc.x.com", limit=15).]`) {
-		t.Errorf("room block should end with the read_room call: %q", got)
+	if !strings.HasSuffix(got, `Check message using read_messages(target="team@muc.x.com", limit=15).]`) {
+		t.Errorf("room block should end with the read_messages call: %q", got)
 	}
 }
 
 // TestRoomsSeedOnce: the room list and its delivery rule are seeded with the
-// routing contract, once per session (#106). An agent that assumes silence
+// messaging contract, once per session (#106). An agent that assumes silence
 // means an empty room will miss handoffs it was not named in, so this is not
 // optional context.
 func TestRoomsSeedOnce(t *testing.T) {
@@ -402,8 +402,8 @@ func TestRoomsSeedOnce(t *testing.T) {
 	if !strings.Contains(got1, "[pi-msg: rooms:") || !strings.Contains(got1, "team@muc.x.com") {
 		t.Errorf("first prompt should seed the room list: %q", got1)
 	}
-	if !strings.Contains(got1, "read_room") {
-		t.Errorf("the room seed should point at read_room: %q", got1)
+	if !strings.Contains(got1, "read_messages") {
+		t.Errorf("the room seed should point at read_messages: %q", got1)
 	}
 	got2 := b.composePrompt("again", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
 	if strings.Contains(got2, "[pi-msg: rooms:") {
@@ -416,41 +416,38 @@ func TestRoomsSeedOnce(t *testing.T) {
 	}
 }
 
-func TestRoutingSeedOnce(t *testing.T) {
-	b := roomBridge() // room-mode account
-	// First prompt seeds the contract (once); room-mode only.
+func TestMessagingSeedOnce(t *testing.T) {
+	b := roomBridge()
 	got1 := b.composePrompt("go", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
-	if !strings.Contains(got1, "[pi-msg: routing:") {
-		t.Errorf("first prompt should seed the routing contract: %q", got1)
+	if !strings.Contains(got1, "[pi-msg: messaging:") {
+		t.Errorf("first prompt should seed the messaging contract: %q", got1)
 	}
-	// Subsequent prompts must NOT re-seed.
 	got2 := b.composePrompt("again", "team@muc.x.com", "zach@x.com", "", "", "", &roomNotice{kind: noticeTag})
-	if strings.Contains(got2, "[pi-msg: routing:") {
+	if strings.Contains(got2, "[pi-msg: messaging:") {
 		t.Errorf("second prompt re-seeded the contract: %q", got2)
 	}
 
-	// A non-room (1:1) account never seeds.
 	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
 	got := b1.composePrompt("hi", "zach@x.com", "", "", "", "", nil)
-	if strings.Contains(got, "[pi-msg: routing:") {
-		t.Errorf("1:1 account should not seed the routing contract: %q", got)
+	if !strings.Contains(got, "[pi-msg: messaging:") {
+		t.Errorf("1:1 account should seed the messaging contract: %q", got)
 	}
 }
 
 // TestInitialPromptCompose verifies the invocation-time initial prompt path
 // (pi-msg#35): the task text is composed through the normal prompt path, so a
-// fresh room-mode on-demand spawn receives the routing contract seed followed
+// fresh room-mode on-demand spawn receives the messaging contract seed followed
 // by the task as a canonical owner message (its reply therefore routes `to:`
 // the owner per the contract), while a 1:1 account gets the task verbatim.
 func TestInitialPromptCompose(t *testing.T) {
 	task := "resolve zachpmanson/pi-msg#35 and open a PR"
 
-	// Fresh room-mode spawn: routingSeeded is false (an initial prompt forces a
-	// fresh session), so the first prompt seeds the routing contract once.
+	// Fresh room-mode spawn: messagingSeeded is false (an initial prompt forces a
+	// fresh session), so the first prompt seeds the messaging contract once.
 	b := roomBridge()
 	got := b.composePrompt(task, b.acct.Owner, "", "", "", "", nil)
-	if !strings.Contains(got, "[pi-msg: routing:") {
-		t.Errorf("fresh room-mode initial prompt should seed the routing contract: %q", got)
+	if !strings.Contains(got, "[pi-msg: messaging:") {
+		t.Errorf("fresh room-mode initial prompt should seed the messaging contract: %q", got)
 	}
 	if !strings.Contains(got, "from: zach@x.com") {
 		t.Errorf("initial prompt should carry the from: owner header: %q", got)
@@ -459,52 +456,10 @@ func TestInitialPromptCompose(t *testing.T) {
 		t.Errorf("initial prompt should end with the task text: %q", got)
 	}
 
-	// 1:1 account: the task is delivered verbatim, no routing contract.
+	// A 1:1 account also receives the explicit messaging contract.
 	b1 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
-	if got := b1.composePrompt(task, "zach@x.com", "", "", "", "", nil); got != task {
-		t.Errorf("1:1 initial prompt = %q, want plain %q", got, task)
-	}
-}
-
-func TestRouteLineNoop(t *testing.T) {
-	cases := []struct {
-		in     string
-		dest   string
-		inline string
-		ok     bool
-	}{
-		{"to: noop", "noop", "", true},
-		{"to: NOOP", "noop", "", true},
-		{"  to: noop", "noop", "", true},
-		{"to: noop nothing to add", "noop", "nothing to add", true},
-		{"to: zach@x.com", "zach@x.com", "", true},
-		{"to: be fair, that's prose", "", "", false}, // no @ and not "noop"
-		{"to: nooperator", "", "", false},            // must be exactly "noop"
-	}
-	for _, c := range cases {
-		dest, replyTo, inline, ok := routeLine(c.in)
-		if ok != c.ok || dest != c.dest || inline != c.inline {
-			t.Errorf("routeLine(%q) = (%q,%q,%v), want (%q,%q,%v)", c.in, dest, inline, ok, c.dest, c.inline, c.ok)
-		}
-		if replyTo != "" {
-			t.Errorf("routeLine(%q) set replyTo = %q, want empty", c.in, replyTo)
-		}
-	}
-}
-
-// A noop reply must parse as a real segment, not fall through to the reject
-// path — otherwise an attempt at silence is dumped to the error room and the
-// agent is nudged to resend, producing the very turn it tried to avoid (#20).
-func TestNoopIsNotRejected(t *testing.T) {
-	segs, leading := splitReplySegments("to: noop")
-	if leading != "" {
-		t.Errorf("leading = %q, want empty", leading)
-	}
-	if len(segs) != 1 {
-		t.Fatalf("got %d segments, want 1", len(segs))
-	}
-	if segs[0].dest != "noop" {
-		t.Errorf("dest = %q, want noop", segs[0].dest)
+	if got := b1.composePrompt(task, "zach@x.com", "", "", "", "", nil); !strings.Contains(got, "[pi-msg: messaging:") || !strings.HasSuffix(got, task) {
+		t.Errorf("1:1 initial prompt should seed the contract before the task: %q", got)
 	}
 }
 
@@ -816,29 +771,29 @@ func TestCascadeCapDropsRatherThanBuffers(t *testing.T) {
 // (#106), so its failure modes matter: an unjoined room must be refused, and a
 // readable one must render something the model can act on.
 func TestReadRoomRelayRejectsUnjoinedRoom(t *testing.T) {
-	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", RoomTrigger: "pi"}
 	b := newTestBridge(acct)
 	var buf bytes.Buffer
 	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
 
 	// The error room is the interesting case: joined at the XMPP layer, but
 	// write-only by construction, so it must not be readable.
-	b.handleToolRelay("r1", `{"action":"read_room","room":"errors@muc.x"}`)
+	b.handleToolRelay("r1", `{"action":"read_messages","target":"errors@muc.x"}`)
 	out := buf.String()
-	if !strings.Contains(out, "not a room this bridge has joined") {
+	if !strings.Contains(out, "not a readable conversation") {
 		t.Errorf("unjoined room not refused: %q", out)
 	}
 	if strings.Contains(out, "team@muc.x") && strings.Contains(out, "archived message") {
-		t.Errorf("read_room returned content for an unjoined room: %q", out)
+		t.Errorf("read_messages returned content for an unjoined room: %q", out)
 	}
 }
 
 func TestFormatRoomRead(t *testing.T) {
-	got := formatRoomRead("team@muc.x", nil, true, "newest 30")
+	got := formatMessagesRead("team@muc.x", nil, true, "newest 30")
 	// The extension rejects any result without this prefix, so an empty archive
 	// (a successful read of nothing) must still carry it — otherwise a working
 	// read is reported to the model as a failed tool call.
-	if !strings.HasPrefix(got, "[pi-msg: read_room:") || !strings.Contains(got, "no archived messages") {
+	if !strings.HasPrefix(got, "[pi-msg: read_messages:") || !strings.Contains(got, "no archived messages") {
 		t.Errorf("an empty archive must carry the header and say so: %q", got)
 	}
 
@@ -848,9 +803,9 @@ func TestFormatRoomRead(t *testing.T) {
 		{ID: "p1", ArchiveID: "9812", Nick: "peppy", Body: "on it", Stamp: stamp, ReplyToID: "abc123"},
 		{ID: "z1", ArchiveID: "9813", Nick: "zach", Body: "thanks", Stamp: stamp, FromOwner: true},
 	}
-	got = formatRoomRead("team@muc.x", msgs, true, "newest 30")
-	if !strings.HasPrefix(got, "[pi-msg: read_room:") {
-		t.Errorf("read_room block must carry its header (the tool keys off it): %q", got)
+	got = formatMessagesRead("team@muc.x", msgs, true, "newest 30")
+	if !strings.HasPrefix(got, "[pi-msg: read_messages:") {
+		t.Errorf("read_messages block must carry its header (the tool keys off it): %q", got)
 	}
 	if !strings.Contains(got, "slippy (3m ago) [id 9811] [stanza s1]: the parser is flaky") {
 		t.Errorf("sender/age/ids/body line wrong: %q", got)
@@ -871,30 +826,30 @@ func TestFormatRoomRead(t *testing.T) {
 	}
 
 	// An incomplete result set means the server has more behind this page.
-	got = formatRoomRead("team@muc.x", msgs, false, "newest 3")
+	got = formatMessagesRead("team@muc.x", msgs, false, "newest 3")
 	if !strings.Contains(got, "older history exists") {
 		t.Errorf("an incomplete window should warn: %q", got)
 	}
 }
 
-// read_room's `since` accepts both an absolute stamp and a relative age, and a
+// read_messages's `since` accepts both an absolute stamp and a relative age, and a
 // malformed value is an error rather than a silently dropped bound. A dropped
 // bound would return older messages than asked for while looking successful.
 func TestRoomReadSince(t *testing.T) {
 	now := time.Date(2026, 9, 28, 19, 30, 0, 0, time.UTC)
-	if got, err := roomReadSince("", now); err != nil || !got.IsZero() {
+	if got, err := messagesReadSince("", now); err != nil || !got.IsZero() {
 		t.Errorf("unset since: got (%v,%v), want zero time and no error", got, err)
 	}
-	got, err := roomReadSince("2026-09-28T08:15:58+10:00", now)
+	got, err := messagesReadSince("2026-09-28T08:15:58+10:00", now)
 	if err != nil || !got.Equal(time.Date(2026, 9, 27, 22, 15, 58, 0, time.UTC)) {
 		t.Errorf("absolute stamp: got (%v,%v)", got, err)
 	}
-	got, err = roomReadSince("2h", now)
+	got, err = messagesReadSince("2h", now)
 	if err != nil || !got.Equal(now.Add(-2*time.Hour)) {
 		t.Errorf("relative age: got (%v,%v), want %v", got, err, now.Add(-2*time.Hour))
 	}
 	for _, bad := range []string{"yesterday", "2 hours", "-1h", "2026-13-40"} {
-		if _, err := roomReadSince(bad, now); err == nil {
+		if _, err := messagesReadSince(bad, now); err == nil {
 			t.Errorf("since %q should be rejected", bad)
 		}
 	}
@@ -903,14 +858,14 @@ func TestRoomReadSince(t *testing.T) {
 // A cursor must be an opaque stanza id: empty means the newest page, and a value
 // with whitespace cannot be one. Whether the id exists is the server's answer.
 func TestRoomReadCursor(t *testing.T) {
-	if got, err := roomReadCursor("  "); err != nil || got != "" {
+	if got, err := messagesReadCursor("  "); err != nil || got != "" {
 		t.Errorf("blank cursor: got (%q,%v), want unset", got, err)
 	}
-	if got, err := roomReadCursor(" stanza-1 "); err != nil || got != "stanza-1" {
+	if got, err := messagesReadCursor(" stanza-1 "); err != nil || got != "stanza-1" {
 		t.Errorf("cursor should be trimmed: got (%q,%v)", got, err)
 	}
 	for _, bad := range []string{"two ids", "a\tb", strings.Repeat("x", 257)} {
-		if _, err := roomReadCursor(bad); err == nil {
+		if _, err := messagesReadCursor(bad); err == nil {
 			t.Errorf("cursor %q should be rejected", bad)
 		}
 	}
@@ -934,7 +889,7 @@ func TestCursorEmptyPageUnknown(t *testing.T) {
 // A read reports the room as it happened, our own lines included and marked:
 // the reader wrote them, and an unmarked line of its own would read as a peer's.
 func TestFormatRoomReadMarksOwnMessages(t *testing.T) {
-	out := formatRoomRead("r@muc", []InboundMessage{
+	out := formatMessagesRead("r@muc", []InboundMessage{
 		{Nick: "b2-1", ArchiveID: "1001", Body: "theirs"},
 		{Nick: "beltino", ArchiveID: "1002", Body: "ours", Own: true},
 	}, true, "newest 2")
@@ -974,44 +929,44 @@ func TestCursorFallbackPage(t *testing.T) {
 // for the whole recent conversation.
 func TestRoomReadWindowLabel(t *testing.T) {
 	since := time.Date(2026, 9, 28, 9, 30, 0, 0, time.UTC)
-	if got := roomReadWindowLabel(30, time.Time{}, ""); got != "newest 30" {
+	if got := messagesReadWindowLabel(30, time.Time{}, ""); got != "newest 30" {
 		t.Errorf("default label = %q", got)
 	}
-	if got := roomReadWindowLabel(30, since, ""); !strings.Contains(got, "since 2026-09-28T09:30:00Z") {
+	if got := messagesReadWindowLabel(30, since, ""); !strings.Contains(got, "since 2026-09-28T09:30:00Z") {
 		t.Errorf("since label = %q", got)
 	}
-	if got := roomReadWindowLabel(30, time.Time{}, "c1"); !strings.Contains(got, "before stanza c1") {
+	if got := messagesReadWindowLabel(30, time.Time{}, "c1"); !strings.Contains(got, "before stanza c1") {
 		t.Errorf("cursor label = %q", got)
 	}
-	both := roomReadWindowLabel(30, since, "c1")
+	both := messagesReadWindowLabel(30, since, "c1")
 	if !strings.Contains(both, "before stanza c1") || !strings.Contains(both, "since 2026-09-28T09:30:00Z") {
 		t.Errorf("combined label = %q", both)
 	}
 	// A narrowed window is described even when the fetch found nothing.
-	empty := formatRoomRead("team@muc.x", nil, true, roomReadWindowLabel(30, since, ""))
-	if !strings.HasPrefix(empty, "[pi-msg: read_room:") || !strings.Contains(empty, "no archived messages") || !strings.Contains(empty, "since ") {
+	empty := formatMessagesRead("team@muc.x", nil, true, messagesReadWindowLabel(30, since, ""))
+	if !strings.HasPrefix(empty, "[pi-msg: read_messages:") || !strings.Contains(empty, "no archived messages") || !strings.Contains(empty, "since ") {
 		t.Errorf("empty narrowed read = %q", empty)
 	}
 }
 
 // A malformed argument must fail loudly in the tool result: the extension treats
-// any result without the read_room header as a failed tool call, so these must
+// any result without the read_messages header as a failed tool call, so these must
 // NOT carry the header (the same loud-failure shape as an unjoined room).
 func TestReadRoomRelayRejectsBadWindowArgs(t *testing.T) {
 	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
 	for _, args := range []string{
-		`{"action":"read_room","room":"team@muc.x","since":"yesterday"}`,
-		`{"action":"read_room","room":"team@muc.x","before":"two ids"}`,
+		`{"action":"read_messages","target":"team@muc.x","since":"yesterday"}`,
+		`{"action":"read_messages","target":"team@muc.x","before":"two ids"}`,
 	} {
 		b := newTestBridge(acct)
 		var buf bytes.Buffer
 		b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
 		b.handleToolRelay("r1", args)
 		out := buf.String()
-		if !strings.Contains(out, "read_room:") {
+		if !strings.Contains(out, "read_messages:") {
 			t.Errorf("args %s: no failure message: %q", args, out)
 		}
-		if strings.Contains(out, "[pi-msg: read_room:") {
+		if strings.Contains(out, "[pi-msg: read_messages:") {
 			t.Errorf("args %s: a malformed window must not look like a successful read: %q", args, out)
 		}
 	}
@@ -1082,16 +1037,16 @@ func TestBareMentionCounter(t *testing.T) {
 	}
 }
 
-// The seeded routing contract must state the new rule. It is the only place the
+// The seeded messaging contract must state the new rule. It is the only place the
 // false-positive cost of bare mentions is disclosed to the agents living with
 // it, and the old wording said the opposite (#106).
 func TestRoutingContractStatesBareMentions(t *testing.T) {
 	b := roomBridge()
-	got := b.routingContract()
+	got := b.messagingContract()
 	if strings.Contains(got, "a name without @ does not reach") {
-		t.Errorf("routing contract still denies bare mentions: %q", got)
+		t.Errorf("messaging contract still denies bare mentions: %q", got)
 	}
-	if !strings.Contains(got, "a name without @ also reaches it") {
-		t.Errorf("routing contract does not state the bare-mention rule: %q", got)
+	if !strings.Contains(got, "mention the intended agent by name or `@name`") {
+		t.Errorf("messaging contract does not state the room mention rule: %q", got)
 	}
 }
