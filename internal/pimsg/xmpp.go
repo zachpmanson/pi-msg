@@ -1450,8 +1450,9 @@ func (b *XMPPBridge) sendChatState(to, state string) error {
 }
 
 // SendComposing sends the XEP-0085 composing chat state to a 1:1 recipient.
-// It is a best-effort prelude to an explicit send_message call; callers should
-// still deliver the body if this transient indicator cannot be sent.
+// It is a best-effort early signal while a streamed send_message call is still
+// assembling its arguments; callers should still deliver the body if this
+// transient indicator cannot be sent.
 func (b *XMPPBridge) SendComposing(to string) error {
 	return b.sendChatState(to, "composing")
 }

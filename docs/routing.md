@@ -13,11 +13,12 @@ automatically, in either a 1:1 or room-mode account. To send chat text, call:
 send_message(to, text, reply_to?)
 ```
 
-Each call sends one message to one destination. For a 1:1 destination, pi-msg
-sends a best-effort XEP-0085 `composing` chat-state immediately before the
-message, then includes `active` on the message to clear the typing indicator. If
-the body cannot be sent, it best-effort sends a standalone `active` state.
-Indicator failures do not block delivery. MUC messages do not get chat states. Multiple messages or recipients require multiple calls. Only a
+Each call sends one message to one destination. As streamed `send_message`
+arguments arrive, pi-msg sends a best-effort XEP-0085 `composing` state as soon
+as the complete 1:1 `to` value is known. The delivered message includes `active`
+to clear the typing indicator; if the body cannot be sent, pi-msg best-effort
+sends a standalone `active` state. Indicator failures do not block delivery.
+MUC messages do not get chat states. Multiple messages or recipients require multiple calls. Only a
 successful `send_message` counts as a reply for run accounting. A successful
 `send_file` upload is not a substitute for a chat reply. If a run that should
 answer produces no successful `send_message`, pi-msg issues one bounded internal

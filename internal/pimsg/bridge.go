@@ -71,7 +71,10 @@ type Bridge struct {
 	// (see fireInitialPrompt). Used by the sentinel doer flow (beltino#18).
 	initialPrompt string
 
-	mu sync.Mutex
+	mu              sync.Mutex
+	streamToolMu    sync.Mutex
+	streamToolCalls map[int]*streamToolCallState
+	streamComposing map[string]string // tool-call ID → destination, for cleanup at execution end
 	// sessionTransitionMu serializes an idle-triggered fresh-session swap with
 	// inbound delivery, so a message at the away boundary lands in one session.
 	sessionTransitionMu sync.Mutex
@@ -478,6 +481,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.xmpp.SetPresence("dnd", "thinking…")
 		b.lifecycleReact("👀") // picked up (opt-in; ack-only runs stay silent)
 	case "agent_settled":
+		b.clearAllStreamComposing()
 		b.ackInboxSettled()
 		b.setStreaming(false)
 		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
@@ -529,6 +533,8 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 	case "tool_execution_start":
 		b.markToolSinceDelivery()
 		b.xmpp.SetPresence("dnd", toolLabel(ev))
+	case "tool_execution_end":
+		b.clearStreamComposing(ev.Str("toolCallId"))
 	case "auto_retry_start":
 		b.xmpp.SetPresence("dnd", "retrying (transient error)…")
 	case "auto_retry_end":
@@ -658,8 +664,10 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 	} else {
 		// Typing is a transient, best-effort signal. Do not let a failed
 		// chat-state stanza prevent delivery of the actual reply.
-		if err := b.xmpp.SendComposing(to); err != nil {
-			b.log("warning", fmt.Sprintf("send composing state to %s failed: %v", to, err))
+		if !b.takeStreamComposing(to) {
+			if err := b.xmpp.SendComposing(to); err != nil {
+				b.log("warning", fmt.Sprintf("send composing state to %s failed: %v", to, err))
+			}
 		}
 		stanzaID = b.xmpp.SendChatReply(to, text, reply)
 	}
@@ -3574,6 +3582,160 @@ func (b *Bridge) handleStreamDelta(ev Event) {
 		// Streamed assistant text is a private draft; send_message selects the
 		// destination and delivers only when explicitly called.
 		b.xmpp.SetPresence("dnd", "drafting…")
+	case "toolcall_start", "toolcall_delta", "toolcall_end":
+		b.handleStreamToolCall(ame)
+	}
+}
+
+type streamToolCallState struct {
+	id      string
+	name    string
+	args    string
+	dest    string
+	started bool
+	sent    bool
+}
+
+func (b *Bridge) handleStreamToolCall(ame Event) {
+	kind := ame.Str("type")
+	index := int(ame.F64("contentIndex"))
+	partial := ame.Obj("partial")
+	var block Event
+	if partial != nil {
+		content := partial.Arr("content")
+		if index >= 0 && index < len(content) {
+			if raw, ok := content[index].(map[string]any); ok {
+				block = Event(raw)
+			}
+		}
+	}
+	toolCall := ame.Obj("toolCall")
+	id, name := block.Str("id"), block.Str("name")
+	if toolCall != nil {
+		if id == "" {
+			id = toolCall.Str("id")
+		}
+		if name == "" {
+			name = toolCall.Str("name")
+		}
+	}
+
+	b.streamToolMu.Lock()
+	if b.streamToolCalls == nil {
+		b.streamToolCalls = make(map[int]*streamToolCallState)
+	}
+	state := b.streamToolCalls[index]
+	if kind == "toolcall_start" || state == nil {
+		state = &streamToolCallState{}
+		b.streamToolCalls[index] = state
+	}
+	if id != "" {
+		state.id = id
+	}
+	if name != "" {
+		state.name = name
+	}
+	if kind == "toolcall_delta" {
+		state.args += ame.Str("delta")
+	}
+	args, callName, alreadyStarted := state.args, state.name, state.started
+	b.streamToolMu.Unlock()
+
+	if callName == "send_message" && !alreadyStarted {
+		dest, ok := completeJSONStringField(args, "to")
+		if !ok && kind == "toolcall_end" && toolCall != nil {
+			if finalArgs := toolCall.Obj("arguments"); finalArgs != nil {
+				dest, ok = finalArgs.Str("to"), finalArgs.Str("to") != ""
+			}
+		}
+		if ok && b.xmpp != nil && b.xmpp.classifyMessageDest(dest, b.acct.AllowArbitraryJid) == destUser {
+			b.streamToolMu.Lock()
+			state = b.streamToolCalls[index]
+			shouldSend := state != nil && !state.started
+			if shouldSend {
+				state.started = true
+				state.dest = dest
+			}
+			b.streamToolMu.Unlock()
+			if shouldSend {
+				if err := b.xmpp.SendComposing(dest); err != nil {
+					b.log("warning", fmt.Sprintf("streamed composing state to %s failed: %v", dest, err))
+				} else {
+					b.streamToolMu.Lock()
+					if state := b.streamToolCalls[index]; state != nil {
+						state.sent = true
+						if state.id != "" {
+							if b.streamComposing == nil {
+								b.streamComposing = make(map[string]string)
+							}
+							b.streamComposing[state.id] = dest
+						}
+					}
+					b.streamToolMu.Unlock()
+				}
+			}
+		}
+	}
+
+	if kind == "toolcall_end" {
+		b.streamToolMu.Lock()
+		if state := b.streamToolCalls[index]; state != nil {
+			if state.sent && state.id != "" && state.dest != "" {
+				if b.streamComposing == nil {
+					b.streamComposing = make(map[string]string)
+				}
+				b.streamComposing[state.id] = state.dest
+			}
+			delete(b.streamToolCalls, index)
+		}
+		b.streamToolMu.Unlock()
+	}
+}
+
+func (b *Bridge) takeStreamComposing(to string) bool {
+	b.streamToolMu.Lock()
+	defer b.streamToolMu.Unlock()
+	for id, dest := range b.streamComposing {
+		if bareJid(dest) == bareJid(to) {
+			delete(b.streamComposing, id)
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bridge) clearStreamComposing(id string) {
+	b.streamToolMu.Lock()
+	dest := b.streamComposing[id]
+	delete(b.streamComposing, id)
+	b.streamToolMu.Unlock()
+	if dest != "" && b.xmpp != nil {
+		if err := b.xmpp.SendActive(dest); err != nil {
+			b.log("warning", fmt.Sprintf("streamed active state to %s failed: %v", dest, err))
+		}
+	}
+}
+
+func (b *Bridge) clearAllStreamComposing() {
+	b.streamToolMu.Lock()
+	dests := make(map[string]struct{})
+	for _, dest := range b.streamComposing {
+		dests[dest] = struct{}{}
+	}
+	for _, state := range b.streamToolCalls {
+		if state.sent && state.dest != "" {
+			dests[state.dest] = struct{}{}
+		}
+	}
+	b.streamComposing = make(map[string]string)
+	b.streamToolCalls = make(map[int]*streamToolCallState)
+	b.streamToolMu.Unlock()
+	for dest := range dests {
+		if b.xmpp != nil {
+			if err := b.xmpp.SendActive(dest); err != nil {
+				b.log("warning", fmt.Sprintf("streamed active state to %s failed: %v", dest, err))
+			}
+		}
 	}
 }
 

@@ -899,8 +899,8 @@ func TestAbortClearsHintPending(t *testing.T) {
 
 // streamDelta builds a pi >= 0.84.0 message_update event: an
 // assistantMessageEvent delta and nothing else. Pi 0.84.0 removed the
-// cumulative `message` field and `assistantMessageEvent.partial`, so any event
-// this helper cannot express is one pi no longer sends.
+// cumulative top-level `message` field; streamed tool-call tests include the
+// nested `partial` snapshot when they need the tool-call name and ID.
 func streamDelta(ame map[string]any) Event {
 	return Event{"type": "message_update", "assistantMessageEvent": ame}
 }
@@ -928,6 +928,30 @@ func TestStreamDeltaContract(t *testing.T) {
 
 	// An event with no assistantMessageEvent is ignored, not a panic.
 	b.handleStreamDelta(Event{"type": "message_update"})
+}
+
+func TestStreamToolCallSendsComposingAfterCompleteToValue(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	partial := func() map[string]any {
+		return map[string]any{"content": []any{map[string]any{
+			"type": "toolCall", "id": "call-1", "name": "send_message", "arguments": map[string]any{},
+		}}}
+	}
+	b.handleStreamDelta(streamDelta(map[string]any{
+		"type": "toolcall_start", "contentIndex": float64(0), "partial": partial(),
+	}))
+	b.handleStreamDelta(streamDelta(map[string]any{
+		"type": "toolcall_delta", "contentIndex": float64(0), "delta": `{"to":"zach@x"`, "partial": partial(),
+	}))
+	if b.streamToolCalls[0].started {
+		t.Fatal("sent composing before the `to` value had a JSON member delimiter")
+	}
+	b.handleStreamDelta(streamDelta(map[string]any{
+		"type": "toolcall_delta", "contentIndex": float64(0), "delta": `,"text":"answer`, "partial": partial(),
+	}))
+	if state := b.streamToolCalls[0]; !state.started || state.dest != "zach@x" {
+		t.Fatalf("stream state = %+v, want composing started for completed destination", state)
+	}
 }
 
 // TestStreamDeltaContractRoomMode ensures private draft text only changes the
