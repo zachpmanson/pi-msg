@@ -500,7 +500,6 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
 		b.resetTailTracking() // fresh run: no message seen, no tool since delivery
 		b.clearRunActivity()
-		b.reactionAckRun = false
 		b.markActive() // a run is in flight — not idle
 		b.xmpp.SetPresence("dnd", "thinking…")
 		b.lifecycleReact("👀") // picked up (opt-in via the reactions flag)
@@ -556,6 +555,9 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// is consumed here (like volunteered) rather than cleared at
 		// agent_start — the settle check above must still see it.
 		b.heartbeatRun = false
+		b.mu.Lock()
+		b.reactionAckRun = false // consume only after settle-time reactions are gated
+		b.mu.Unlock()
 		// Deliver any long-running-process alarms queued while the run just
 		// settled was in flight. This must come AFTER the banner decision and
 		// the flag consumption above: a flushed heartbeat sets heartbeatRun
@@ -1102,7 +1104,9 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	} else {
 		b.setTurnDest(m.Room, false) // a reaction ack is not a handoff
 	}
+	b.mu.Lock()
 	b.reactionAckRun = true
+	b.mu.Unlock()
 	// The ack quotes OUR OWN message being reacted to (#58, case D) — never the
 	// reaction itself. msgHistory already records outbound bodies at send time,
 	// so no new plumbing is needed; an unknown id (evicted from the ring, or a
@@ -1654,6 +1658,9 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.rpc.Abort()
 		b.settleLocally()
 		b.lifecycleReact("⛔") // aborted
+		b.mu.Lock()
+		b.reactionAckRun = false
+		b.mu.Unlock()
 		msg := "⛔ aborted"
 		if dropped == 1 {
 			msg += " (1 queued message dropped)"
@@ -1669,6 +1676,9 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.rpc.Abort()
 		b.settleLocally()
 		b.lifecycleReact("⏹") // interrupted
+		b.mu.Lock()
+		b.reactionAckRun = false
+		b.mu.Unlock()
 		b.reply("⏹ interrupted — continuing with the next queued message")
 	case "quit", "exit":
 		b.shutdown("requested over chat")
@@ -4473,6 +4483,10 @@ func (b *Bridge) lifecycleReact(emojis ...string) {
 		return
 	}
 	b.mu.Lock()
+	if b.reactionAckRun {
+		b.mu.Unlock()
+		return
+	}
 	to, id := b.lifecycleReactTo, b.lifecycleReactID
 	b.mu.Unlock()
 	if to == "" || id == "" {
@@ -4485,6 +4499,10 @@ func (b *Bridge) lifecycleReact(emojis ...string) {
 // lifecycle-reactions setting. It replaces the completion reaction with 🫡.
 func (b *Bridge) reactNoReply() {
 	b.mu.Lock()
+	if b.reactionAckRun {
+		b.mu.Unlock()
+		return
+	}
 	to, id := b.lifecycleReactTo, b.lifecycleReactID
 	b.mu.Unlock()
 	if to == "" || id == "" {

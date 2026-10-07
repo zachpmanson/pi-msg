@@ -1457,6 +1457,35 @@ func TestNoReplyReactionIgnoresOptionalLifecycleSetting(t *testing.T) {
 	}
 }
 
+func TestReactionAckRunSuppressesLifecycleReactionsUntilSettled(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x", Reactions: true})
+	var attempts int
+	b.xmpp.logf = func(string, string) { attempts++ }
+	b.setLifecycleReactTarget("zach@x", "msg-1")
+	b.mu.Lock()
+	b.reactionAckRun = true
+	b.mu.Unlock()
+
+	b.handleRPCEvent(Event{"type": "agent_start"})
+	b.lifecycleReact("👀")
+	b.reactNoReply()
+	b.handleRPCEvent(Event{"type": "agent_settled"})
+	if attempts != 0 {
+		t.Fatalf("reaction-ack run emitted %d automatic reaction attempts", attempts)
+	}
+	b.mu.Lock()
+	stillMarked := b.reactionAckRun
+	b.mu.Unlock()
+	if stillMarked {
+		t.Fatal("reaction-ack run flag leaked after settlement")
+	}
+
+	b.lifecycleReact("👀")
+	if attempts != 1 {
+		t.Fatalf("ordinary run lifecycle reaction attempts = %d, want 1", attempts)
+	}
+}
+
 // TestToolRelayProcessHeartbeatInjectsPrompt: an idle agent receives the
 // long-running-process alarm as an injected prompt carrying the TRUE elapsed
 // seconds and the log tail, presence goes dnd thinking, and the relay answers
