@@ -122,9 +122,11 @@ type Account struct {
 	// ToolActivity mirrors a one-line notice each time a tool starts.
 	ToolActivity bool `json:"toolActivity,omitempty"`
 	// Reactions, when true, enables XEP-0444 emoji reactions on 1:1 owner
-	// messages: the run lifecycle maps to 👀 (picked up) / ✅ (done) / ⛔
+	// messages: ordinary run lifecycle maps to 👀 (picked up) / ✅ (done) / ⛔
 	// (aborted), and the agent may react deliberately via a "react: <emoji>"
-	// line. Off by default so it doesn't double up with read receipts + presence.
+	// line. The quick-interrupt `!` and unanswered-run 🫡 acknowledgements are
+	// sent independently of this setting. Off by default so lifecycle reactions
+	// don't double up with read receipts + presence.
 	Reactions bool `json:"reactions,omitempty"`
 	// AllowArbitraryJid allows send_message and read_messages to target valid
 	// JIDs outside the default destination allowlists. False by default.

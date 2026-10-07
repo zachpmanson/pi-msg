@@ -418,6 +418,19 @@ func TestReactionAckRunSuppressesAutomaticReactions(t *testing.T) {
 	}
 }
 
+func TestInterruptedReactionIgnoresOptionalLifecycleSetting(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x.com"}) // reactions default off
+	var logs []string
+	b.xmpp.logf = func(_, msg string) { logs = append(logs, msg) }
+	b.setLifecycleReactTarget("zach@x.com", "bang-123")
+
+	b.reactInterrupted()
+
+	if len(logs) != 1 || !strings.Contains(logs[0], "reaction failed: not online") {
+		t.Fatalf("interrupt reaction attempts = %v, want one attempt despite reactions being disabled", logs)
+	}
+}
+
 func TestLifecycleReactionsRemainEnabledForOrdinaryRuns(t *testing.T) {
 	acct := ResolvedAccount{Owner: "zach@x.com", Reactions: true}
 	b := newTestBridge(acct)

@@ -1493,6 +1493,11 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 	// would upload the session file to whatever room the agent spoke in last
 	// (zpm/beltino#56).
 	b.setTurnDest(origin, false) // the owner wrote it, so no tag is expected
+	if t == "!" {
+		// The interrupt is acknowledged on the command stanza itself, rather
+		// than the previous prompt's lifecycle target.
+		b.setLifecycleReactTarget(reactTo, reactID)
+	}
 	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!")) && b.handleCommand(t) {
 		// Handled in-process: it never becomes a prompt, so nothing will ever
 		// settle for it (#104).
@@ -1693,8 +1698,7 @@ func (b *Bridge) handleCommand(t string) bool {
 		// evaluates the next queued message as soon as the abort lands.
 		b.rpc.Abort()
 		b.settleLocally()
-		b.lifecycleReact("⏹") // interrupted
-		b.reply("⏹ interrupted — continuing with the next queued message")
+		b.reactInterrupted()
 	case "quit", "exit":
 		b.shutdown("requested over chat")
 	case "dump":
@@ -3962,6 +3966,23 @@ func (b *Bridge) lifecycleReact(emojis ...string) {
 		return
 	}
 	b.xmpp.SendReaction(to, id, emojis...)
+}
+
+// reactInterrupted marks the incoming quick-interrupt command. Like the
+// unanswered-run salute, this acknowledgement is independent of the optional
+// lifecycle-reactions setting.
+func (b *Bridge) reactInterrupted() {
+	b.mu.Lock()
+	if b.reactionAckRun {
+		b.mu.Unlock()
+		return
+	}
+	to, id := b.lifecycleReactTo, b.lifecycleReactID
+	b.mu.Unlock()
+	if to == "" || id == "" {
+		return
+	}
+	b.xmpp.SendReaction(to, id, "⏹")
 }
 
 // reactNoReply always marks an unanswered run, independent of the optional
