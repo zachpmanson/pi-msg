@@ -49,6 +49,19 @@ func TestSendMessageArbitraryJidOptIn(t *testing.T) {
 	}
 }
 
+func TestReadMessagesRequiresExplicitTarget(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}}
+	for _, payload := range []string{
+		`{"action":"read_messages"}`,
+		`{"action":"read_messages","target":"   "}`,
+	} {
+		out := relayOutput(t, acct, payload)
+		if !strings.Contains(out, "target is required") {
+			t.Errorf("read_messages without a target should fail explicitly, got %q", out)
+		}
+	}
+}
+
 func TestReadMessagesDefaultAllowlist(t *testing.T) {
 	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}}
 	out := relayOutput(t, acct, `{"action":"read_messages","target":"stranger@x"}`)
