@@ -418,11 +418,11 @@ func TestReactionAckRunSuppressesAutomaticReactions(t *testing.T) {
 	}
 }
 
-func TestInterruptedReactionIgnoresOptionalLifecycleSetting(t *testing.T) {
+func TestInterruptedReactionUsesActivePromptTargetRegardlessOfSetting(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x.com"}) // reactions default off
 	var logs []string
 	b.xmpp.logf = func(_, msg string) { logs = append(logs, msg) }
-	b.setLifecycleReactTarget("zach@x.com", "bang-123")
+	b.setLifecycleReactTarget("zach@x.com", "interrupted-prompt-123")
 
 	b.reactInterrupted()
 
