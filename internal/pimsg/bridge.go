@@ -656,6 +656,11 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 	if kind == destRoom {
 		stanzaID = b.xmpp.SendRoomReply(bareJid(to), text, reply)
 	} else {
+		// Typing is a transient, best-effort signal. Do not let a failed
+		// chat-state stanza prevent delivery of the actual reply.
+		if err := b.xmpp.SendComposing(to); err != nil {
+			b.log("warning", fmt.Sprintf("send composing state to %s failed: %v", to, err))
+		}
 		stanzaID = b.xmpp.SendChatReply(to, text, reply)
 	}
 	if stanzaID == "" {

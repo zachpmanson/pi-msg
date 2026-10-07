@@ -64,6 +64,7 @@ const (
 const (
 	receiptsNS    = "urn:xmpp:receipts"
 	chatMarkersNS = "urn:xmpp:chat-markers:0"
+	chatStatesNS  = "http://jabber.org/protocol/chatstates"
 )
 
 // reactionsNS is XEP-0444 message reactions: the agent reacts to an owner
@@ -106,7 +107,7 @@ const (
 // reply and the XEP-0115 caps hash — keep in sync with the codebase.
 var discoFeatures = []string{
 	"http://jabber.org/protocol/caps",
-	"http://jabber.org/protocol/chatstates",
+	chatStatesNS,
 	discoInfoNS,
 	"http://jabber.org/protocol/muc",
 	"urn:xmpp:chat-markers:0",
@@ -1416,6 +1417,29 @@ func (b *XMPPBridge) Send(text string) string { return b.SendChatTo(b.acct.Owner
 // Returns the stanza ID of the last chunk sent, or "" if nothing was sent.
 func (b *XMPPBridge) SendChatTo(to, text string) string {
 	return b.SendChatReply(to, text, nil)
+}
+
+type composingMessage struct {
+	stanza.Message
+	Composing struct{} `xml:"http://jabber.org/protocol/chatstates composing"`
+}
+
+// SendComposing sends the XEP-0085 composing chat state to a 1:1 recipient.
+// It is a best-effort prelude to an explicit send_message call; callers should
+// still deliver the body if this transient indicator cannot be sent.
+func (b *XMPPBridge) SendComposing(to string) error {
+	session := b.currentSession()
+	if session == nil {
+		return fmt.Errorf("not online")
+	}
+	toJID, err := jid.Parse(to)
+	if err != nil {
+		return fmt.Errorf("invalid recipient %q: %w", to, err)
+	}
+	msg := composingMessage{Message: stanza.Message{To: toJID, Type: stanza.ChatMessage}}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return b.encode(ctx, session, msg)
 }
 
 // SendChatReply is SendChatTo with an optional XEP-0461 reply stamp. Only the

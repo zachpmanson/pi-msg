@@ -14,6 +14,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"mellium.im/xmpp/jid"
+	"mellium.im/xmpp/stanza"
 )
 
 func TestBareJid(t *testing.T) {
@@ -36,6 +39,27 @@ func TestResourcepart(t *testing.T) {
 	}
 	if got := resourcepart("zach@x.com"); got != "" {
 		t.Errorf("resourcepart with no resource = %q, want empty", got)
+	}
+}
+
+func TestComposingMessageXML(t *testing.T) {
+	to, err := jid.Parse("zach@example.com/phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := xml.Marshal(composingMessage{Message: stanza.Message{To: to, Type: stanza.ChatMessage}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, `to="zach@example.com/phone"`) || !strings.Contains(got, `type="chat"`) {
+		t.Fatalf("composing stanza missing destination or chat type: %s", got)
+	}
+	if !strings.Contains(got, `<composing xmlns="http://jabber.org/protocol/chatstates"></composing>`) {
+		t.Fatalf("composing stanza missing XEP-0085 state: %s", got)
+	}
+	if strings.Contains(got, "<body") {
+		t.Fatalf("composing stanza unexpectedly contains a body: %s", got)
 	}
 }
 

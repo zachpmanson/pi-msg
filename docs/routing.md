@@ -13,12 +13,14 @@ automatically, in either a 1:1 or room-mode account. To send chat text, call:
 send_message(to, text, reply_to?)
 ```
 
-Each call sends one message to one destination. Multiple messages or recipients
-require multiple calls. Only a successful `send_message` counts as a reply for
-run accounting. A successful `send_file` upload is not a substitute for a chat
-reply. If a run that should answer produces no successful `send_message`, pi-msg
-issues one bounded internal recovery prompt. A final response is not a substitute
-for `send_message`.
+Each call sends one message to one destination. For a 1:1 destination, pi-msg
+sends a best-effort XEP-0085 `composing` chat-state immediately before the
+message; a failed indicator does not block delivery. MUC messages do not get a
+composing state. Multiple messages or recipients require multiple calls. Only a
+successful `send_message` counts as a reply for run accounting. A successful
+`send_file` upload is not a substitute for a chat reply. If a run that should
+answer produces no successful `send_message`, pi-msg issues one bounded internal
+recovery prompt. A final response is not a substitute for `send_message`.
 
 By default, `to` must be the owner, a configured room, or a known occupant of a
 configured room. A configured room is an allowed groupchat destination only
