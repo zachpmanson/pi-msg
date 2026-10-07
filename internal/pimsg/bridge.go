@@ -16,15 +16,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"mellium.im/xmpp/jid"
 )
 
-// typingRefresh re-sends the "composing" chat state before clients auto-clear
-// it (~30s), so the typing indicator stays lit while the agent works.
-const typingRefresh = 20 * time.Second
-
 // Bridge wires an XMPP connection to a `pi --mode rpc` child: owner chat
-// becomes pi commands, and pi's events become chat replies / presence /
-// typing.
+// becomes pi commands, and pi's events update XMPP presence or send explicit
+// bridge notices.
 type Bridge struct {
 	acct  ResolvedAccount
 	debug bool
@@ -81,14 +79,12 @@ type Bridge struct {
 	busyMarked          bool // on-disk <acct>.busy reflects work in flight (see syncBusyMarker)
 	repliedThisRun      bool
 	shuttingDown        bool
-	routingNudges       int           // mis-routed-reply corrections sent this user turn (bounded)
-	pendingNudge        *pendingNudge // staged routing correction, decided at agent_settled (#16)
-	reactTo             string        // full JID of the owner message the current run reacts to
-	reactID             string        // stanza id of that message (XEP-0444 target); "" disables
-	turnDest            string        // reply destination for the current turn (owner or room jid)
-	routingSeeded       bool          // the pi-msg routing contract has been injected into this session (once)
-	reactionAckRun      bool          // a run was woken by an inbound reaction ack (suppress "done (no reply)" noise)
-	heartbeatRun        bool          // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
+	reactTo             string // full JID of the owner message the current run reacts to
+	reactID             string // stanza id of that message (XEP-0444 target); "" disables
+	turnDest            string // reply destination for the current turn (owner or room jid)
+	messagingSeeded     bool   // the pi-msg messaging contract has been injected into this session (once)
+	reactionAckRun      bool   // a run was woken by an inbound reaction ack (suppress automatic reactions and no-reply recovery)
+	heartbeatRun        bool   // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
 	// runActive is when the current run last took a message into its context —
 	// an injected steer or a fresh assistant turn begins one. The inbox compares
 	// it with a delivery stamp at settle to tell a message the run consumed from
@@ -100,9 +96,9 @@ type Bridge struct {
 	finalMsgHadText bool
 	// toolSinceDelivery records that a tool ran after the last successful
 	// delivery. With finalMsgHadText it separates a run that stopped mid-work
-	// from one that deliberately said nothing (to: noop).
-	toolSinceDelivery bool
-	tailNudges        int // empty-tail recovery prompts sent this user turn (bounded)
+	// from one with a private final response and no send_message call.
+	toolSinceDelivery  bool
+	sendRecoveryNudges int // empty-tail recovery prompts sent this user turn (bounded)
 	// runInbound counts the chat messages that entered the current run: the one
 	// that started it plus every steer that landed while it was in flight.
 	// runDeliveries counts the replies that actually reached a destination. Pi
@@ -131,13 +127,7 @@ type Bridge struct {
 	pendingHeartbeats []string  // long-running-process alarms queued while a run was in flight
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
-	lifecycleReactID string // snapshot of reactID at run start; never overwritten by deliverReply
-
-	typingMu          sync.Mutex
-	typingStop        chan struct{}
-	typingTo          string // JID currently showing "composing" ("" if none)
-	typingStream      string // accumulated streamed reply text (room-mode routing)
-	typingRoutingDone bool   // routing decision for the streaming reply already made
+	lifecycleReactID string // snapshot of reactID at run start
 
 	// cascadeMu guards cascade, the count of consecutive agent-to-agent turns
 	// taken with no owner message in between (#23), and cascadeNotified, which
@@ -206,13 +196,9 @@ const maxPendingMarkers = 64
 // otherwise distinguish a dropped handoff from a peer still thinking.
 const cascadeCap = 25
 
-// rpcEnv is the environment the pi child process is launched with: the
-// companion extension's tool set (file and reaction are always available —
-// lifecycle auto-reactions (👀✅⛔) are gated in the bridge, not here; room is
-// offered only in room mode, since read_room has nothing to read otherwise),
-// plus the prompt-level opt-ins. beforeAgentStartText is not a tool but travels
-// the same way: the extension reads PI_MSG_BEFORE_AGENT_START_TEXT on
-// before_agent_start and appends it to the system prompt on every turn.
+// rpcEnv selects the companion extension's tool set. Message delivery and
+// archive reads are available in every account mode; file and reaction tools
+// remain opt-ins here, and lifecycle auto-reactions are gated in the bridge.
 func rpcEnv(acct ResolvedAccount) []string {
 	env := []string{"PI_MSG_TOOLS=" + strings.Join(toolNames(acct), ",")}
 	if acct.BeforeAgentStartText != "" {
@@ -221,16 +207,11 @@ func rpcEnv(acct ResolvedAccount) []string {
 	return env
 }
 
-// toolNames is the companion-extension tool set for an account, mirroring the
-// config: file and reaction are always registered (lifecycle auto-reactions are
-// gated in the bridge, not by the tool's presence), and room is offered only in
-// room mode — read_room has nothing to read otherwise (#106).
+// toolNames is the companion-extension tool set for an account. Explicit
+// message sending and history reads are always available; file and reaction
+// tools remain present regardless of their lifecycle opt-ins.
 func toolNames(acct ResolvedAccount) []string {
-	tools := []string{"file", "reaction"}
-	if acct.RoomMode() {
-		tools = append(tools, "room")
-	}
-	return tools
+	return []string{"file", "reaction", "messaging", "messages"}
 }
 
 // NewBridge constructs a bridge for the resolved account.
@@ -313,15 +294,15 @@ func (b *Bridge) Run(ctx context.Context) error {
 		b.rpc.sessionPath = prev
 		b.log("info", fmt.Sprintf("resuming session %s (start=%s)", prev, startLabel(b.startDir)))
 		b.resumed = true
-		// A resumed session's context already contains the routing contract (it
+		// A resumed session's context already contains the messaging contract (it
 		// was seeded when the session began) — unless the contract text has changed
 		// since, which a pi-msg upgrade can do. Re-seed then: a session still
 		// holding the old addressing rules would enforce rules the bridge no longer
 		// applies (#106/#109, found in the field on 2026-09-28).
 		if loadSeededContract(b.acct.Name) == b.contractHash() {
-			b.routingSeeded = true
+			b.messagingSeeded = true
 		} else {
-			b.log("info", "routing contract changed since this session was seeded; re-seeding")
+			b.log("info", "messaging contract changed since this session was seeded; re-seeding")
 		}
 		b.xmpp.SetStartupStatus("resumed")
 	} else {
@@ -416,11 +397,10 @@ func (b *Bridge) onPiExit() error {
 	if b.rpc.StoppedIntentionally() {
 		return nil
 	}
-	// pi died on its own (crash): XMPP is still connected, so clear the typing
-	// indicator and — unlike the graceful lifecycle, which is presence-only — post
-	// a loud chat message so the crash isn't missed, then drop presence carrying
-	// the same reason as the offline status. The message goes first, while online.
-	b.stopTyping()
+	// pi died on its own (crash): XMPP is still connected, so — unlike the
+	// graceful lifecycle, which is presence-only — post a loud chat message so
+	// the crash isn't missed, then drop presence carrying the same reason as the
+	// offline status. The message goes first, while online.
 	err := b.rpc.ExitErr()
 	if err != nil {
 		b.reply(fmt.Sprintf("🔴 pi crashed: %v. Bridge shutting down.", err))
@@ -470,9 +450,6 @@ func (b *Bridge) shutdown(reason string) {
 	b.shuttingDown = true
 	b.mu.Unlock()
 	b.log("info", "shutting down: "+reason)
-	// Clear the typing indicator (sends chat-state "active") while still online,
-	// so the owner isn't left seeing "typing…" against an offline bot.
-	b.stopTyping()
 	// Record the instant we go offline so the next launch's replay window can
 	// recover messages that arrive during the swap.
 	markSwapStart(b.log, b.acct.Name, time.Now())
@@ -484,11 +461,9 @@ func (b *Bridge) shutdown(reason string) {
 
 // --- pi event handling ---
 
-// The bridge conveys agent state on three orthogonal axes so they don't all
-// mean "busy" (see docs): the typing indicator = "a message is arriving right
-// now" (lit only while assistant text streams); presence <show> = availability
-// (dnd while a run is in flight, available when idle); presence <status> = the
-// current activity label (thinking / running a tool / muttering / replying / retrying).
+// The bridge conveys agent state through XMPP presence: <show> is availability
+// (dnd while a run is in flight, available when idle), and <status> is the
+// current activity label (thinking / running a tool / drafting / retrying).
 func (b *Bridge) handleRPCEvent(ev Event) {
 	switch ev.Type() {
 	case "agent_start":
@@ -497,33 +472,22 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setReplied(false)
 		b.setHandleWarned(false)
 		b.setUntaggedWarned(false)
-		b.clearPendingNudge() // a new run starts — discard any stale staged correction (#16)
-		b.resetTailTracking() // fresh run: no message seen, no tool since delivery
+		b.resetSendTracking() // fresh run: no message seen, no tool since delivery
 		b.clearRunActivity()
-		b.reactionAckRun = false
 		b.markActive() // a run is in flight — not idle
 		b.xmpp.SetPresence("dnd", "thinking…")
-		b.lifecycleReact("👀") // picked up (opt-in via the reactions flag)
+		b.lifecycleReact("👀") // picked up (opt-in; ack-only runs stay silent)
 	case "agent_settled":
 		b.ackInboxSettled()
 		b.setStreaming(false)
-		b.stopTyping()
 		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
 		b.announceSettledPresence()
 		b.lifecycleReact("✅") // done
-		// The routing reminder decision happens here (issue #16): mid-run
-		// malformed commentary drops silently, and the agent is only nudged if
-		// the run's FINAL message was malformed (pending nudge set AND nothing
-		// successfully delivered after it). Not before. A launched nudge is
-		// itself a pending reply, so it holds the no-reply reaction: the
-		// resend lands moments later, and reacting first would read
-		// as "agent: done, no reply" immediately followed by the resend.
-		nudged := b.firePendingNudge()
-		// A run that ended on a tool call never wrote its answer: the tool
-		// result came back and no assistant text followed it. Ask for the reply
-		// once rather than letting the work vanish. A deliberate silence uses
-		// "to: noop", which delivers and so never reaches here.
-		recovering := b.needsEmptyTailRecovery() && b.fireTailRecovery()
+		// Final assistant text is internal. If this run sent no XMPP message,
+		// prompt once for an explicit send_message rather than implying the text
+		// was delivered. Keep the no-reply reaction suppressed while that retry
+		// is in flight.
+		recovering := b.needsSendRecovery() && b.fireSendRecovery()
 		// Several messages entered this run but fewer replies left it. Pi
 		// injects a steer the moment a tool yields, so the model can read the
 		// next question before answering the last — and then never answer it.
@@ -538,18 +502,15 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		}
 		// The counts belong to the run that just ended, whatever we decided.
 		b.resetRunCounts()
-		// The reply text + typing/presence already signal "done". Only nudge if
-		// the run produced no message, so silence isn't mistaken for a hang.
-		// A run woken purely by a reaction ack (reactionAckRun) is allowed to
-		// stay silent after a to:noop without touching the owner. So is a
-		// heartbeat wake (heartbeatRun): noop is exactly what the alarm asks
-		// for, and the "— your turn" would be a misleading prompt to the
-		// owner. A recovery prompt (tail retry or routing nudge) is in flight,
-		// so hold the reaction: the retry may still answer, and a 🫡 followed
-		// by the resend would read as a contradiction.
-		if b.bannerNoReply(recovering, nudged) {
+		// A run woken purely by a reaction ack or heartbeat may stay silent. A
+		// recovery prompt is in flight when no message was sent, so hold the
+		// no-reply reaction until the retry settles.
+		if b.bannerNoReply(recovering) {
 			b.reactNoReply()
 		}
+		// Keep the ack marker through all settle-time recovery/reaction decisions,
+		// then consume it so it cannot suppress the next ordinary run.
+		b.setReactionAckRun(false)
 		b.volunteered = false // a resume volunteer turn is a one-shot; never repeats
 		// A heartbeat wake is likewise one-shot: the flag lives only for the
 		// run it opened, so a later user-initiated run is judged normally. It
@@ -566,13 +527,9 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 	case "message_update":
 		b.handleStreamDelta(ev)
 	case "tool_execution_start":
-		// A tool is running, not text streaming: drop the typing bubble and
-		// label the activity.
-		b.stopTyping()
 		b.markToolSinceDelivery()
 		b.xmpp.SetPresence("dnd", toolLabel(ev))
 	case "auto_retry_start":
-		b.stopTyping()
 		b.xmpp.SetPresence("dnd", "retrying (transient error)…")
 	case "auto_retry_end":
 		b.xmpp.SetPresence("dnd", "thinking…")
@@ -617,17 +574,9 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// message is tool-only never wrote its reply at all.
 		text := FixToolCallXML(extractText(msg["content"]))
 		b.setFinalMsgHadText(text != "")
-		if text == "" {
-			return
-		}
-		// "replied" must mean "reached a destination", not "text existed".
-		// A malformed reply goes to the error room, which the owner never
-		// reads — counting that as a reply would suppress the settle-time
-		// 🫡 reaction and leave the owner with silence.
-		if b.deliverReply(text) {
-			b.setReplied(true)
-			b.clearToolSinceDelivery()
-		}
+		// Assistant text is intentionally not sent. The model must call
+		// send_message for an outbound stanza; settle-time recovery handles a
+		// requested reply that never used the tool.
 	case "extension_error":
 		// Name the thrower. pi attaches the offending extension's path and the
 		// event it was handling, and the relay used to drop both — leaving the
@@ -669,19 +618,73 @@ func (b *Bridge) handleUIRequest(ev Event) {
 	}
 }
 
-// read_room limits. The default is what an agent usually wants — roughly the
+func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
+	if b.xmpp == nil {
+		b.rpc.RespondUIRelay(id, "send_message is unavailable: the bridge has no XMPP connection")
+		return
+	}
+	to = strings.TrimSpace(to)
+	text = strings.TrimSpace(text)
+	if to == "" || text == "" {
+		b.rpc.RespondUIRelay(id, "send_message requires non-empty to and text")
+		return
+	}
+	kind := b.xmpp.classifyMessageDest(to, b.acct.AllowArbitraryJid)
+	if kind == destBlocked {
+		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: %q is not an allowed destination", to))
+		return
+	}
+	var reply *replyTarget
+	replyToID = strings.TrimSpace(replyToID)
+	if replyToID != "" {
+		entry, ok := b.xmpp.lookupReplyMessage(replyToID)
+		if !ok {
+			b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: stanza %q is not in message history; read it with read_messages or omit reply_to", replyToID))
+			return
+		}
+		conversation := entry.ConversationJID
+		if conversation == "" {
+			conversation = entry.FromJID
+		}
+		if bareJid(conversation) != bareJid(to) {
+			b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: stanza %q belongs to %q, not destination %q", replyToID, conversation, to))
+			return
+		}
+		reply = &replyTarget{author: entry.FromJID, id: replyToID}
+	}
+	var stanzaID string
+	if kind == destRoom {
+		stanzaID = b.xmpp.SendRoomReply(bareJid(to), text, reply)
+	} else {
+		stanzaID = b.xmpp.SendChatReply(to, text, reply)
+	}
+	if stanzaID == "" {
+		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message to %s failed: no stanza was sent", to))
+		return
+	}
+	b.setReplied(true)
+	b.clearToolSinceDelivery()
+	b.recordDelivery(stanzaID, text)
+	if kind == destRoom {
+		to = bareJid(to)
+		b.warnHandleProblems(to, text)
+		b.warnUntaggedRoomReply(to, text)
+	}
+	b.setReactTarget(to, stanzaID)
+	b.rpc.RespondUIRelay(id, "sent:"+stanzaID)
+}
+
+// read_messages limits. The default is what an agent usually wants — roughly the
 // recent conversation — and the maximum bounds the token cost of one tool call,
 // since the whole result lands in the model's context.
 const (
-	roomReadDefaultLimit = 30
-	roomReadMaxLimit     = 100
+	messagesReadDefaultLimit = 30
+	messagesReadMaxLimit     = 100
 )
 
-// handleReadRoomRelay answers the `read_room` tool: it fetches archived
-// messages from a joined room's XEP-0313 archive and returns them as text. With
-// the ambient buffer gone (#106) this is the only way an agent learns what
-// happened in a room it was not addressed in, so the read is deliberately
-// explicit and on demand rather than pushed.
+// handleReadMessagesRelay answers the `read_messages` tool: it fetches XEP-0313
+// archive history for an allowed room or direct-chat peer and returns it as text.
+// Reads are explicit and on demand rather than pushed into the prompt.
 //
 // By default it reads the newest `limit` messages, which stays stateless and is
 // what an agent usually wants. Two optional arguments add a window (#57):
@@ -689,75 +692,90 @@ const (
 // `before` is a stanza id cursor that pages backwards past the newest-N window.
 // Both are validated here so a bad argument fails loudly in the tool result
 // instead of silently reading the newest page.
-func (b *Bridge) handleReadRoomRelay(id, room string, limit int, sinceArg, beforeArg string) {
+func (b *Bridge) handleReadMessagesRelay(id, target string, limit int, sinceArg, beforeArg string) {
 	if b.xmpp == nil {
-		b.rpc.RespondUIRelay(id, "read_room is unavailable: the bridge has no XMPP connection")
+		b.rpc.RespondUIRelay(id, "read_messages is unavailable: the bridge has no XMPP connection")
 		return
 	}
-	// Default to the only room when no room is named, so a single-room account
-	// never has to spell its own room out.
-	if strings.TrimSpace(room) == "" && len(b.acct.Rooms) == 1 {
-		room = b.acct.Rooms[0]
-	}
-	bare := bareJid(room)
-	if bare == "" {
-		if len(b.acct.Rooms) == 0 {
-			b.rpc.RespondUIRelay(id, "read_room: this account joins no rooms")
+	target = strings.TrimSpace(target)
+	if target == "" {
+		switch {
+		case !b.acct.RoomMode():
+			target = b.acct.Owner
+		case len(b.acct.Rooms) == 1:
+			target = b.acct.Rooms[0]
+		default:
+			b.rpc.RespondUIRelay(id, "read_messages needs a target: this account joins multiple rooms ("+strings.Join(b.acct.Rooms, ", ")+")")
 			return
 		}
-		b.rpc.RespondUIRelay(id, "read_room needs a room: no room was named and this account joins more than one ("+strings.Join(b.acct.Rooms, ", ")+")")
+	}
+	bare := bareJid(target)
+	if bare == "" {
+		b.rpc.RespondUIRelay(id, "read_messages: target must be a valid JID")
 		return
 	}
-	// Only joined rooms are readable. The error room is not in this set by
-	// construction, so rejected agent output stays unreadable.
-	if !b.xmpp.isRoomJID(bare) {
-		b.rpc.RespondUIRelay(id, fmt.Sprintf("read_room: %q is not a room this bridge has joined (readable: %s)", room, strings.Join(b.acct.Rooms, ", ")))
+	isRoom := b.xmpp.isRoomJID(bare)
+	if b.acct.ErrorRoom != "" && bare == bareJid(b.acct.ErrorRoom) {
+		b.rpc.RespondUIRelay(id, fmt.Sprintf("read_messages: %q is not a readable conversation", target))
 		return
+	}
+	if !isRoom {
+		if bare != bareJid(b.acct.Owner) && !b.acct.AllowArbitraryJid {
+			b.rpc.RespondUIRelay(id, fmt.Sprintf("read_messages: %q is not an allowed target (allowed: owner %s and configured rooms)", target, b.acct.Owner))
+			return
+		}
+		parsed, err := jid.Parse(bare)
+		if err != nil || parsed.String() != bare {
+			b.rpc.RespondUIRelay(id, fmt.Sprintf("read_messages: invalid peer JID %q", target))
+			return
+		}
 	}
 	if limit <= 0 {
-		limit = roomReadDefaultLimit
+		limit = messagesReadDefaultLimit
 	}
-	if limit > roomReadMaxLimit {
-		limit = roomReadMaxLimit
+	if limit > messagesReadMaxLimit {
+		limit = messagesReadMaxLimit
 	}
-	since, err := roomReadSince(sinceArg, time.Now())
+	since, err := messagesReadSince(sinceArg, time.Now())
 	if err != nil {
-		b.rpc.RespondUIRelay(id, "read_room: "+err.Error())
+		b.rpc.RespondUIRelay(id, "read_messages: "+err.Error())
 		return
 	}
-	cursor, err := roomReadCursor(beforeArg)
+	cursor, err := messagesReadCursor(beforeArg)
 	if err != nil {
-		b.rpc.RespondUIRelay(id, "read_room: "+err.Error())
+		b.rpc.RespondUIRelay(id, "read_messages: "+err.Error())
 		return
 	}
-	b.log("notice", fmt.Sprintf("tool-relay read_room: room=%q limit=%d since=%q before=%q", bare, limit, sinceArg, cursor))
-	// The MAM query is a network round trip, so run it off the RPC event loop and
-	// answer the blocked tool when it settles (same shape as the file upload).
+	b.log("notice", fmt.Sprintf("tool-relay read_messages: target=%q limit=%d since=%q before=%q", bare, limit, sinceArg, cursor))
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), mamTimeout)
 		defer cancel()
-		msgs, complete, err := b.xmpp.FetchMAMRoomWindow(ctx, bare, since, cursor, limit)
+		var msgs []InboundMessage
+		var complete bool
+		var err error
+		if isRoom {
+			msgs, complete, err = b.xmpp.FetchMAMRoomWindow(ctx, bare, since, cursor, limit)
+		} else {
+			msgs, complete, err = b.xmpp.FetchMAMDirectWindow(ctx, bare, since, cursor, limit)
+		}
 		if err != nil {
-			reason := fmt.Sprintf("read_room %s failed: %v", bare, err)
+			reason := fmt.Sprintf("read_messages %s failed: %v", bare, err)
 			b.log("warning", reason)
 			b.rpc.RespondUIRelay(id, reason)
 			return
 		}
-		// An empty page for a cursor read is a successful read of an empty window
-		// (the cursor is the room's oldest archived message); an unrecognised
-		// cursor never reaches here, because FetchMAMRoomWindow reports it as an
-		// error rather than handing back the newest page.
-		b.rpc.RespondUIRelay(id, formatRoomRead(bare, msgs, complete, roomReadWindowLabel(limit, since, cursor)))
+		b.xmpp.recordReadHistory(msgs, bare)
+		b.rpc.RespondUIRelay(id, formatMessagesRead(bare, msgs, complete, messagesReadWindowLabel(limit, since, cursor)))
 	}()
 }
 
-// roomReadSince resolves read_room's `since` argument to an archive lower
+// messagesReadSince resolves read_messages's `since` argument to an archive lower
 // bound. Both forms are accepted: an absolute RFC 3339 stamp, and a relative
 // age (a Go duration such as "2h", meaning that long before now). An empty
 // argument means "no lower bound" (the zero time); anything unparseable is an
 // error the caller reports rather than silently dropping the bound — a read
 // that quietly ignored `since` would return older messages than asked for.
-func roomReadSince(arg string, now time.Time) (time.Time, error) {
+func messagesReadSince(arg string, now time.Time) (time.Time, error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
 		return time.Time{}, nil
@@ -774,11 +792,11 @@ func roomReadSince(arg string, now time.Time) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("since %q is neither an RFC 3339 timestamp nor a relative age (e.g. 2h, 90m)", arg)
 }
 
-// roomReadCursor validates read_room's `before` argument: a stanza id from a
+// messagesReadCursor validates read_messages's `before` argument: a stanza id from a
 // previous read, or "" for the newest page. Stanza ids are opaque, so only the
 // shape is checked — a non-empty token with no whitespace. Whether the id still
 // exists in the archive is the server's answer, reported by the fetch.
-func roomReadCursor(arg string) (string, error) {
+func messagesReadCursor(arg string) (string, error) {
 	cursor := strings.TrimSpace(arg)
 	if cursor == "" {
 		return "", nil
@@ -789,10 +807,10 @@ func roomReadCursor(arg string) (string, error) {
 	return cursor, nil
 }
 
-// roomReadWindowLabel describes which slice of the archive a read covered, so
+// messagesReadWindowLabel describes which slice of the archive a read covered, so
 // the result is self-describing: the default newest-N page, a `since` bound, a
 // `before` cursor, or both.
-func roomReadWindowLabel(limit int, since time.Time, cursor string) string {
+func messagesReadWindowLabel(limit int, since time.Time, cursor string) string {
 	switch {
 	case cursor != "" && !since.IsZero():
 		return fmt.Sprintf("before stanza %s and since %s", cursor, since.UTC().Format(time.RFC3339))
@@ -805,20 +823,20 @@ func roomReadWindowLabel(limit int, since time.Time, cursor string) string {
 	}
 }
 
-// formatRoomRead renders archived room messages for the model: oldest first, one
-// line each, with the sender, age, MAM archive id for pagination, and stanza id
-// for replies and reactions. Every return value starts with
-// the `[pi-msg: read_room:` header — including the empty case, which is a
+// formatMessagesRead renders archived conversation messages for the model: oldest
+// first, one line each, with sender, age, archive cursor, and stanza ID. Every
+// return value starts with
+// the `[pi-msg: read_messages:` header — including the empty case, which is a
 // successful read of an empty window — because the companion extension treats
 // any other result as a failed tool call (#106 review). `window` names the slice
 // read (newest N, since …, before …), so a narrowed read is not mistaken for the
 // whole recent conversation.
-func formatRoomRead(room string, msgs []InboundMessage, complete bool, window string) string {
+func formatMessagesRead(conversation string, msgs []InboundMessage, complete bool, window string) string {
 	if len(msgs) == 0 {
-		return fmt.Sprintf("[pi-msg: read_room: no archived messages in %s (%s archive window).]", room, window)
+		return fmt.Sprintf("[pi-msg: read_messages: no archived messages in %s (%s archive window).]", conversation, window)
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "[pi-msg: read_room: %d archived message(s) in %s (%s), oldest first — read on demand, not a prompt; nothing here needs a reply unless you choose to send one.]", len(msgs), room, window)
+	fmt.Fprintf(&sb, "[pi-msg: read_messages: %d archived message(s) in %s (%s), oldest first — read on demand, not a prompt; nothing here needs a reply unless you choose to send one.]", len(msgs), conversation, window)
 	for _, m := range msgs {
 		who := m.Nick
 		if who == "" {
@@ -841,8 +859,8 @@ func formatRoomRead(room string, msgs []InboundMessage, complete bool, window st
 		if m.ReplyToID != "" {
 			reply = fmt.Sprintf(" [in reply to %s]", m.ReplyToID)
 		}
-		// MAM archive ids address `before` pagination; stanza ids address
-		// reactions and reply routing. They are distinct identifiers (#125).
+		// Archive IDs address `before` pagination; stanza IDs address
+		// send_message.reply_to and reactions. They are distinct identifiers.
 		ids := ""
 		if m.ArchiveID != "" {
 			ids += fmt.Sprintf(" [id %s]", m.ArchiveID)
@@ -875,9 +893,11 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		Emoji        string             `json:"emoji"`
 		Path         string             `json:"path"`
 		To           string             `json:"to"`
+		Text         string             `json:"text"`
+		ReplyTo      string             `json:"replyTo"`
+		Target       string             `json:"target"`
 		MessageID    string             `json:"messageId"`
 		From         string             `json:"from"`
-		Room         string             `json:"room"`
 		Limit        int                `json:"limit"`
 		Since        string             `json:"since"`
 		Before       string             `json:"before"`
@@ -948,8 +968,10 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 			}
 			b.rpc.RespondUIRelay(id, url)
 		}()
-	case "read_room":
-		b.handleReadRoomRelay(id, cmd.Room, cmd.Limit, cmd.Since, cmd.Before)
+	case "send_message":
+		b.handleSendMessageRelay(id, cmd.To, cmd.Text, cmd.ReplyTo)
+	case "read_messages":
+		b.handleReadMessagesRelay(id, cmd.Target, cmd.Limit, cmd.Since, cmd.Before)
 	case "process_count":
 		// Absolute count of background processes pi has running (relayed by the
 		// pi-processes companion extension). While any run — or any background
@@ -1003,9 +1025,8 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	// message is still outside the cursor and the next reconnect's backfill picks
 	// it up (#94).
 	defer b.noteInboundHandled()
-	b.resetRoutingNudges() // fresh user turn — allow corrections again
-	b.resetTailNudges()    // fresh user turn — allow one empty-tail recovery again
-	b.resetHintNudges()    // fresh user turn — allow one unanswered-message hint again
+	b.resetSendRecoveryNudges() // fresh user turn — allow one empty-tail recovery again
+	b.resetHintNudges()         // fresh user turn — allow one unanswered-message hint again
 	// Any inbound message is activity: come back to available and restart the
 	// idle-away timer from now (a run still in flight keeps dnd — leave its
 	// presence alone).
@@ -1096,13 +1117,13 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 		return
 	}
 	// Idle: wake the agent so the ack is readable now. It may acknowledge, act,
-	// or reply "to: noop" — no owner message required (issue #27).
+	// or stay silent; no owner message is required (issue #27).
 	if m.Direct {
 		b.setTurnDest(b.acct.Owner, false)
 	} else {
 		b.setTurnDest(m.Room, false) // a reaction ack is not a handoff
 	}
-	b.reactionAckRun = true
+	b.setReactionAckRun(true)
 	// The ack quotes OUR OWN message being reacted to (#58, case D) — never the
 	// reaction itself. msgHistory already records outbound bodies at send time,
 	// so no new plumbing is needed; an unknown id (evicted from the ring, or a
@@ -1114,7 +1135,7 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 		}
 	}
 	b.rpc.Prompt(
-		fmt.Sprintf("[pi-msg: room: %s reacted %s to your message %q. You may acknowledge, act on it, or ignore — reply with \"to: noop\" if you have nothing to add.]", render, joint, excerpt),
+		fmt.Sprintf("[pi-msg: room: %s reacted %s to your message %q. You may acknowledge, act on it, or ignore; no reply is required unless you need to send a message with send_message.]", render, joint, excerpt),
 		b.steerBehavior())
 	if b.xmpp != nil {
 		b.xmpp.SetPresence("dnd", "thinking…")
@@ -1144,7 +1165,7 @@ func reactionExcerpt(text string) string {
 
 // roomNoticeKind selects which pointer block a room-triggered prompt carries
 // (#58). The message body never enters the prompt: the agent pulls it with
-// read_room.
+// read_messages.
 type roomNoticeKind int
 
 const (
@@ -1406,8 +1427,8 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	}
 	switch action {
 	case actionCanonical:
-		// The stanza id always travels: it is the handle for "to: <stanza-id>"
-		// reply routing (#54), which works whether or not reactions are on.
+		// The stanza id always travels: it can be send_message's reply_to
+		// value (#54), whether or not reactions are on.
 		// Room reactions enabled → also use the room JID as the reaction target,
 		// so auto-reacts and send_reaction hit the room message. Every reaction
 		// path needs BOTH a target jid and an id, so an id with no jid reacts to
@@ -1463,6 +1484,8 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 		b.inboxDrop(reactID, "", "")
 		return
 	}
+	// A real message supersedes any pending/active reaction-only wake.
+	b.setReactionAckRun(false)
 	// Point the default reply/file destination at the message that arrived, BEFORE
 	// any dispatch. A control command produces no prompt of its own, so setting
 	// this only on the prompt path below would make a command inherit the
@@ -1569,7 +1592,7 @@ func (b *Bridge) sendDisplayedMarker(to, id string) error {
 
 // dispatchCommentary sends a non-owner addressed message as a room pointer
 // block (untrusted by authority, though the block no longer wraps the body — the
-// agent pulls it with read_room). Slash-commands from non-owners are treated as
+// agent pulls it with read_messages). Slash-commands from non-owners are treated as
 // literal text, never control commands.
 func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID, replyTo string, notice *roomNotice) {
 	t := strings.TrimSpace(body)
@@ -1577,6 +1600,8 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 		b.inboxDrop(reactID, "", "")
 		return
 	}
+	// A real message supersedes any pending/active reaction-only wake.
+	b.setReactionAckRun(false)
 	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin, true) // a peer's handoff: an untagged reply here is the mistake
@@ -1623,9 +1648,9 @@ func (b *Bridge) handleCommand(t string) bool {
 			// restart would resume an OLD conversation. Persist the new session
 			// file now so a restart continues this conversation instead.
 			b.refreshSessionFile()
-			// A fresh session has no routing contract in context yet — re-seed
+			// A fresh session has no messaging contract in context yet — re-seed
 			// it on the next prompt (once).
-			b.routingSeeded = false
+			b.messagingSeeded = false
 			// /new leaves the agent with a blank session and nothing asked of it,
 			// which is the state a fresh bridge is in: make it free to @free again
 			// rather than leaving it in the settled window for idleAwayTimeout
@@ -2052,26 +2077,26 @@ func compactArgs(args Event) string {
 	return strings.Join(pairs, " ")
 }
 
-// routingContract is pi-msg's canonical, on-start description of how the agent
-// must address its replies. It is seeded once per session (see composePrompt),
-// not on every message; the full spec lives in docs/routing.md. Ownership of
-// the routing protocol belongs to pi-msg, not to any fleet agent config.
-func (b *Bridge) routingContract() string {
-	return fmt.Sprintf("[pi-msg: routing: every reply must begin with a line \"to: <jid|stanza-id>\" naming where it goes. Default to the jid form: reply to where a message came from using its \"from:\" jid; DM the sender via their \"sender:\" jid; reach the owner via \"to: %s\". Use the id form, \"to: <stanza-id>\" — a message's \"stanza-id:\" value — only when the latest prompt contains two or more distinct messages and your reply answers one of them specifically: it sends to that message's author AND marks your text as a reply to that exact message, so the owner can see which one you answered. When the prompt has exactly one message, a plain \"to: <jid>\" already identifies what you are answering. Copy the id in full: an id that is wrong or unknown fails the send. Several \"to:\" lines fan out to different destinations. \"to: %s\" sends nothing (deliberate silence). To wake another agent in a room write \"@name\" inline; a name without @ also reaches it: a room message that does not address an agent is never delivered to it at all, so prose naming one (\"ask peppy for the path\") counts as addressing it. That cuts both ways — naming an agent in passing is a handoff, so refer to an agent without naming it when you do not mean to wake it. \"@everyone\" reaches the whole room, and \"@free\" reaches only the free agents — the ones whose presence is away (idle), plus a bridge that has not been asked to do anything since it started or was reset with /new. An agent that is working, or that has worked and has only just gone quiet, is not reached by @free. The owner's own rule differs: an owner room message that names nobody reaches the room's free agents and any agent that has spoken in the room within the last 20 minutes, while one that tags an agent or replies to an agent's message goes to that agent alone. Full spec: docs/routing.md]", b.acct.Owner, destNoopName)
+// messagingContract is the canonical on-start contract for outbound messages.
+// Final assistant text is private to the harness; send_message is the explicit
+// agent-authored path for text messages.
+func (b *Bridge) messagingContract() string {
+	allow := "By default, send_message allows the owner, configured rooms, and known occupants; read_messages allows the owner and configured rooms."
+	if b.acct.AllowArbitraryJid {
+		allow = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable."
+	}
+	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?). Choose `to` from the incoming `from:` conversation JID, use `sender:` to DM a room participant, or use owner JID %s to message the owner. %s For a threaded reply, pass the complete `stanza-id:` as `reply_to`; it must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, with the appropriate reply_to. `read_messages` reads room or 1:1 history; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
-// pointer block (#58): the case, the addressing meta and a read_room call, with
+// pointer block (#58): the case, the addressing meta and a read_messages call, with
 // the body left out. A 1:1 DM (or the invocation-time initial prompt) keeps the
 // "from:"/"sender:" header with the body below it. origin is the channel
 // jid (owner or room); sender is the individual's real jid (room only, when
 // known).
 //
-// No per-message routing hint is appended here (see issue #33): the routing
-// rules live persistently in the fleet AGENTS.md/project context (the
-// "on-start" baseline), and the only corrective is firePendingNudge, which
-// re-injects the rule at agent_settled when a run's final message failed to
-// route (#16).
+// No per-message messaging hint is appended here: the tool contract is seeded
+// once per session, and no-send recovery is handled at agent_settled.
 // replyContext renders the `in-reply-to:` header value for an inbound message
 // carrying a XEP-0461 reply stamp, or "" when it carries none (#95).
 //
@@ -2137,15 +2162,15 @@ func shortAge(d time.Duration) string {
 // rule in force in them (#106): a room message either addresses this agent — and
 // arrives as a normal prompt with a `from:` header — or it is not delivered at
 // all. There is no buffered room chatter, so an agent that wants the wider
-// conversation must read it deliberately with the read_room tool. Seeded once
-// per session alongside the routing contract, because an agent that assumes
+// conversation must read it deliberately with the read_messages tool. Seeded once
+// per session alongside the messaging contract, because an agent that assumes
 // silence means an empty room will miss handoffs it was not named in.
 // contractHash identifies the contract text this bridge would seed, so a
 // resumed session can tell whether the rules in its context are still current.
-// It covers both halves — the routing contract and the room contract.
+// It covers both halves — the messaging contract and the room contract.
 func (b *Bridge) contractHash() string {
 	h := fnv.New32a()
-	fmt.Fprint(h, b.routingContract())
+	fmt.Fprint(h, b.messagingContract())
 	fmt.Fprint(h, "\n\n")
 	fmt.Fprint(h, b.roomsContract())
 	return fmt.Sprintf("%08x", h.Sum32())
@@ -2155,18 +2180,18 @@ func (b *Bridge) roomsContract() string {
 	if len(b.acct.Rooms) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("[pi-msg: rooms: you are in %s. A room message that addresses you arrives as a normal prompt with a `from:` header naming that room — reply there with `to: <that room jid>`. Messages that do not address you are NOT delivered and are NOT buffered; silence means nobody addressed you, not that nothing was said. Use the read_room tool to read a room's recent history on demand.]", strings.Join(b.acct.Rooms, ", "))
+	return fmt.Sprintf("[pi-msg: rooms: you are in %s. A room message that addresses you arrives with a `from:` header naming that room. Final text is internal: use send_message(to=<room jid>, text=..., reply_to=...) to answer there. Messages that do not address you are NOT delivered and are NOT buffered; silence means nobody addressed you, not that nothing was said. Use read_messages(target=<room jid>) to inspect room history.]", strings.Join(b.acct.Rooms, ", "))
 }
 
 func (b *Bridge) composePrompt(body, origin, sender, reactID, reactTo, replyTo string, notice *roomNotice) string {
 	var sb strings.Builder
-	// Seed the pi-msg routing contract once per session (fresh session or after
+	// Seed the pi-msg messaging contract once per session (fresh session or after
 	// /new) so the agent knows the protocol without paying a per-message cost.
 	// Resumed sessions skip this: their context already contains the contract
-	// (routingSeeded is set true at startup for a resume and reset on /new).
+	// (messagingSeeded is set true at startup for a resume and reset on /new).
 	b.seedContracts(&sb)
 	// A room-triggered prompt is a pointer block (#58): the body is dropped and
-	// the agent pulls the text itself with read_room. Only a 1:1 DM or the
+	// the agent pulls the text itself with read_messages. Only a 1:1 DM or the
 	// invocation-time initial prompt still carries the body, below.
 	if notice != nil {
 		b.writeRoomPointer(&sb, *notice, origin, sender, reactID, reactTo)
@@ -2179,7 +2204,7 @@ func (b *Bridge) composePrompt(body, origin, sender, reactID, reactTo, replyTo s
 		}
 	}
 	// Include the stanza ID so the agent can name this message later — as
-	// send_reaction's messageId, or as a "to: <stanza-id>" reply route (#54).
+	// send_reaction's messageId or send_message's reply_to value.
 	// react-to is the reaction target jid, and appears only when reactions are
 	// enabled for this channel.
 	if reactID != "" {
@@ -2200,23 +2225,26 @@ func (b *Bridge) composePrompt(body, origin, sender, reactID, reactTo, replyTo s
 
 // seedContracts writes the session-start contracts once per session (fresh
 // session or after /new). Resumed sessions skip it: their context already
-// contains the contracts (routingSeeded is true at startup for a resume and is
+// contains the contracts (messagingSeeded is true at startup for a resume and is
 // reset on /new).
 func (b *Bridge) seedContracts(sb *strings.Builder) {
-	if b.acct.RoomMode() && !b.routingSeeded {
-		b.routingSeeded = true
-		sb.WriteString(b.routingContract())
-		sb.WriteString("\n\n")
-		sb.WriteString(b.roomsContract())
-		sb.WriteString("\n\n")
-		saveSeededContract(b.log, b.acct.Name, b.contractHash())
+	if b.messagingSeeded {
+		return
 	}
+	b.messagingSeeded = true
+	sb.WriteString(b.messagingContract())
+	if rooms := b.roomsContract(); rooms != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(rooms)
+	}
+	sb.WriteString("\n\n")
+	saveSeededContract(b.log, b.acct.Name, b.contractHash())
 }
 
 // writeRoomPointer renders one of the room pointer blocks (#58): the agent is
 // told what reached it and given the addressing meta, and pulls the text itself
-// with read_room. The body is deliberately absent, and no field line repeats a
-// jid the commentary already names. The read_room call is the last line and
+// with read_messages. The body is deliberately absent, and no field line repeats a
+// jid the commentary already names. The read_messages call is the last line and
 // carries no failed-read clause — the extension already reports its own errors.
 func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sender, reactID, reactTo string) {
 	switch n.kind {
@@ -2242,7 +2270,7 @@ func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sen
 	if reactTo != "" {
 		fmt.Fprintf(sb, "react-to: %s\n", reactTo)
 	}
-	fmt.Fprintf(sb, "Check message using read_room(room=%q, limit=15).]", origin)
+	fmt.Fprintf(sb, "Check message using read_messages(target=%q, limit=15).]", origin)
 }
 
 // matchTrigger reports whether body addresses the bot in room, and returns the
@@ -2584,7 +2612,7 @@ func stripUnquoted(t string) string {
 // or a broadcast handle does not address anyone. Without this, the sentence
 // "it still reads a name without @ does not reach them, with no `@everyone`" is
 // a broadcast to every agent in the room — observed live on 2026-09-28, when an
-// agent discussing the routing rules woke the whole fleet.
+// agent discussing the messaging rules woke the whole fleet.
 //
 // Only BALANCED pairs are removed: an unmatched backtick is left as literal text
 // so a typo cannot silently swallow a real mention later in the same line.
@@ -2818,12 +2846,11 @@ func (b *Bridge) warnHandleProblems(room, body string) {
 	} else {
 		sb.WriteString(" No other handle is addressable in this room right now.")
 	}
-	// Deliberately NOT offering "reply to: noop" as the alternative. It was
-	// offered once and an agent took it: told that "@everyone" reached nobody
-	// while opening an election, it acknowledged by staying silent, and the
-	// whole fleet sat idle. Given an explicit cheap out, a fleet trained to
-	// prefer silence will take it, so state the consequence and ask for the
-	// decision instead.
+	// Deliberately do not suggest silence as the alternative. It was offered
+	// once and an agent took it: told that "@everyone" reached nobody while
+	// opening an election, it acknowledged by staying silent, and the whole
+	// fleet sat idle. Given an explicit cheap out, a fleet trained to prefer
+	// silence will take it, so state the consequence and ask for the decision.
 	sb.WriteString(" If anyone needs to act on it, resend addressing them.]")
 	b.rpc.Prompt(sb.String(), b.steerBehavior())
 }
@@ -2911,7 +2938,7 @@ func untaggedRoomNotice(addressable []string) string {
 	} else {
 		sb.WriteString(" No other handle is addressable in this room right now.")
 	}
-	// Deliberately NOT offering "to: noop": the same lesson as
+	// Deliberately do not suggest silence: the same lesson as
 	// warnHandleProblems — a fleet trained to prefer silence takes the cheap
 	// out, and this message has already been delivered to the room.
 	sb.WriteString(" If anyone needs to act on it, resend naming them.]")
@@ -2947,8 +2974,8 @@ func (b *Bridge) warnUntaggedRoomReply(room, body string) {
 // dispatch instead of being held for a later turn. See handleRoom.
 
 // reply sends a bridge-generated notice (banner, command results, shutdown,
-// errors) to the owner's 1:1 — the primary channel. Agent replies go through
-// deliverReply instead.
+// errors) to the owner's 1:1 — the primary channel. Agent-authored text is
+// private unless it is sent through an explicit messaging tool.
 func (b *Bridge) reply(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
@@ -2956,190 +2983,13 @@ func (b *Bridge) reply(text string) {
 	b.xmpp.Send(text)
 }
 
-// deliverReply routes one agent-produced message. In a pure 1:1 account it goes
-// to the owner verbatim. When the account has room access, the message is split
-// into one or more "to: <jid>" segments (see composePrompt's routing hint) and
-// each is delivered independently — a joined room → groupchat, the owner or a
-// known occupant → 1:1. Text with no "to:" line, text before the first "to:",
-// or a non-allowlisted target is forwarded to the owner with a note and the
-// agent is nudged to resend correctly.
-func (b *Bridge) deliverReply(text string) bool {
-	delivered := false
-	if !b.acct.RoomMode() {
-		// A 1:1 account has no routing contract, but "to: noop" still works: it
-		// is the only way the agent can say "I have nothing to send" without the
-		// run looking like a reply that went missing. As in room mode, the body
-		// after it is discarded.
-		if leadingNoop(text) {
-			b.log("notice", "agent chose silence (to: noop)")
-			b.setReplied(true)
-			b.recordDelivery("", "")
-			return true
-		}
-		// Deliberate reactions are the send_reaction tool's job now; a 1:1 reply
-		// is just its text.
-		if strings.TrimSpace(text) != "" {
-			stanzaID := b.xmpp.Send(text)
-			// Update reaction target to the just-sent message so subsequent
-			// send_reaction calls target the agent's own message.
-			if stanzaID != "" {
-				b.setReactTarget(b.acct.Owner, stanzaID)
-				b.recordDelivery(stanzaID, text)
-				delivered = true
-			}
-		}
-		return delivered
-	}
-	segs, leading := splitReplySegments(text)
-	if len(segs) == 0 {
-		if body := strings.TrimSpace(text); body != "" {
-			b.rejectReply(body, "it had no \"to: <jid>\" routing line")
-		}
-		return false
-	}
-	if leading != "" {
-		b.rejectReply(leading, "this text came before the first \"to:\" line, so it had no destination")
-	}
-	for _, s := range segs {
-		// A stanza-id route (#54) names the message to answer. Resolve it to
-		// that message's author, then continue through the unchanged
-		// classifyDest path — a room message records "room@muc/nick", which
-		// bareJid collapses to the room, and the reply stamp keeps the occupant
-		// jid so the client can attribute it.
-		var reply *replyTarget
-		if s.replyTo != "" {
-			author := b.xmpp.lookupMessage(s.replyTo)
-			if author == "" {
-				b.rejectReply(s.body, fmt.Sprintf("%q is an unknown stanza id", s.replyTo))
-				continue
-			}
-			s.dest = bareJid(author)
-			reply = &replyTarget{author: author, id: s.replyTo}
-		}
-		// "to: noop" — the agent deliberately has nothing to send. Drop the body
-		// without emitting a stanza, and count it as having replied so the
-		// 🫡 reaction doesn't turn room silence into owner DM noise.
-		if strings.EqualFold(s.dest, destNoopName) {
-			// "notice", not "info": info is suppressed unless PI_MSG_DEBUG is set,
-			// and a noop emits no stanza, so this line is the ONLY evidence the
-			// feature was used at all. Logging it at info made adoption
-			// unmeasurable in production.
-			b.log("notice", "agent chose silence (to: noop)")
-			b.clearPendingNudge()
-			b.setReplied(true)
-			b.recordDelivery("", "")
-			// Deliberate silence IS an answer: it must not look like a run that
-			// died before writing one, or the recovery would argue with it.
-			delivered = true
-			continue
-		}
-		kind := b.xmpp.classifyDest(s.dest)
-		if kind == destBlocked {
-			b.rejectReply(s.body, fmt.Sprintf("%q is not an allowed destination", s.dest))
-			continue
-		}
-		if s.body != "" {
-			var stanzaID string
-			if kind == destRoom {
-				stanzaID = b.xmpp.SendRoomReply(bareJid(s.dest), s.body, reply)
-				// A mistyped mention — or a self-tag — is inert: it addresses
-				// nobody and reports nothing, so the sender believes the
-				// handoff landed.
-				b.warnHandleProblems(bareJid(s.dest), s.body)
-				// A message with NO mention is inert in the same way, and is the
-				// more common slip: it reads as a reply in the room while no
-				// agent is delivered it at all.
-				b.warnUntaggedRoomReply(bareJid(s.dest), s.body)
-			} else {
-				stanzaID = b.xmpp.SendChatReply(s.dest, s.body, reply)
-			}
-			// A message routed successfully — any staged correction no longer
-			// applies (#16: nudge only if the FINAL message was malformed, and
-			// "a later message routed fine" discards the staged nudge).
-			if stanzaID != "" {
-				b.clearPendingNudge()
-				b.recordDelivery(stanzaID, s.body)
-				delivered = true
-			}
-			// Update reaction target to the last-segment message so subsequent
-			// send_reaction calls target the agent's own most recent message.
-			if stanzaID != "" {
-				dest := s.dest
-				if kind == destRoom {
-					dest = bareJid(dest)
-				}
-				b.setReactTarget(dest, stanzaID)
-			}
-		}
-	}
-	return delivered
-}
-
-// maxRoutingNudges bounds how many routing reminders we send per user turn, so
-// a stubbornly-malformed agent can't loop forever. Applied at settle time (the
-// only point a reminder can fire, per #16).
-const maxRoutingNudges = 2
-
-// pendingNudge is a malformed room-mode reply staged while the agent streams.
-// The routing reminder is only sent at agent_settled if the run's FINAL
-// message was malformed (issue #16) — mid-run commentary drops silently, and a
-// message that later routes fine clears the staged correction.
-type pendingNudge struct {
-	body   string
-	reason string
-}
-
-// rejectReply handles a room-mode reply that couldn't be routed: it forwards the
-// text to the write-only error room (falling back to the owner's 1:1 if unset),
-// then stages a routing correction. The actual nudge prompt is deferred to
-// agent_settled (firePendingNudge, issue #16), so mid-stream thinking
-// commentary never triggers a routing reminder.
-func (b *Bridge) rejectReply(body, reason string) {
-	b.log("warning", "agent reply not routed: "+reason)
-	b.routeDropped(fmt.Sprintf("⚠️ malformed message: %s\n\n%s", reason, body))
-	b.stageNudge(body, reason)
-}
-
-// stageNudge remembers the most recent malformed reply for the settle-time
-// decision. Later staging replaces earlier ones; a successful delivery or a
-// new run clears it.
-func (b *Bridge) stageNudge(body, reason string) {
-	b.mu.Lock()
-	b.pendingNudge = &pendingNudge{body: body, reason: reason}
-	b.mu.Unlock()
-}
-
-// clearPendingNudge discards any staged routing correction: called when a
-// later message routes successfully, when a new run starts, or when a run is
-// reset locally (abort/new), so stale corrections never survive their run.
-func (b *Bridge) clearPendingNudge() {
-	b.mu.Lock()
-	b.pendingNudge = nil
-	b.mu.Unlock()
-}
-
-// takeStagedNudge consumes the staged correction (if any) and reports the
-// reason to nudge about, bounded by the per-turn budget. Returns "" when
-// nothing is staged or the budget is exhausted — the reminder is silently
-// dropped in both cases (the text already reached the error room).
-func (b *Bridge) takeStagedNudge() string {
-	b.mu.Lock()
-	p := b.pendingNudge
-	b.pendingNudge = nil
-	b.mu.Unlock()
-	if p == nil || !b.bumpRoutingNudge() {
-		return ""
-	}
-	return p.reason
-}
-
-// maxTailNudges bounds how many empty-tail recovery prompts we send per user
+// maxSendRecoveryNudges bounds how many empty-tail recovery prompts we send per user
 // turn. One retry recovers the common case; more would loop against a model
 // that keeps ending its runs on a tool call.
-const maxTailNudges = 1
+const maxSendRecoveryNudges = 1
 
-// resetTailTracking clears the empty-tail bookkeeping at the start of a run.
-func (b *Bridge) resetTailTracking() {
+// resetSendTracking clears the empty-tail bookkeeping at the start of a run.
+func (b *Bridge) resetSendTracking() {
 	b.mu.Lock()
 	b.finalMsgHadText = false
 	b.toolSinceDelivery = false
@@ -3170,7 +3020,7 @@ func (b *Bridge) lastRunActivity() time.Time {
 }
 
 // setFinalMsgHadText records whether the assistant message that just ended
-// carried deliverable text. Only the last such call before settle matters.
+// carried private final text. Only the last such call before settle matters.
 func (b *Bridge) setFinalMsgHadText(v bool) {
 	b.mu.Lock()
 	b.finalMsgHadText = v
@@ -3185,7 +3035,7 @@ func (b *Bridge) markToolSinceDelivery() {
 	b.mu.Unlock()
 }
 
-// clearToolSinceDelivery is called when a reply actually reaches a destination:
+// clearToolSinceDelivery is called when a send_message reaches its destination:
 // the work up to this point has been reported.
 func (b *Bridge) clearToolSinceDelivery() {
 	b.mu.Lock()
@@ -3193,40 +3043,35 @@ func (b *Bridge) clearToolSinceDelivery() {
 	b.mu.Unlock()
 }
 
-// needsEmptyTailRecovery reports whether the run stopped mid-work: a tool ran
-// after the last delivered text, and the run's final assistant message carried
-// no text at all. That combination means the answer was never written — the
-// bridge has nothing to send and the owner would see silence.
-//
-// A run that delivered its reply after the tool clears toolSinceDelivery, so it
-// never matches. Nor does a run that simply had nothing to do (no tool). A
-// volunteer, reaction-ack, or heartbeat run is allowed to end quietly.
-func (b *Bridge) needsEmptyTailRecovery() bool {
+// needsSendRecovery reports an ordinary run that produced no outbound chat
+// message. Final assistant text is private, so an incoming request, a final
+// draft, or work after a tool call with no successful send merits one retry.
+func (b *Bridge) needsSendRecovery() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.volunteered || b.reactionAckRun || b.heartbeatRun {
+	if b.volunteered || b.reactionAckRun || b.heartbeatRun || b.repliedThisRun {
 		return false
 	}
-	return b.toolSinceDelivery && !b.finalMsgHadText
+	return b.runInbound > 0 || b.finalMsgHadText || b.toolSinceDelivery
 }
 
-// bumpTailNudge consumes one unit of the per-turn recovery budget.
-func (b *Bridge) bumpTailNudge() bool {
+// bumpSendRecoveryNudge consumes one unit of the per-turn recovery budget.
+func (b *Bridge) bumpSendRecoveryNudge() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.tailNudges++
-	return b.tailNudges <= maxTailNudges
+	b.sendRecoveryNudges++
+	return b.sendRecoveryNudges <= maxSendRecoveryNudges
 }
 
-// resetTailNudges refills the recovery budget at the start of a user turn.
-func (b *Bridge) resetTailNudges() { b.mu.Lock(); b.tailNudges = 0; b.mu.Unlock() }
+// resetSendRecoveryNudges refills the recovery budget at the start of a user turn.
+func (b *Bridge) resetSendRecoveryNudges() { b.mu.Lock(); b.sendRecoveryNudges = 0; b.mu.Unlock() }
 
 // maxHintNudges bounds how many unanswered-message hints we send per user turn.
 const maxHintNudges = 1
 
 // runLogEntry is one line of the current run's chat history: a message that
 // came in, or a reply that went out. The stanza id is the handle the agent
-// needs to answer that exact message ("to: <stanza-id>").
+// may pass to send_message as reply_to.
 type runLogEntry struct {
 	who  string // display name: the sender's nick for inbound, our own nick for a reply
 	id   string // stanza id of the message ("" when the send reported none)
@@ -3241,7 +3086,7 @@ func (e runLogEntry) line() string {
 		id = "(no id)"
 	}
 	if e.text == "" {
-		return fmt.Sprintf("%s: %s (deliberate silence, to: noop)", e.who, id)
+		return fmt.Sprintf("%s: %s (sent message without text)", e.who, id)
 	}
 	return fmt.Sprintf("%s: %s %q", e.who, id, e.text)
 }
@@ -3256,15 +3101,9 @@ func (b *Bridge) countInbound(who, id, text string) {
 	b.mu.Unlock()
 }
 
-// recordDelivery records one answer that reached its destination: a sent
-// stanza, or a "to: noop" (deliberate silence is an answer). It also adds the
-// reply to the run's history, so only deliverReply calls it — nothing else
-// knows the stanza ids.
-//
-// It counts per SEGMENT, not per assistant message. One message can carry
-// several "to:" lines that fan out to several people, and counting that as a
-// single reply made a run that answered every message look unbalanced, which
-// fired the unanswered-message hint for work that was already done.
+// recordDelivery records one successfully sent chat message and adds it to the
+// run history. Each send_message call is one delivery; multiple calls can
+// answer multiple inbound messages in a run.
 func (b *Bridge) recordDelivery(id, text string) {
 	b.mu.Lock()
 	b.runDeliveries++
@@ -3301,10 +3140,10 @@ func hintExcerpt(text string) string {
 // The counters are reset at settle rather than at agent_start because
 // handleCanonical counts a message before pi reports the run started: resetting
 // at agent_start would zero the very message that opened the run.
-func (b *Bridge) bannerNoReply(recovering, nudged bool) bool {
+func (b *Bridge) bannerNoReply(recovering bool) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return !b.repliedThisRun && !b.volunteered && !b.reactionAckRun && !b.heartbeatRun && !recovering && !nudged
+	return !b.repliedThisRun && !b.volunteered && !b.reactionAckRun && !b.heartbeatRun && !recovering
 }
 
 // resetRunCounts clears the per-run message/reply tally. Called at settle,
@@ -3319,10 +3158,9 @@ func (b *Bridge) resetRunCounts() {
 // unansweredRun reports whether the run took in more messages than it answered,
 // and returns both counts. It only fires when at least two messages entered the
 // run: a single message with no reply is the empty-tail case, already covered by
-// needsEmptyTailRecovery and the unanswered-run reaction.
+// needsSendRecovery and the unanswered-run reaction.
 //
-// "to: noop" counts as a delivery, so a run the agent deliberately answered with
-// silence is never flagged.
+// Only successful send_message calls count as deliveries.
 func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -3337,14 +3175,13 @@ func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
 // can hold the unanswered-run reaction while the check is in flight.
 //
 // The hint is a prompt, not a chat message: it never reaches the owner. The
-// agent answers it with real replies, or with "to: noop" if it already covered
-// everything — so a correctly-handled run costs one cheap turn and no noise.
+// agent answers it with send_message calls for anything still outstanding.
 func (b *Bridge) fireUnansweredHint(inbound, delivered int, history []runLogEntry) bool {
 	if !b.bumpHintNudge() {
 		return false
 	}
 	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
-	b.rpc.Prompt(unansweredHintText(inbound, delivered, history, b.acct.RoomMode()), b.steerBehavior())
+	b.rpc.Prompt(unansweredHintText(inbound, delivered, history), b.steerBehavior())
 	b.markHintPending()
 	return true
 }
@@ -3358,15 +3195,9 @@ func (b *Bridge) fireUnansweredHint(inbound, delivered int, history []runLogEntr
 // history — every message in and every reply out, in order, each with its
 // stanza id — and the agent matches its replies against it.
 //
-// The routing form names the stanza id (#54): this hint fires exactly when
-// several messages are in play, which is the case a bare jid cannot
-// disambiguate. An id both routes the reply and marks it as a reply to the
-// message it answers, so the owner can see which one each reply is for.
-//
-// It also names the multi-destination form: the hint asks for every outstanding
-// reply, and several "to:" lines in one reply fan out, so the agent can clear
-// the whole backlog in the single turn the hint buys it.
-func unansweredHintText(inbound, delivered int, history []runLogEntry, roomMode bool) string {
+// The hint asks for explicit send_message calls. A stanza id in reply_to both
+// selects the specific inbound message and threads the outbound reply.
+func unansweredHintText(inbound, delivered int, history []runLogEntry) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "[pi-msg: unanswered: You received %d messages but sent %d replies. Make sure that your replies addressed all %d received messages.", inbound, delivered, inbound)
 	if len(history) > 0 {
@@ -3379,15 +3210,7 @@ func unansweredHintText(inbound, delivered int, history []runLogEntry, roomMode 
 	} else {
 		sb.WriteString(" ")
 	}
-	if roomMode {
-		sb.WriteString("If anything is outstanding reply to it now using \"to: <jid|stanza-id>\" — a stanza id from the history above routes the reply to that message's author AND marks it as a reply to that exact message. Several \"to:\" lines in one reply fan out to different destinations, so you can answer every outstanding message in this one turn. ")
-	} else {
-		// A 1:1 account parses no "to: <destination>" line, so asking for one
-		// would put the literal text in front of the owner. Only "to: noop"
-		// works here (leadingNoop).
-		sb.WriteString("If anything is outstanding answer it now — you can answer every outstanding message in this one reply. ")
-	}
-	sb.WriteString("If your replies covered everything the user wanted already, reply with \"to: noop\" and nothing else.]")
+	sb.WriteString("If anything is outstanding, call send_message(to, text, reply_to) for each answer; use the matching stanza ID from the history as reply_to when appropriate. The final assistant response is internal and is not sent to chat.]")
 	return sb.String()
 }
 
@@ -3415,179 +3238,16 @@ func (b *Bridge) bumpHintNudge() bool {
 // resetHintNudges refills the hint budget at the start of a user turn.
 func (b *Bridge) resetHintNudges() { b.mu.Lock(); b.hintNudges = 0; b.mu.Unlock() }
 
-// fireTailRecovery asks the agent for the reply its run never wrote. It reports
-// whether a prompt went out, so the caller can hold the "done (no reply)"
-// banner while the retry is in flight. Returns false once the budget is spent,
-// and the banner then tells the owner nothing came back.
-func (b *Bridge) fireTailRecovery() bool {
-	if !b.bumpTailNudge() {
+// fireSendRecovery asks for an explicit send_message after a run produced no
+// chat stanza. Its prompt is internal; final assistant text remains undelivered.
+func (b *Bridge) fireSendRecovery() bool {
+	if !b.bumpSendRecoveryNudge() {
 		return false
 	}
-	b.log("notice", "run ended on a tool call with no reply: asking the agent to write it")
-	// A pure 1:1 account has no routing contract, so don't ask it for a "to:"
-	// line it must not write. "to: noop" is the exception: it works in both
-	// modes (leadingNoop), and it is how the agent declines to say anything.
-	const base = "[pi-msg: recovery: Your last run ended after a tool call without writing any reply, so nothing was delivered to the chat. The tool result is above. Write the reply now."
-	prompt := fmt.Sprintf("%s If you truly have nothing to say, reply with \"to: noop\" and nothing else.]", base)
-	if b.acct.RoomMode() {
-		prompt = fmt.Sprintf("%s Begin it with a \"to: <jid>\" line (e.g. \"to: %s\" for the owner). If you truly have nothing to say, reply with \"to: noop\".]", base, b.acct.Owner)
-	}
-	b.rpc.Prompt(prompt, b.steerBehavior())
+	b.log("notice", "run ended without sending a chat message: asking the agent to use send_message")
+	b.rpc.Prompt("[pi-msg: recovery: No chat message was sent during the last run. Final assistant text is internal and was not delivered. If a reply is needed, call send_message(to, text, reply_to?) now; use a separate call for each message. The tool result will confirm whether each message was sent.]", b.steerBehavior())
 	return true
 }
-
-// firePendingNudge sends the staged routing reminder, if the run settled on a
-// malformed final message. Called from agent_settled only; the reminder is a
-// prompt, so it isn't confused for a real user.
-func (b *Bridge) firePendingNudge() bool {
-	reason := b.takeStagedNudge()
-	if reason == "" {
-		return false
-	}
-	b.rpc.Prompt(fmt.Sprintf("[pi-msg: routing: Your previous message was NOT delivered to anyone in the chat: %s. Every reply MUST begin with a line \"to: <jid>\" naming the destination (e.g. \"to: %s\" for the owner, or a room/person jid). Resend your message now with a valid \"to:\" line.]", reason, b.acct.Owner), b.steerBehavior())
-	return true
-}
-
-// routeDropped sends dropped/unrouteable output to the write-only error room
-// (Change #15) when one is configured, falling back to the owner's 1:1
-// otherwise so nothing is silently lost. The agent never reads the error room.
-func (b *Bridge) routeDropped(text string) {
-	if errRoom := b.acct.ErrorRoom; errRoom != "" {
-		b.xmpp.SendRoomTo(bareJid(errRoom), text)
-		return
-	}
-	b.xmpp.Send(text)
-}
-
-// bumpRoutingNudge increments the per-turn nudge counter and reports whether a
-// nudge is still allowed. Reset by resetRoutingNudges on each real user turn.
-func (b *Bridge) bumpRoutingNudge() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.routingNudges++
-	return b.routingNudges <= maxRoutingNudges
-}
-
-func (b *Bridge) resetRoutingNudges() { b.mu.Lock(); b.routingNudges = 0; b.mu.Unlock() }
-
-// replySegment is one routed chunk of an agent reply: a destination and the
-// text to send there. Exactly one of dest and replyTo is set. dest is a jid (or
-// the reserved "noop"). replyTo is the stanza id of the message this segment
-// answers, which deliverReply resolves to a destination through msgHistory.
-type replySegment struct {
-	dest    string
-	replyTo string
-	body    string
-}
-
-// splitReplySegments parses an agent reply into "to: <target>" segments. A line
-// whose first token after "to:" looks like a jid (contains "@"), or like a
-// stanza id, starts a new segment; other lines form the body (that line's
-// remainder plus subsequent lines up to the next "to:"). Text before the first "to:" line is returned as
-// leading (a routing error). This lets one agent output fan out to several
-// destinations.
-func splitReplySegments(text string) (segs []replySegment, leading string) {
-	var leadingLines []string
-	cur := -1
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimRight(line, "\r")
-		if dest, replyTo, inline, ok := routeLine(line); ok {
-			segs = append(segs, replySegment{dest: dest, replyTo: replyTo, body: inline})
-			cur = len(segs) - 1
-			continue
-		}
-		if cur < 0 {
-			leadingLines = append(leadingLines, line)
-			continue
-		}
-		if segs[cur].body == "" {
-			segs[cur].body = line
-		} else {
-			segs[cur].body += "\n" + line
-		}
-	}
-	for i := range segs {
-		segs[i].body = strings.TrimSpace(segs[i].body)
-	}
-	return segs, strings.TrimSpace(strings.Join(leadingLines, "\n"))
-}
-
-// routeLine reports whether line is a "to: <target>" routing directive,
-// returning what it named and any inline body after it. Three target forms are
-// accepted, and exactly one of dest and replyTo comes back set:
-//
-//	to: noop          → dest = "noop" (send nothing)
-//	to: <jid>         → dest = the jid (contains "@")
-//	to: <stanza-id>   → replyTo = the stanza id (a UUID)
-//
-// A jid must contain "@", and a stanza id must match the UUID shape, so
-// ordinary prose beginning with "to:" is not mistaken for a route.
-func routeLine(line string) (dest, replyTo, inline string, ok bool) {
-	t := strings.TrimLeft(line, " \t")
-	if len(t) < len("to:") || !strings.EqualFold(t[:len("to:")], "to:") {
-		return "", "", "", false
-	}
-	after := strings.TrimLeft(t[len("to:"):], " \t")
-	target := after
-	if i := strings.IndexAny(after, " \t"); i >= 0 {
-		target, inline = after[:i], strings.TrimSpace(after[i:])
-	}
-	// "to: noop" is a real destination meaning "send nothing" (#20). It must be
-	// recognized here rather than falling through to the reject path, or an
-	// agent's attempt at silence would be dumped to the error room AND nudged
-	// for a resend — generating the very turn it was trying to avoid.
-	if strings.EqualFold(target, destNoopName) {
-		return destNoopName, "", inline, true
-	}
-	// A stanza id names the message to answer, not a channel (#54). deliverReply
-	// resolves it to that message's author and stamps the outbound reply. The
-	// UUID shape is checked before the "@" test: a UUID has no "@", so this form
-	// is purely additive and no routing line that works today changes meaning.
-	if isStanzaID(target) {
-		return "", target, inline, true
-	}
-	if !strings.Contains(target, "@") {
-		return "", "", "", false
-	}
-	return target, "", inline, true
-}
-
-// leadingNoop reports whether text's first non-empty line is a "to: noop"
-// routing line. Used in 1:1 mode, which parses no other routing form: any other
-// text is an ordinary reply and is sent as written.
-func leadingNoop(text string) bool {
-	for _, line := range strings.Split(text, "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		dest, _, _, ok := routeLine(strings.TrimRight(line, "\r"))
-		return ok && strings.EqualFold(dest, destNoopName)
-	}
-	return false
-}
-
-// destNoopName is the reserved "discard this segment" routing destination.
-const destNoopName = "noop"
-
-// stanzaIDRe matches the two stanza-id shapes a routing line can name.
-//
-// The first is the strict 8-4-4-4-12 hex UUID that most clients put on a
-// message, and the shape #54 specifies. The second is pi-msg's own format:
-// newStanzaID emits 16 bare hex characters, so an id the bridge generated would
-// never match a UUID pattern.
-//
-// Both alternatives are checked in full, and a partial id matches neither. That
-// is on purpose: the recorded tradeoff on #54 is that a mistyped id costs the
-// message, so a wrong id is loud rather than quietly mis-delivered. Widening
-// the shape does not weaken that — an id of the right shape that names no
-// recorded message still takes the reject path.
-//
-// A client whose ids match neither shape cannot be answered by id. If that
-// turns up in practice, the fix is to widen this pattern, not to guess.
-var stanzaIDRe = regexp.MustCompile(`^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16})$`)
-
-// isStanzaID reports whether s has the shape of a stanza id.
-func isStanzaID(s string) bool { return stanzaIDRe.MatchString(s) }
 
 func (b *Bridge) handleModel(arg string) {
 	if arg == "" {
@@ -3815,7 +3475,7 @@ func (b *Bridge) creditFailAlert(errMsg string) bool {
 	// in-run bookkeeping so settle can't fire a tail-retry or unanswered-hint
 	// prompt — a recovery prompt would just hit the same 402 again.
 	b.setReplied(true)
-	b.resetTailTracking()
+	b.resetSendTracking()
 	b.markHintPending()
 	return true
 }
@@ -3890,9 +3550,7 @@ func openRouterCredits(key string) (total, used float64, err error) {
 }
 
 // handleStreamDelta maps an assistant streaming delta (message_update) to the
-// typing indicator and status label. Typing is lit only between text_start and
-// text_end — i.e. only while words are actually being produced — so a "typing…"
-// bubble genuinely predicts an imminent message rather than "busy".
+// XMPP presence status. Draft text remains private until send_message is called.
 func (b *Bridge) handleStreamDelta(ev Event) {
 	ame := ev.Obj("assistantMessageEvent")
 	if ame == nil {
@@ -3902,34 +3560,9 @@ func (b *Bridge) handleStreamDelta(ev Event) {
 	case "thinking_start":
 		b.xmpp.SetPresence("dnd", "thinking…")
 	case "text_start":
-		// Presence label: a room-mode stream is most often inter-tool
-		// commentary that never gains a "to:" line and is never delivered,
-		// so it starts as "muttering…" and only upgrades to "replying…"
-		// once a routing line proves a real reply (see streamTypingDelta).
-		// The typing indicator is the "message actually about to be routed"
-		// signal (issue #44), so a muttering label cannot be mistaken for a
-		// pending reply. A pure 1:1 account has no routing contract — every
-		// streamed word IS the reply, so it stays "replying…".
-		if b.acct.RoomMode() {
-			b.xmpp.SetPresence("dnd", "muttering…")
-		} else {
-			b.xmpp.SetPresence("dnd", "replying…")
-		}
-		// In a room-mode account the reply's destination is only known once
-		// its "to: <jid>" routing line streams in, so typing is withheld
-		// until then rather than lit speculatively on the owner (issue #44).
-		// A pure 1:1 account has no routing — always the owner.
-		if !b.acct.RoomMode() {
-			b.startTypingTo(b.acct.Owner)
-		}
-		b.resetStreamTyping()
-	case "text_delta":
-		if b.acct.RoomMode() {
-			b.streamTypingDelta(ame.Str("delta"))
-		}
-	case "text_end":
-		b.stopTyping()
-		b.resetStreamTyping()
+		// Streamed assistant text is a private draft; send_message selects the
+		// destination and delivers only when explicitly called.
+		b.xmpp.SetPresence("dnd", "drafting…")
 	}
 }
 
@@ -3961,157 +3594,6 @@ func truncateLabel(s string, max int) string {
 	return string(r[:max-1]) + "…"
 }
 
-// --- typing indicator ---
-// The XEP-0085 typing indicator is a per-recipient 1:1 chat state whose job is
-// "a message is arriving right now". In a room-mode account the destination is
-// only decided by the reply's "to: <jid>" routing line, so typing is withheld
-// rather than lit speculatively on the owner: it is sent only once that routing
-// streams in, and then toward THE recipient it leads to — a reply that heads
-// to a room or to "noop" keeps the composer dark (issue #44). A pure 1:1
-// account has no routing and always points at the owner.
-
-// resetStreamTyping clears the text stream used to re-assemble a streamed
-// reply's routing decision. Called before every text_start / text_end from the
-// event-loop goroutine (single thread), so the buffer needs no extra lock.
-func (b *Bridge) resetStreamTyping() {
-	b.typingStream = ""
-	b.typingRoutingDone = false
-}
-
-// startTypingTo lights the "composing" chat-state toward a specific recipient,
-// re-issuing it every typingRefresh so clients don't auto-clear the bubble
-// while the agent keeps working. Redirects cleanly if the streamed routing line
-// later points at a different 1:1 recipient than the one already lit.
-func (b *Bridge) startTypingTo(to string) {
-	if to == "" {
-		return
-	}
-	b.typingMu.Lock()
-	defer b.typingMu.Unlock()
-	if b.typingStop != nil {
-		if b.typingTo == to {
-			return // already typing toward this recipient; keep the live ticker
-		}
-		// Redirect to a different recipient: clear the old bubble first.
-		old := b.typingTo
-		close(b.typingStop)
-		b.typingStop = nil
-		b.typingTo = ""
-		if old != "" {
-			b.xmpp.ChatStateTo("active", old)
-		}
-	}
-	b.xmpp.ChatStateTo("composing", to)
-	b.typingTo = to
-	stop := make(chan struct{})
-	b.typingStop = stop
-	go func() {
-		tk := time.NewTicker(typingRefresh)
-		defer tk.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-tk.C:
-				b.xmpp.ChatStateTo("composing", to)
-			}
-		}
-	}()
-}
-
-// streamTypingDelta feeds one streamed text chunk into the room-mode typing
-// decision. Once the reply's first complete routing line is recognised it
-// lights typing toward that line's 1:1 recipient, or leaves it dark when the
-// reply heads to a room / "noop" / nowhere. After a decision the buffer is
-// frozen for the rest of the message.
-func (b *Bridge) streamTypingDelta(delta string) {
-	if delta == "" || b.typingRoutingDone {
-		return
-	}
-	b.typingStream += delta
-	target, decided, delivers := streamTypingTarget(b.typingStream, b.xmpp)
-	if !decided {
-		return
-	}
-	b.typingRoutingDone = true
-	if target == "" {
-		b.stopTyping()
-	} else {
-		b.startTypingTo(target)
-	}
-	// A completed routing line that will actually emit a stanza upgrades the
-	// label from "muttering…" to "replying…"; a line that sends nothing
-	// (noop, an unknown stanza id, a blocked target) keeps the composer dark
-	// and the label honest as muttering.
-	if delivers {
-		b.xmpp.SetPresence("dnd", "replying…")
-	}
-}
-
-// streamTypingTarget inspects the partial streamed text for a completed routing
-// line and maps it to a typing recipient. It returns (target, decided,
-// delivers): decided is true once a routing line resolves, target is the 1:1
-// recipient whose composer should light ("" means the composer must stay dark),
-// and delivers reports whether that line will actually emit a stanza (a 1:1 or
-// room reply) as opposed to sending nothing — a noop, an unknown stanza id, or
-// a blocked target never delivers, exactly as their composer stays dark. The
-// delivers flag is what upgrades the presence label from "muttering…" to
-// "replying…" (see streamTypingDelta).
-func streamTypingTarget(buf string, xm *XMPPBridge) (target string, decided bool, delivers bool) {
-	hasEnd := strings.HasSuffix(buf, "\n")
-	lines := strings.Split(buf, "\n")
-	end := len(lines)
-	if !hasEnd {
-		end = len(lines) - 1 // the trailing fragment is still mid-stream
-	}
-	for i := 0; i < end; i++ {
-		l := lines[i]
-		l = strings.TrimRight(l, "\r")
-		dest, replyTo, _, ok := routeLine(l)
-		if !ok {
-			continue
-		}
-		if strings.EqualFold(dest, destNoopName) {
-			return "", true, false
-		}
-		// A stanza-id route lights the composer only if the id resolves; an
-		// unknown id is a routing failure, and a failure never types or
-		// delivers.
-		if replyTo != "" {
-			dest = xm.lookupMessage(replyTo)
-			if dest == "" {
-				return "", true, false
-			}
-		}
-		switch xm.classifyDest(dest) {
-		case destUser:
-			return bareJid(dest), true, true
-		case destRoom:
-			return "", true, true // a room reply delivers, but never lights a 1:1 composer
-		default: // blocked or otherwise not an allowed chat
-			return "", true, false
-		}
-	}
-	return "", false, false
-}
-
-// stopTyping is unconditional so a running indicator can always be cleared
-// (avoiding a stuck "composing" if the reply channel flips mid-turn). It only
-// emits the "active" chat-state if typing was actually running, and does so
-// toward the recipient the bubble was lit on.
-func (b *Bridge) stopTyping() {
-	b.typingMu.Lock()
-	defer b.typingMu.Unlock()
-	if b.typingStop != nil {
-		close(b.typingStop)
-		b.typingStop = nil
-	}
-	if b.typingTo != "" {
-		b.xmpp.ChatStateTo("active", b.typingTo)
-		b.typingTo = ""
-	}
-}
-
 // clearQueue drops pi's queued steering and follow-up messages and returns how
 // many it dropped. Requires pi >= 0.84.4 (`clear_queue`). On an older pi the
 // command is unknown, so the request fails; that is logged at info and reported
@@ -4131,22 +3613,19 @@ func (b *Bridge) clearQueue() int {
 	return len(data.Arr("steering")) + len(data.Arr("followUp"))
 }
 
-// settleLocally resets run-scoped UI (streaming flag, typing indicator,
-// presence) when a control command ends the current run directly. Pi answers
-// `abort` with an `error`(aborted) event rather than `agent_settled`, so the
-// normal agent_settled cleanup never fires for an aborted run — otherwise the
-// typing goroutine keeps re-asserting "composing" (and presence stays
-// "working…") into the next session. Idempotent and mutex-guarded, so it's
-// safe if a late agent_settled also arrives.
+// settleLocally resets run-scoped UI (streaming flag and presence) when a
+// control command ends the current run directly. Pi answers `abort` with an
+// `error`(aborted) event rather than `agent_settled`, so the normal
+// agent_settled cleanup never fires. Idempotent and mutex-guarded, so it's safe
+// if a late agent_settled also arrives.
 func (b *Bridge) settleLocally() {
 	b.setStreaming(false)
-	b.stopTyping()
 	b.markIdle()
 	b.announceSettledPresence()
-	b.clearPendingNudge() // aborted run — discard any staged correction (#16)
+	b.setReactionAckRun(false)
 	// Aborted or replaced run: drop the empty-tail bookkeeping so a recovery
 	// prompt can't fire for work the user already cancelled.
-	b.resetTailTracking()
+	b.resetSendTracking()
 	b.resetRunCounts()
 	b.takeHintPending() // aborted: no catch-up run is coming
 }
@@ -4369,7 +3848,7 @@ func (b *Bridge) idleTick() {
 			return
 		}
 		b.refreshSessionFile()
-		b.routingSeeded = false
+		b.messagingSeeded = false
 		b.markFresh()
 		b.mu.Lock()
 		// The transition mutex prevents inbound activity from changing this
@@ -4391,7 +3870,7 @@ func (b *Bridge) idleTick() {
 
 // setReactTarget records which message the next run's agent-driven reactions
 // (send_reaction tool) attach to. Called before each prompt and updated by
-// deliverReply so agent reactions target its own outgoing messages.
+// explicit sends so agent reactions target its own outgoing messages.
 func (b *Bridge) setReactTarget(to, id string) {
 	b.mu.Lock()
 	b.reactTo, b.reactID = to, id
@@ -4400,7 +3879,7 @@ func (b *Bridge) setReactTarget(to, id string) {
 
 // setLifecycleReactTarget records both the regular react target AND a
 // snapshot for lifecycle auto-reacts (👀✅⛔). The lifecycle snapshot is never
-// overwritten by deliverReply, so agent_settled's ✅ always targets the
+// overwritten by a later send, so agent_settled's ✅ always targets the
 // original triggering message.
 func (b *Bridge) setLifecycleReactTarget(to, id string) {
 	b.mu.Lock()
@@ -4473,6 +3952,10 @@ func (b *Bridge) lifecycleReact(emojis ...string) {
 		return
 	}
 	b.mu.Lock()
+	if b.reactionAckRun {
+		b.mu.Unlock()
+		return
+	}
 	to, id := b.lifecycleReactTo, b.lifecycleReactID
 	b.mu.Unlock()
 	if to == "" || id == "" {
@@ -4485,12 +3968,22 @@ func (b *Bridge) lifecycleReact(emojis ...string) {
 // lifecycle-reactions setting. It replaces the completion reaction with 🫡.
 func (b *Bridge) reactNoReply() {
 	b.mu.Lock()
+	if b.reactionAckRun {
+		b.mu.Unlock()
+		return
+	}
 	to, id := b.lifecycleReactTo, b.lifecycleReactID
 	b.mu.Unlock()
 	if to == "" || id == "" {
 		return
 	}
 	b.xmpp.SendReaction(to, id, "🫡")
+}
+
+func (b *Bridge) setReactionAckRun(v bool) {
+	b.mu.Lock()
+	b.reactionAckRun = v
+	b.mu.Unlock()
 }
 
 func (b *Bridge) setStreaming(v bool) {
@@ -4561,7 +4054,7 @@ func (b *Bridge) formatHeartbeat(procs []HeartbeatProcess) string {
 	if len(procs) == 1 {
 		p := procs[0]
 		return fmt.Sprintf(
-			"[pi-msg: process %q has been running for %d %s now. Here's the log tail:\n\n%s\n\nIf this is unexpected, determine what happened and act. If this is expected, reply with \"to: noop\" and nothing else.]",
+			"[pi-msg: process %q has been running for %d %s now. Here's the log tail:\n\n%s\n\nIf this is unexpected, determine what happened and act. If this is expected, no chat reply is needed; final assistant text is internal.]",
 			p.Name, p.ElapsedSecs, heartbeatNoun(p.ElapsedSecs), heartbeatTail(p.Tail),
 		)
 	}
@@ -4573,7 +4066,7 @@ func (b *Bridge) formatHeartbeat(procs []HeartbeatProcess) string {
 	for _, p := range procs {
 		fmt.Fprintf(&sb, "\n\n• %s — %d %s\n%s", p.Name, p.ElapsedSecs, heartbeatNoun(p.ElapsedSecs), heartbeatTail(p.Tail))
 	}
-	sb.WriteString("\n\nIf any of these is unexpected, determine what happened and act. If they are all expected, reply with \"to: noop\" and nothing else.]")
+	sb.WriteString("\n\nIf any of these is unexpected, determine what happened and act. If they are all expected, no chat reply is needed; final assistant text is internal.]")
 	return sb.String()
 }
 
@@ -4595,8 +4088,8 @@ func heartbeatTail(tail string) string {
 
 // fireHeartbeat wakes the (idle) agent with a long-running-process alarm,
 // routing any response to the owner like the other synthetic prompts. The run
-// is marked heartbeatRun so its (expected) to:noop outcome is treated like a
-// volunteer or reaction-ack run: no 🫡 reaction, no recovery or
+// is marked heartbeatRun so its expected private/no-message outcome is treated
+// like a volunteer or reaction-ack run: no 🫡 reaction, recovery, or
 // unanswered-message hints.
 func (b *Bridge) fireHeartbeat(text string) {
 	if text == "" {
@@ -4633,7 +4126,7 @@ func (b *Bridge) fireResumeTurn() {
 	b.rpc.Prompt(
 		"[pi-msg: startup: your session was resumed (continued from a previous process). "+
 			"You may volunteer to continue the conversation or task from the previous session. "+
-			"If you have nothing worth volunteering, reply with \"to: noop\" and nothing else.]",
+			"If you have nothing worth volunteering, do not send a chat message; final assistant text is internal.]",
 		b.steerBehavior())
 	b.xmpp.SetPresence("dnd", "thinking…")
 }
@@ -4642,7 +4135,7 @@ func (b *Bridge) fireResumeTurn() {
 // or a "prompt" start-directive payload) as the persona's very first prompt,
 // so an on-demand spawn arrives with its task baked in (beltino#18). It is
 // composed through the normal prompt path: a fresh room-mode session gets the
-// routing contract seed (routingSeeded is false for a forced-fresh launch), and
+// messaging contract seed (messagingSeeded is false for a forced-fresh launch), and
 // the reply routes to the owner, mirroring fireResumeTurn.
 func (b *Bridge) fireInitialPrompt() {
 	b.setLifecycleReactTarget("", "")

@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -199,45 +198,6 @@ func TestTruncateLabel(t *testing.T) {
 	}
 }
 
-func TestSplitReplySegments(t *testing.T) {
-	seg := func(dest, body string) replySegment {
-		return replySegment{dest: dest, body: body}
-	}
-	cases := []struct {
-		name        string
-		in          string
-		wantSegs    []replySegment
-		wantLeading string
-	}{
-		{"single newline form", "to: room@muc.x\nhere are headlines",
-			[]replySegment{seg("room@muc.x", "here are headlines")}, ""},
-		{"no space after colon", "to:zach@x\nhi",
-			[]replySegment{seg("zach@x", "hi")}, ""},
-		{"inline body", "to: alice@x hello there",
-			[]replySegment{seg("alice@x", "hello there")}, ""},
-		{"two segments", "to: a@x.com\nblah blah\nto: b@x.com\nmore stuff",
-			[]replySegment{seg("a@x.com", "blah blah"), seg("b@x.com", "more stuff")}, ""},
-		{"multiline body per segment", "to: a@x\nl1\nl2\nto: b@x\nm1",
-			[]replySegment{seg("a@x", "l1\nl2"), seg("b@x", "m1")}, ""},
-		{"case insensitive", "TO: zach@x\nyo",
-			[]replySegment{seg("zach@x", "yo")}, ""},
-		{"leading junk before first to", "oops forgot\nto: a@x\nbody",
-			[]replySegment{seg("a@x", "body")}, "oops forgot"},
-		{"prose to: without @ is not a route", "to: whom it may concern\nhello",
-			nil, "to: whom it may concern\nhello"},
-		{"no routing at all", "just a reply", nil, "just a reply"},
-	}
-	for _, c := range cases {
-		gotSegs, gotLeading := splitReplySegments(c.in)
-		if gotLeading != c.wantLeading {
-			t.Errorf("%s: leading = %q, want %q", c.name, gotLeading, c.wantLeading)
-		}
-		if !reflect.DeepEqual(gotSegs, c.wantSegs) {
-			t.Errorf("%s: segs = %+v, want %+v", c.name, gotSegs, c.wantSegs)
-		}
-	}
-}
-
 func TestClassifyDest(t *testing.T) {
 	x := NewXMPPBridge(
 		ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"},
@@ -263,55 +223,8 @@ func TestClassifyDest(t *testing.T) {
 	}
 }
 
-// TestStreamTypingTarget pins the room-mode typing decision (issue #44): the
-// indicator is withheld while the reply is still streaming / has not yet
-// written a routing line, and once a completed "to:" line appears it points at
-// that line's 1:1 recipient — or stays dark for a room, noop, or blocked target.
-// delivers reports whether that line will emit a stanza (the presence-label
-// upgrade from "muttering…" to "replying…").
-func TestStreamTypingTarget(t *testing.T) {
-	x := NewXMPPBridge(
-		ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"},
-		func(InboundMessage) {}, func(string, string) {},
-	)
-	x.occupants["team@muc.x"] = map[string]string{"alice": "alice@x"}
-	cases := []struct {
-		buf      string
-		target   string
-		decided  bool
-		delivers bool
-	}{
-		// Not yet a complete routing line → keep waiting.
-		{"", "", false, false},
-		{"to:", "", false, false},
-		{"to: zach", "", false, false},
-		{"to: zach@x", "", false, false},
-		// Owner 1:1 → indicator on the owner, delivers.
-		{"to: zach@x\n", "zach@x", true, true},
-		{"to: zach@x/phone\n", "zach@x", true, true},
-		// Known occupant → indicator on the occupant, delivers.
-		{"to: alice@x\n", "alice@x", true, true},
-		// A leading non-routing line is skipped; the routing still resolves.
-		{"sure\nto: zach@x\n", "zach@x", true, true},
-		// Room deliveries never light the owner's bubble but DO deliver.
-		{"to: team@muc.x\n", "", true, true},
-		// Noop and unknown targets send nothing and never light the bubble.
-		{"to: noop\n", "", true, false},
-		{"to: stranger@x\n", "", true, false},
-		{"to: zach@x\ncommentary only", "zach@x", true, true},
-	}
-	for _, c := range cases {
-		got, decided, delivers := streamTypingTarget(c.buf, x)
-		if got != c.target || decided != c.decided || delivers != c.delivers {
-			t.Errorf("streamTypingTarget(%q) = (%q,%v,%v), want (%q,%v,%v)",
-				c.buf, got, decided, delivers, c.target, c.decided, c.delivers)
-		}
-	}
-}
-
-// TestErrorRoomInvisibleToAgent verifies the write-only error room is NOT in
-// roomBares (so dispatch ignores it) and is NOT an allowed reply/send
-// destination — agents can't read it or route to it.
+// TestErrorRoomInvisibleToAgent verifies the error archive is not an
+// agent-addressable room or outbound destination.
 func TestErrorRoomInvisibleToAgent(t *testing.T) {
 	x := NewXMPPBridge(
 		ResolvedAccount{Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", Owner: "zach@x"},
@@ -328,99 +241,6 @@ func TestErrorRoomInvisibleToAgent(t *testing.T) {
 	}
 	if got := x.classifyDest("team@muc.x"); got != destRoom {
 		t.Errorf("normal room should remain an allowed destination, got %v", got)
-	}
-}
-
-func TestRoutingNudgeBound(t *testing.T) {
-	b := NewBridge(ResolvedAccount{}, false)
-	for i := 1; i <= maxRoutingNudges; i++ {
-		if !b.bumpRoutingNudge() {
-			t.Errorf("nudge %d should be allowed (cap %d)", i, maxRoutingNudges)
-		}
-	}
-	if b.bumpRoutingNudge() {
-		t.Error("nudge past the cap should be denied")
-	}
-	b.resetRoutingNudges()
-	if !b.bumpRoutingNudge() {
-		t.Error("after reset, a nudge should be allowed again")
-	}
-}
-
-// TestStagedNudgeLifecycle verifies issue #16's core flow: rejectReply stages
-// a correction that is only fired at settle if a later message didn't route.
-func TestStagedNudgeLifecycle(t *testing.T) {
-	b := NewBridge(ResolvedAccount{}, false)
-
-	// Nothing staged → nothing to fire.
-	if got := b.takeStagedNudge(); got != "" {
-		t.Errorf("empty staged nudge → got %q, want empty", got)
-	}
-
-	// Stage a correction (as rejectReply does), then a later message routes
-	// fine → the staged nudge is cleared and never fires.
-	b.stageNudge("dropped body", "no to: line")
-	b.clearPendingNudge()
-	if got := b.takeStagedNudge(); got != "" {
-		t.Errorf("staged nudge after clear → got %q, want empty", got)
-	}
-
-	// Stage a correction and fire at settle → reason fires exactly once.
-	b.stageNudge("dropped body", "no to: line")
-	if got := b.takeStagedNudge(); got != "no to: line" {
-		t.Errorf("settled nudge reason = %q, want %q", got, "no to: line")
-	}
-	if got := b.takeStagedNudge(); got != "" {
-		t.Errorf("staged nudge should fire once, got %q on second take", got)
-	}
-
-	// Later staging replaces earlier — only the final reason is nudged.
-	b.stageNudge("a", "reason one")
-	b.stageNudge("b", "reason two")
-	if got := b.takeStagedNudge(); got != "reason two" {
-		t.Errorf("latest staged reason = %q, want %q", got, "reason two")
-	}
-}
-
-// TestStagedNudgeRespectsBudget verifies the per-turn cap still bounds the
-// settle-time reminder even with a single staging point.
-func TestStagedNudgeRespectsBudget(t *testing.T) {
-	b := NewBridge(ResolvedAccount{}, false)
-	b.stageNudge("a", "r1")
-	b.stageNudge("b", "r2")
-	if got := b.takeStagedNudge(); got != "r2" {
-		t.Fatalf("first staged nudge = %q, want r2", got)
-	}
-	// Both staged nudges consumed the budget now; a fresh turn resets it.
-	b.resetRoutingNudges()
-	b.stageNudge("c", "r3")
-	if got := b.takeStagedNudge(); got != "r3" {
-		t.Errorf("post-reset staged nudge = %q, want r3", got)
-	}
-}
-
-// TestFirePendingNudgeReportsLaunch pins the banner-suppression contract: a
-// settle that launches the routing nudge holds the "done (no reply)" banner,
-// because the resend arrives moments later. firePendingNudge must report
-// whether it actually launched so the caller can gate on it.
-func TestFirePendingNudgeReportsLaunch(t *testing.T) {
-	b := roomBridge()
-	b.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
-
-	// Nothing staged → no nudge launches.
-	if b.firePendingNudge() {
-		t.Error("no staged nudge → firePendingNudge must report false")
-	}
-
-	// A staged correction → the nudge fires and is reported.
-	b.stageNudge("dropped body", "no to: line")
-	if !b.firePendingNudge() {
-		t.Error("staged nudge → firePendingNudge must report true")
-	}
-
-	// Consumed on fire → nothing left to launch.
-	if b.firePendingNudge() {
-		t.Error("after firing, no second nudge may launch")
 	}
 }
 
@@ -562,6 +382,61 @@ func TestInboundReactionAck(t *testing.T) {
 	}
 	if b3.currentTurnDest() != "zach@x.com" {
 		t.Errorf("owner 1:1 reaction turnDest = %q, want owner", b3.currentTurnDest())
+	}
+}
+
+func TestReactionAckRunSuppressesAutomaticReactions(t *testing.T) {
+	acct := ResolvedAccount{
+		Owner: "zach@x.com", Rooms: []string{"team@muc.x.com"},
+		Reactions: true, RoomReactions: true,
+	}
+	b := NewBridge(acct, false)
+	var logs []string
+	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, func(_, msg string) {
+		logs = append(logs, msg)
+	})
+	b.rpc = &RPCClient{}
+	b.xmpp.recordSelfMessage("target-123", "team@muc.x.com", "our message")
+	b.setLifecycleReactTarget("team@muc.x.com", "target-123")
+	b.onInbound(InboundMessage{
+		Nick: "peer", Room: "team@muc.x.com", From: "peer@x.com/peer",
+		Reactions: []string{"\u2705"}, ReactionID: "target-123",
+	})
+
+	b.handleRPCEvent(Event{"type": "agent_start"})
+	if !b.reactionAckRun {
+		t.Fatal("agent_start cleared the reaction-ack marker before settlement")
+	}
+	b.handleRPCEvent(Event{"type": "agent_settled"})
+	if b.reactionAckRun {
+		t.Error("agent_settled should consume the reaction-ack marker")
+	}
+	for _, msg := range logs {
+		if strings.Contains(msg, "reaction failed") {
+			t.Errorf("ack-only run attempted an automatic reaction: %q", msg)
+		}
+	}
+}
+
+func TestLifecycleReactionsRemainEnabledForOrdinaryRuns(t *testing.T) {
+	acct := ResolvedAccount{Owner: "zach@x.com", Reactions: true}
+	b := newTestBridge(acct)
+	var logs []string
+	b.xmpp.logf = func(_, msg string) { logs = append(logs, msg) }
+	b.setLifecycleReactTarget("zach@x.com", "target-123")
+
+	b.handleRPCEvent(Event{"type": "agent_start"})
+	b.setReplied(true) // suppress the separate no-reply acknowledgement
+	b.handleRPCEvent(Event{"type": "agent_settled"})
+
+	var attempts int
+	for _, msg := range logs {
+		if strings.Contains(msg, "reaction failed: not online") {
+			attempts++
+		}
+	}
+	if attempts != 2 {
+		t.Errorf("ordinary run made %d lifecycle reaction attempts, want start + settled (2)", attempts)
 	}
 }
 
@@ -792,73 +667,48 @@ func TestOpenRouterCreditsParse(t *testing.T) {
 	}
 }
 
-// newTestBridge builds an offline bridge: sends return "" (not online), which
-// is exactly the "nothing reached a destination" case deliverReply must report.
+// newTestBridge builds an offline bridge for validation and relay tests.
 func newTestBridge(acct ResolvedAccount) *Bridge {
 	b := NewBridge(acct, false)
 	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, b.log)
 	return b
 }
 
-// TestRepliedOnlyOnDelivery pins the core of the dropped-reply fix: "replied"
-// must mean "reached a destination", not "text existed". A malformed reply goes
-// to the write-only error room, which the owner never reads, so counting it as
-// a reply would suppress the settle-time banner and leave the owner in silence.
-func TestRepliedOnlyOnDelivery(t *testing.T) {
-	room := ResolvedAccount{Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", Owner: "zach@x"}
-	b := newTestBridge(room)
-	if b.deliverReply("no routing line here") {
-		t.Error("a reply with no \"to:\" line must not count as delivered")
-	}
-	if b.deliverReply("to: errors@muc.x\n\nsneaky") {
-		t.Error("a blocked destination must not count as delivered")
-	}
-	// Offline: a well-formed reply still can't reach anyone.
-	if b.deliverReply("to: zach@x\n\nhello") {
-		t.Error("an offline send must not count as delivered")
-	}
-	// Pure 1:1 accounts take the other branch; offline is still not delivered.
-	solo := newTestBridge(ResolvedAccount{Owner: "zach@x"})
-	if solo.deliverReply("hello") {
-		t.Error("an offline 1:1 send must not count as delivered")
+// Final assistant text is private, including text that resembles the retired
+// `to:` routing syntax.
+func TestAssistantFinalTextIsNotSent(t *testing.T) {
+	for _, text := range []string{"plain final answer", "to: zach@x\n\nlegacy route"} {
+		b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+		b.handleRPCEvent(Event{
+			"type":    "message_end",
+			"message": map[string]any{"role": "assistant", "content": text, "stopReason": "stop"},
+		})
+		if b.replied() {
+			t.Errorf("final assistant text %q was counted as delivered", text)
+		}
+		if !b.finalMsgHadText {
+			t.Errorf("final assistant text %q should remain available as an internal draft", text)
+		}
 	}
 }
 
-// TestNoopStillCountsAsReplied verifies deliberate silence stays an answer:
-// "to: noop" emits no stanza but must never look like a run that died before
-// writing a reply, or the empty-tail recovery would argue with it.
-func TestNoopStillCountsAsReplied(t *testing.T) {
+func TestFinalDraftDoesNotCountAsDelivery(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
-	if !b.deliverReply("to: noop\n\nnothing to add") {
-		t.Error("to: noop must count as delivered")
-	}
-	if !b.replied() {
-		t.Error("to: noop must set replied")
-	}
-}
-
-// TestPreambleDoesNotDisarmNoReplyNet covers the failure that dropped replies
-// live: the agent writes a preamble alongside its tool call, the tool returns,
-// and the run ends with no further text. The delivered preamble used to mark
-// the run as answered, so no banner and no retry fired — the owner just got a
-// "running…" line and then silence.
-func TestPreambleDoesNotDisarmNoReplyNet(t *testing.T) {
-	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
-	b.resetTailTracking()
-	// Preamble message: text delivered, then the tool starts.
+	b.resetSendTracking()
+	// A final draft is not delivery; a tool runs and the final message is
+	// tool-only, so recovery asks for an explicit send_message.
 	b.setFinalMsgHadText(true)
-	b.clearToolSinceDelivery()
 	b.markToolSinceDelivery()
-	// The tool result arrives and the run ends with a tool-only message.
 	b.setFinalMsgHadText(false)
-	if !b.needsEmptyTailRecovery() {
-		t.Error("a run ending on a tool call after a preamble needs recovery")
+	if !b.needsSendRecovery() {
+		t.Error("a run ending on a tool call with no send needs recovery")
 	}
-	// The winning shape: the reply text comes after the tool result.
+	// A successful send_message after the tool marks the run as delivered.
 	b.setFinalMsgHadText(true)
+	b.setReplied(true)
 	b.clearToolSinceDelivery()
-	if b.needsEmptyTailRecovery() {
-		t.Error("a run that replied after its tool needs no recovery")
+	if b.needsSendRecovery() {
+		t.Error("a run that sent a message needs no recovery")
 	}
 }
 
@@ -867,54 +717,58 @@ func TestPreambleDoesNotDisarmNoReplyNet(t *testing.T) {
 // "done (no reply)" banner already covers.
 func TestNoRecoveryWithoutTool(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
-	b.resetTailTracking()
-	if b.needsEmptyTailRecovery() {
+	b.resetSendTracking()
+	if b.needsSendRecovery() {
 		t.Error("no tool ran — recovery must not fire")
 	}
 	// Volunteer and reaction-ack runs are allowed to end quietly even mid-work.
 	b.markToolSinceDelivery()
 	b.volunteered = true
-	if b.needsEmptyTailRecovery() {
+	if b.needsSendRecovery() {
 		t.Error("a volunteer run must not trigger recovery")
 	}
 	b.volunteered = false
 	b.reactionAckRun = true
-	if b.needsEmptyTailRecovery() {
+	if b.needsSendRecovery() {
 		t.Error("a reaction-ack run must not trigger recovery")
 	}
 }
 
-// TestEmptyTailRecoveryBounded verifies the retry can't loop against a model
+// TestSendRecoveryBounded verifies the retry can't loop against a model
 // that keeps ending its runs on a tool call: one prompt per user turn, then the
 // banner takes over and tells the owner nothing came back.
-func TestEmptyTailRecoveryBounded(t *testing.T) {
+func TestSendRecoveryBounded(t *testing.T) {
 	b := NewBridge(ResolvedAccount{}, false)
-	for i := 1; i <= maxTailNudges; i++ {
-		if !b.bumpTailNudge() {
-			t.Errorf("recovery %d should be allowed (cap %d)", i, maxTailNudges)
+	for i := 1; i <= maxSendRecoveryNudges; i++ {
+		if !b.bumpSendRecoveryNudge() {
+			t.Errorf("recovery %d should be allowed (cap %d)", i, maxSendRecoveryNudges)
 		}
 	}
-	if b.bumpTailNudge() {
+	if b.bumpSendRecoveryNudge() {
 		t.Error("recovery past the cap should be denied")
 	}
-	b.resetTailNudges()
-	if !b.bumpTailNudge() {
+	b.resetSendRecoveryNudges()
+	if !b.bumpSendRecoveryNudge() {
 		t.Error("after a fresh user turn, recovery should be allowed again")
 	}
 }
 
-// TestSettleLocallyClearsTailTracking verifies an aborted or replaced run can't
+// TestSettleLocallyClearsSendTracking verifies an aborted or replaced run can't
 // leave state behind that fires a recovery prompt for cancelled work.
-func TestSettleLocallyClearsTailTracking(t *testing.T) {
+func TestSettleLocallyClearsSendTracking(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
 	b.markToolSinceDelivery()
 	b.setFinalMsgHadText(false)
-	if !b.needsEmptyTailRecovery() {
+	if !b.needsSendRecovery() {
 		t.Fatal("precondition: mid-work run should need recovery")
 	}
+	b.setReactionAckRun(true)
 	b.settleLocally()
-	if b.needsEmptyTailRecovery() {
+	if b.needsSendRecovery() {
 		t.Error("settleLocally must clear the empty-tail bookkeeping")
+	}
+	if b.reactionAckRun {
+		t.Error("settleLocally must clear the reaction-ack marker")
 	}
 }
 
@@ -981,74 +835,8 @@ func TestUnansweredHintBounded(t *testing.T) {
 	}
 }
 
-// TestNoopCountsTowardAnsweredRun verifies deliberate silence balances the
-// tally, so a run the agent answered with "to: noop" is never nagged.
-func TestNoopCountsTowardAnsweredRun(t *testing.T) {
-	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
-	b.countInbound("zach", "", "hello")
-	b.countInbound("zach", "", "hello")
-	if !b.deliverReply("to: zach@x\n\nanswered one") {
-		// Offline, so this send reports undelivered; count it by hand to model
-		// the online case.
-		b.recordDelivery("id-r", "answered")
-	}
-	if b.deliverReply("to: noop\n\nnothing more to add") {
-		b.recordDelivery("id-r", "answered")
-	}
-	if _, _, ok := b.unansweredRun(); ok {
-		t.Error("a run answered with a reply plus to: noop must not hint")
-	}
-}
-
-// TestNoopWorksInOneToOne pins that a pure 1:1 account can decline to speak.
-// It has no routing contract, but "to: noop" is how the agent says "nothing to
-// send" — without it a deliberate silence looks like a reply that went missing,
-// and the bridge argues with it.
-func TestNoopWorksInOneToOne(t *testing.T) {
-	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
-	if !b.deliverReply("to: noop\n\nnothing more to add") {
-		t.Error("a 1:1 \"to: noop\" must count as an answer")
-	}
-	if !b.replied() {
-		t.Error("a 1:1 \"to: noop\" must mark the run as replied")
-	}
-	if _, out, _ := b.unansweredRun(); out != 1 {
-		t.Errorf("deliveries = %d, want 1", out)
-	}
-	// Only the FIRST non-empty line routes. Prose that merely mentions the form
-	// is an ordinary reply, and offline it reaches nobody.
-	b.resetRunCounts()
-	if b.deliverReply("Sure.\nto: noop") {
-		t.Error("a \"to: noop\" after the first line must not be a route")
-	}
-	if leadingNoop("to be fair, noop is a word") {
-		t.Error("prose beginning with \"to\" must not be a route")
-	}
-}
-
-// TestFanOutCountsEachSegment pins that one reply answering several messages is
-// counted as several answers. Counting per assistant message made a run that
-// answered everything look unbalanced, and the unanswered-message hint then
-// fired for work that was already done.
-func TestFanOutCountsEachSegment(t *testing.T) {
-	b := newTestBridge(ResolvedAccount{Rooms: []string{"team@muc.x"}, Owner: "zach@x"})
-	b.countInbound("zach", "id-a", "first question")
-	b.countInbound("zach", "id-b", "second question")
-	// Two segments in ONE message. "to: noop" is used because an offline send
-	// reaches nobody and so is not an answer.
-	if !b.deliverReply("to: noop\n\nanswer to A\nto: noop\n\nanswer to B") {
-		t.Fatal("precondition: a noop segment must deliver")
-	}
-	if _, out, _ := b.unansweredRun(); out != 2 {
-		t.Errorf("deliveries = %d, want 2 (one per \"to:\" segment)", out)
-	}
-	if _, _, ok := b.unansweredRun(); ok {
-		t.Error("a run that answered both messages in one reply must not hint")
-	}
-}
-
-// TestSettleClearsRunCounts verifies an aborted run can't carry its tally into
-// the next one and fire a hint for cancelled work.
+// TestSettleClearsRunCounts verifies a settled run clears inbound and delivery
+// tallies so its counts cannot leak into the next turn.
 func TestSettleClearsRunCounts(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
 	b.countInbound("zach", "", "hello")
@@ -1105,9 +893,9 @@ func streamDelta(ame map[string]any) Event {
 }
 
 // TestStreamDeltaContract pins pi's post-0.84.0 message_update contract:
-// handleStreamDelta must drive presence and the typing bubble from deltas
-// alone. If a future edit reaches for a cumulative field, this test fails
-// because the events here never carry one.
+// handleStreamDelta drives the presence label from deltas alone. If a future
+// edit reaches for a cumulative field, this test fails because these events do
+// not carry one.
 func TestStreamDeltaContract(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
 
@@ -1117,65 +905,38 @@ func TestStreamDeltaContract(t *testing.T) {
 			b.xmpp.show, b.xmpp.presence)
 	}
 
-	// 1:1 account: text_start lights the owner's composer immediately.
+	// Streamed text is internal and must not light a chat composer.
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
-	if b.xmpp.presence != "replying…" {
-		t.Errorf("text_start presence = %q, want replying…", b.xmpp.presence)
+	if b.xmpp.presence != "drafting…" {
+		t.Errorf("text_start presence = %q, want drafting…", b.xmpp.presence)
 	}
-	if b.typingTo != "zach@x" {
-		t.Errorf("text_start typing target = %q, want zach@x", b.typingTo)
-	}
-
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": "hello"}))
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
-	if b.typingTo != "" {
-		t.Errorf("text_end typing target = %q, want empty", b.typingTo)
-	}
 
 	// An event with no assistantMessageEvent is ignored, not a panic.
 	b.handleStreamDelta(Event{"type": "message_update"})
 }
 
-// TestStreamDeltaContractRoomMode covers the room-mode branch, where the
-// typing target is decided from the accumulated text_delta chunks rather than
-// lit on the owner at text_start. Only the deltas carry that text now, so this
-// pins streamTypingDelta to ame["delta"].
+// TestStreamDeltaContractRoomMode ensures private draft text only changes the
+// presence status and never routes a message in room mode.
 func TestStreamDeltaContractRoomMode(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}})
 
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
-	if b.typingTo != "" {
-		t.Errorf("room-mode text_start typing target = %q, want empty (route unknown)", b.typingTo)
+	if b.xmpp.presence != "drafting…" {
+		t.Errorf("room-mode text_start presence = %q, want drafting…", b.xmpp.presence)
 	}
-	// Until a routing line proves a real reply, the stream reads as
-	// inter-tool commentary: label it muttering, not replying.
-	if b.xmpp.presence != "muttering…" {
-		t.Errorf("room-mode text_start presence = %q, want muttering…", b.xmpp.presence)
-	}
-
-	// The routing line arrives split across deltas, as it does on the wire.
 	for _, d := range []string{"to: ", "zach", "@x\n", "hi"} {
 		b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": d}))
 	}
-	if b.typingTo != "zach@x" {
-		t.Errorf("room-mode typing target = %q, want zach@x", b.typingTo)
+	if b.xmpp.presence != "drafting…" {
+		t.Errorf("private draft changed presence to %q", b.xmpp.presence)
 	}
-	// The routing line resolves to a real delivery: the label upgrades to
-	// replying, matching the lit composer.
-	if b.xmpp.presence != "replying…" {
-		t.Errorf("room-mode routed presence = %q, want replying…", b.xmpp.presence)
-	}
-
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
-	if b.typingTo != "" {
-		t.Errorf("room-mode text_end typing target = %q, want empty", b.typingTo)
-	}
 }
 
-// TestStreamDeltaCommentaryStaysMuttering pins that a stream carrying no
-// routing line — inter-tool commentary that will never be delivered — keeps
-// the "muttering…" label for the whole stream, and that a "to: noop" route
-// (deliberate silence, nothing sent) does not upgrade it either.
+// TestStreamDeltaCommentaryStaysMuttering pins that draft text, including a
+// literal `to:` prefix, remains private and does not change presence.
 func TestStreamDeltaCommentaryStaysMuttering(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}})
 
@@ -1184,17 +945,17 @@ func TestStreamDeltaCommentaryStaysMuttering(t *testing.T) {
 	for _, d := range []string{"let me ", "check the ", "file\n", "done"} {
 		b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": d}))
 	}
-	if b.xmpp.presence != "muttering…" {
-		t.Errorf("commentary stream presence = %q, want muttering…", b.xmpp.presence)
+	if b.xmpp.presence != "drafting…" {
+		t.Errorf("commentary stream presence = %q, want drafting…", b.xmpp.presence)
 	}
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
 
-	// A deliberate-silence route resolves but delivers nothing: still muttering.
+	// Legacy-looking route text is a private draft and doesn't change presence.
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": "to: noop\n"}))
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
-	if b.xmpp.presence != "muttering…" {
-		t.Errorf("noop stream presence = %q, want muttering…", b.xmpp.presence)
+	if b.xmpp.presence != "drafting…" {
+		t.Errorf("private draft presence = %q, want drafting…", b.xmpp.presence)
 	}
 }
 
@@ -1392,14 +1153,14 @@ func TestHeartbeatRunNoBanner(t *testing.T) {
 	}
 
 	// No reply, no recovery: the banner must be suppressed for a heartbeat run.
-	if b.bannerNoReply(false, false) {
+	if b.bannerNoReply(false) {
 		t.Error("banner must be suppressed for a heartbeat wake with no reply")
 	}
 
 	// Simulate the settle consuming the flag; a later user-initiated run with
 	// no reply banners normally again.
 	b.handleRPCEvent(Event{"type": "agent_settled"})
-	if !b.bannerNoReply(false, false) {
+	if !b.bannerNoReply(false) {
 		t.Error("after consume, a normal unanswered run must banner again")
 	}
 }
@@ -1410,36 +1171,36 @@ func TestBannerNoReplyGates(t *testing.T) {
 	b := bgBridge()
 
 	// No reply, not a quiet wake, no recovery → banner.
-	if !b.bannerNoReply(false, false) {
+	if !b.bannerNoReply(false) {
 		t.Error("unanswered run should banner")
 	}
 
 	// A delivered reply suppresses it.
 	b.setReplied(true)
-	if b.bannerNoReply(false, false) {
+	if b.bannerNoReply(false) {
 		t.Error("replied run should not banner")
 	}
 	b.setReplied(false)
 
 	// Quiet wakes suppress it.
 	b.volunteered = true
-	if b.bannerNoReply(false, false) {
+	if b.bannerNoReply(false) {
 		t.Error("volunteer run should not banner")
 	}
 	b.volunteered = false
 	b.reactionAckRun = true
-	if b.bannerNoReply(false, false) {
+	if b.bannerNoReply(false) {
 		t.Error("reaction-ack run should not banner")
 	}
 	b.reactionAckRun = false
 	b.heartbeatRun = true
-	if b.bannerNoReply(false, false) {
+	if b.bannerNoReply(false) {
 		t.Error("heartbeat run should not banner")
 	}
 	b.heartbeatRun = false
 
 	// A recovery/nudge in flight holds it.
-	if b.bannerNoReply(true, false) || b.bannerNoReply(false, true) {
+	if b.bannerNoReply(true) {
 		t.Error("recovery or nudge in flight should hold the banner")
 	}
 }
@@ -1640,8 +1401,8 @@ func TestNonCreditErrorUnchanged(t *testing.T) {
 
 func TestRPCEnv(t *testing.T) {
 	plain := rpcEnv(ResolvedAccount{})
-	if len(plain) != 1 || plain[0] != "PI_MSG_TOOLS=file,reaction" {
-		t.Errorf("rpcEnv(unset) = %v, want [PI_MSG_TOOLS=file,reaction]", plain)
+	if len(plain) != 1 || plain[0] != "PI_MSG_TOOLS=file,reaction,messaging,messages" {
+		t.Errorf("rpcEnv(unset) = %v, want messaging tools enabled by default", plain)
 	}
 	withText := rpcEnv(ResolvedAccount{BeforeAgentStartText: "be brief"})
 	if len(withText) != 2 || withText[1] != "PI_MSG_BEFORE_AGENT_START_TEXT=be brief" {

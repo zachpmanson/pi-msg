@@ -126,6 +126,9 @@ type Account struct {
 	// (aborted), and the agent may react deliberately via a "react: <emoji>"
 	// line. Off by default so it doesn't double up with read receipts + presence.
 	Reactions bool `json:"reactions,omitempty"`
+	// AllowArbitraryJid allows send_message and read_messages to target valid
+	// JIDs outside the default destination allowlists. False by default.
+	AllowArbitraryJid bool `json:"allowArbitraryJid,omitempty"`
 	// RoomReactions, when true, enables XEP-0444 emoji reactions on room
 	// messages (both owner and addressed non-owner commentary). Independent of
 	// the 1:1 reactions flag — you can opt into one, both, or neither.
@@ -222,6 +225,7 @@ type ResolvedAccount struct {
 	Service            string
 	Resource           string
 	ToolActivity       bool
+	AllowArbitraryJid  bool
 	Reactions          bool
 	RoomReactions      bool
 	ResetSessionOnAway bool
@@ -295,10 +299,8 @@ func configPath() string {
 	return filepath.Join(home, ".config", "pi-msg", "config.json")
 }
 
-// sessionStatePath returns the per-account session state file (the absolute
-// path of the pi session to resume on the next launch), stored alongside the
-// loadSeededContract reads the hash of the routing contract text that was last
-// injected into this account's session, returning "" when none is recorded.
+// loadSeededContract reads the hash of the messaging contract text that was
+// last injected into this account's session, returning "" when none is recorded.
 func loadSeededContract(acct string) string {
 	raw, err := os.ReadFile(seededContractPath(acct))
 	if err != nil {
@@ -784,6 +786,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		Service:            service,
 		Resource:           resource,
 		ToolActivity:       acct.ToolActivity,
+		AllowArbitraryJid:  acct.AllowArbitraryJid,
 		Reactions:          acct.Reactions,
 		RoomReactions:      acct.RoomReactions,
 		ResetSessionOnAway: acct.ResetSessionOnAway,

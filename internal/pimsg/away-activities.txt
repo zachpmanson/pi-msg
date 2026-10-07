@@ -2,7 +2,7 @@
 # presence status while the bot is away (rotated randomly). One per notes page;
 # three for the niche non-technical pages. Deliberately weird and esoteric.
 consulting the entrails of yesterday's logs
-debating the ontology of `to:` with myself
+debating whether a tool call is a message
 cataloguing the dreams of the Pi fleet
 polishing a single byte until it shines
 reading the room's sigils backwards

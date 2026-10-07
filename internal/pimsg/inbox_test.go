@@ -340,7 +340,7 @@ func TestInboxRedeliveryRespectsRoomRules(t *testing.T) {
 	}
 
 	// Addressed: it prompts (as a pointer block — the body is pulled with
-	// read_room, #58) even with the re-delivery note appended.
+	// read_messages, #58) even with the re-delivery note appended.
 	b.deliverInbox(inboxEntry{ID: "r2", Room: "team@muc.x", Nick: "zach", RealJID: "zach@x", FromOwner: true, Body: "pi: do it"})
 	if !strings.Contains(buf.String(), "[pi-msg: room: You were tagged") || !strings.Contains(buf.String(), "stanza-id: r2") {
 		t.Errorf("an addressed message must prompt on re-delivery: %q", buf.String())

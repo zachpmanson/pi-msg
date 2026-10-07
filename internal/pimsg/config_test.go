@@ -79,6 +79,9 @@ func TestResolveAccountDefaults(t *testing.T) {
 	if got.BeforeAgentStartText != "" {
 		t.Errorf("BeforeAgentStartText = %q, want empty by default", got.BeforeAgentStartText)
 	}
+	if got.AllowArbitraryJid {
+		t.Error("AllowArbitraryJid = true by default, want false")
+	}
 }
 
 func TestResolveAccountBeforeAgentStartText(t *testing.T) {
@@ -115,6 +118,24 @@ func TestResolveAccountBeforeAgentStartText(t *testing.T) {
 	}
 	if got.BeforeAgentStartText != "" {
 		t.Errorf("whitespace-only value resolved to %q, want empty", got.BeforeAgentStartText)
+	}
+}
+
+func TestResolveAccountAllowArbitraryJid(t *testing.T) {
+	cfg := &Config{Accounts: map[string]Account{
+		"default": {JID: "pi@chat.example.com", Password: "pw", Owner: "zach@chat.example.com", AllowArbitraryJid: true},
+	}}
+	path := writeConfig(t, *cfg)
+	loaded, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	got, err := resolveAccount(loaded, "")
+	if err != nil {
+		t.Fatalf("resolveAccount: %v", err)
+	}
+	if !got.AllowArbitraryJid {
+		t.Error("AllowArbitraryJid did not survive config round trip")
 	}
 }
 

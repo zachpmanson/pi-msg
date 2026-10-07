@@ -65,6 +65,30 @@ func TestCollectMAMResultDirect(t *testing.T) {
 	}
 }
 
+// Direct archives distinguish the owner/peer from this account's own sent
+// lines; the sender is not automatically labelled as the owner.
+func TestCollectMAMResultDirectPeer(t *testing.T) {
+	b := newMAMTestBridge()
+	col := &mamCollector{record: false}
+	b.mamPending["q-direct"] = col
+	for _, from := range []string{"alice@chat.zachmanson.com/phone", "slippy@chat.zachmanson.com"} {
+		toks := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q-direct'>`+
+			`<forwarded xmlns='urn:xmpp:forward:0'><message xmlns='jabber:client' from='`+from+`' id='d-`+from+`' type='chat'><body>hello</body></message></forwarded></result>`)
+		res, _ := element(toks, mamNS, "result")
+		b.collectMAMResult(toks, res)
+	}
+	if len(col.out) != 2 {
+		t.Fatalf("collected %d messages, want peer and own line", len(col.out))
+	}
+	peer, own := col.out[0], col.out[1]
+	if peer.FromOwner || peer.Own || !peer.Direct {
+		t.Errorf("peer message misclassified: %+v", peer)
+	}
+	if !own.Own || own.FromOwner || !own.Direct {
+		t.Errorf("own sent message misclassified: %+v", own)
+	}
+}
+
 // A room-scoped archive result becomes a room message tagged with the room and
 // the occupant nick; our own archived outbound is skipped.
 func TestCollectMAMResultRoom(t *testing.T) {
@@ -269,7 +293,7 @@ func TestReconnectSince(t *testing.T) {
 	}
 }
 
-// The last-page query is what makes read_room return the NEWEST messages. With
+// The last-page query is what makes read_messages return the NEWEST messages. With
 // no RSM cursor the server returns the archive's first page, so a read would
 // hand the agent the room's oldest messages while claiming they were the latest
 // (#106 review): <before/> with no <after> and no start bound is what selects
@@ -291,7 +315,7 @@ func TestMAMLastPagePayload(t *testing.T) {
 	}
 }
 
-// read_room's `before` argument pages BACKWARDS from a stanza id: the query must
+// read_messages's `before` argument pages BACKWARDS from a stanza id: the query must
 // carry <before>id</before>, not the empty <before/> that means "the newest
 // page". An explicit cursor also overrides lastPage, and can be combined with a
 // `since` lower bound.
@@ -316,9 +340,9 @@ func TestMAMBeforeCursorPayload(t *testing.T) {
 	}
 }
 
-// A read must not write the stanza history: recording fetched ids clears the
-// "we sent this" flag on our own archived lines and can evict live ids that
-// `to: <stanza-id>` routing depends on (#106 review).
+// A read must not write live stanza history: archived own lines should not
+// change sent-message classification or evict live IDs; replyable archive IDs
+// are retained in a separate bounded cache.
 func TestMAMReadDoesNotRecordHistory(t *testing.T) {
 	b := newMAMTestBridge()
 	col := &mamCollector{room: "testing@muc.chat.zachmanson.com"} // record=false: a read

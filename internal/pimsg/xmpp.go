@@ -59,8 +59,6 @@ const (
 	directDelayFutureSlack = time.Minute
 )
 
-const chatStatesNS = "http://jabber.org/protocol/chatstates"
-
 // Receipt namespaces: XEP-0184 message delivery receipts and XEP-0333 chat
 // markers. The bridge honors whichever an incoming owner message requests.
 const (
@@ -389,6 +387,9 @@ type XMPPBridge struct {
 	// send_reaction can target arbitrary messages by ID. Capped at 500 entries;
 	// oldest is evicted when full.
 	msgHistory map[string]msgHistoryEntry
+	// readHistory retains reply targets from explicit MAM reads without changing
+	// live routing history. It is capped independently at msgHistoryCap.
+	readHistory map[string]msgHistoryEntry
 
 	// spokeAt records when we last sent a groupchat message to each joined room,
 	// keyed by bare room JID. A message we sent to a room keeps that room's
@@ -434,6 +435,7 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		occupants:   make(map[string]map[string]string),
 		selfNick:    make(map[string]string),
 		msgHistory:  make(map[string]msgHistoryEntry),
+		readHistory: make(map[string]msgHistoryEntry),
 		spokeAt:     make(map[string]time.Time),
 		mamPending:  make(map[string]*mamCollector),
 	}
@@ -1485,6 +1487,21 @@ func (b *XMPPBridge) classifyDest(dest string) destKind {
 	}
 }
 
+// classifyMessageDest extends the normal allowlist only for the explicit
+// send_message tool. Room membership remains mandatory even when arbitrary
+// peer JIDs are enabled.
+func (b *XMPPBridge) classifyMessageDest(dest string, allowArbitrary bool) destKind {
+	kind := b.classifyDest(dest)
+	if kind != destBlocked || !allowArbitrary {
+		return kind
+	}
+	parsed, err := jid.Parse(dest)
+	if err != nil || parsed.String() == "" {
+		return destBlocked
+	}
+	return destUser
+}
+
 // isRoomJID reports whether bare is one of the rooms the bridge has joined.
 func (b *XMPPBridge) isRoomJID(bare string) bool {
 	return b.roomBares[bare]
@@ -1562,25 +1579,6 @@ func idleSinceISO(t time.Time) string {
 func (b *XMPPBridge) GoOffline(status string) {
 	if err := b.encodeUnavailable(status); err != nil {
 		b.log("warning", "offline presence failed: "+err.Error())
-	}
-}
-
-// ChatState sends an XEP-0085 chat-state notification to the owner (the
-// "typing…" indicator). "composing" shows typing; "active" clears it.
-func (b *XMPPBridge) ChatState(state string) {
-	b.ChatStateTo(state, b.acct.Owner)
-}
-
-// ChatStateTo sends an XEP-0085 chat-state notification to a specific JID. The
-// typing indicator is a per-recipient 1:1 chat state, so a reply routed to (or
-// from) someone other than the owner points the bubble at that recipient rather
-// than always lighting the owner (issue #44).
-func (b *XMPPBridge) ChatStateTo(state, to string) {
-	if b.currentSession() == nil {
-		return
-	}
-	if err := b.encodeChatState(to, state, stanza.ChatMessage); err != nil {
-		b.log("warning", "chatstate failed: "+err.Error())
 	}
 }
 
@@ -1662,29 +1660,6 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, reply *
 	return id, b.encode(ctx, session, msg)
 }
 
-func (b *XMPPBridge) encodeChatState(to, state string, typ stanza.MessageType) error {
-	session := b.currentSession()
-	if session == nil {
-		return fmt.Errorf("not online")
-	}
-	toJID, err := jid.Parse(to)
-	if err != nil {
-		return fmt.Errorf("invalid recipient %q: %w", to, err)
-	}
-	msg := struct {
-		stanza.Message
-		State struct {
-			XMLName xml.Name
-		}
-	}{
-		Message: stanza.Message{To: toJID, Type: typ},
-	}
-	msg.State.XMLName = xml.Name{Space: chatStatesNS, Local: state}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	return b.encode(ctx, session, msg)
-}
-
 // SendDisplayedMarker acknowledges a 1:1 owner message with a single XEP-0333
 // "displayed" chat marker. Sent to the message's full from-JID so it routes
 // back to the originating resource. Only one ack is sent per message (a lone
@@ -1746,11 +1721,12 @@ func (b *XMPPBridge) encodeReceipt(to, ns, local, forID string) error {
 // message in that room, and a room receive records room/nick, whose bare JID is
 // the room.
 type msgHistoryEntry struct {
-	FromJID   string
-	Timestamp time.Time
-	Body      string
-	Self      bool
-	Owner     bool
+	FromJID         string // author of the quoted stanza (XEP-0461)
+	ConversationJID string // chat/room target in which it appeared
+	Timestamp       time.Time
+	Body            string
+	Self            bool
+	Owner           bool
 }
 
 // msgHistoryCap is the maximum number of stanza IDs retained in history.
@@ -1881,6 +1857,58 @@ func (b *XMPPBridge) lookupMessageEntry(id string) (msgHistoryEntry, bool) {
 	defer b.mu.Unlock()
 	e, ok := b.msgHistory[id]
 	return e, ok
+}
+
+// recordReadHistory retains targets printed by read_messages so a later
+// send_message call can reply to an archived stanza without perturbing the
+// live routing history used by inbound dispatch.
+func (b *XMPPBridge) recordReadHistory(msgs []InboundMessage, directPeer string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, m := range msgs {
+		if m.ID == "" {
+			continue
+		}
+		from := m.From
+		if m.Direct && m.Own {
+			from = bareJid(b.acct.JID)
+		}
+		stamp := m.Stamp
+		if stamp.IsZero() {
+			stamp = time.Now()
+		}
+		b.readHistory[m.ID] = msgHistoryEntry{
+			FromJID: from, ConversationJID: directPeer, Timestamp: stamp,
+			Body: truncateLabel(strings.TrimSpace(m.Body), msgHistoryBodyCap),
+			Self: m.Own, Owner: m.FromOwner,
+		}
+	}
+	for len(b.readHistory) > msgHistoryCap {
+		var oldestID string
+		var oldest time.Time
+		for id, entry := range b.readHistory {
+			if oldestID == "" || entry.Timestamp.Before(oldest) {
+				oldestID, oldest = id, entry.Timestamp
+			}
+		}
+		delete(b.readHistory, oldestID)
+	}
+}
+
+// lookupReplyMessage resolves live messages and messages exposed by the
+// read_messages archive tool. The latter are kept separate to avoid changing
+// inbound routing classifications merely because history was inspected.
+func (b *XMPPBridge) lookupReplyMessage(id string) (msgHistoryEntry, bool) {
+	if id == "" {
+		return msgHistoryEntry{}, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if entry, ok := b.msgHistory[id]; ok {
+		return entry, true
+	}
+	entry, ok := b.readHistory[id]
+	return entry, ok
 }
 
 // SendReaction reacts to message forID (authored by `to`) with the given emoji,
