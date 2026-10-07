@@ -20,6 +20,18 @@ func TestExtensionBeforeAgentStartWiring(t *testing.T) {
 	}
 }
 
+func TestSendMessageResultIncludesStanzaID(t *testing.T) {
+	for _, want := range []string{
+		"const stanzaId = result.slice(\"sent:\".length)",
+		"Sent to ${to} with stanza-id ${stanzaId}.",
+		"stanza_id: stanzaId",
+	} {
+		if !strings.Contains(xmppToolsExt, want) {
+			t.Errorf("embedded extension missing %q", want)
+		}
+	}
+}
+
 func TestWriteTempExtension(t *testing.T) {
 	path, err := writeTempExtension()
 	if err != nil {

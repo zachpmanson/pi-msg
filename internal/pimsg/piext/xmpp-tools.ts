@@ -429,9 +429,10 @@ ${systemPrompt}`;
 				if (!result.startsWith("sent:")) {
 					throw new Error("pi-msg could not send the message: " + result);
 				}
+				const stanzaId = result.slice("sent:".length);
 				return {
-					content: [{ type: "text", text: `Message sent to ${to}.` }],
-					details: { to, reply_to: p.reply_to ?? "", result },
+					content: [{ type: "text", text: `Sent to ${to} with stanza-id ${stanzaId}.` }],
+					details: { to, reply_to: p.reply_to ?? "", stanza_id: stanzaId, result },
 				};
 			},
 		});
