@@ -1419,15 +1419,23 @@ func (b *XMPPBridge) SendChatTo(to, text string) string {
 	return b.SendChatReply(to, text, nil)
 }
 
-type composingMessage struct {
-	stanza.Message
-	Composing struct{} `xml:"http://jabber.org/protocol/chatstates composing"`
+type chatStateElement struct {
+	XMLName xml.Name
 }
 
-// SendComposing sends the XEP-0085 composing chat state to a 1:1 recipient.
-// It is a best-effort prelude to an explicit send_message call; callers should
-// still deliver the body if this transient indicator cannot be sent.
-func (b *XMPPBridge) SendComposing(to string) error {
+type chatStateMessage struct {
+	stanza.Message
+	State chatStateElement
+}
+
+func makeChatStateMessage(to jid.JID, state string) chatStateMessage {
+	return chatStateMessage{
+		Message: stanza.Message{To: to, Type: stanza.ChatMessage},
+		State:   chatStateElement{XMLName: xml.Name{Space: chatStatesNS, Local: state}},
+	}
+}
+
+func (b *XMPPBridge) sendChatState(to, state string) error {
 	session := b.currentSession()
 	if session == nil {
 		return fmt.Errorf("not online")
@@ -1436,10 +1444,22 @@ func (b *XMPPBridge) SendComposing(to string) error {
 	if err != nil {
 		return fmt.Errorf("invalid recipient %q: %w", to, err)
 	}
-	msg := composingMessage{Message: stanza.Message{To: toJID, Type: stanza.ChatMessage}}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return b.encode(ctx, session, msg)
+	return b.encode(ctx, session, makeChatStateMessage(toJID, state))
+}
+
+// SendComposing sends the XEP-0085 composing chat state to a 1:1 recipient.
+// It is a best-effort prelude to an explicit send_message call; callers should
+// still deliver the body if this transient indicator cannot be sent.
+func (b *XMPPBridge) SendComposing(to string) error {
+	return b.sendChatState(to, "composing")
+}
+
+// SendActive sends the XEP-0085 active state, used to clear a composing
+// indicator if the following message could not be delivered.
+func (b *XMPPBridge) SendActive(to string) error {
+	return b.sendChatState(to, "active")
 }
 
 // SendChatReply is SendChatTo with an optional XEP-0461 reply stamp. Only the
@@ -1636,8 +1656,9 @@ type replyElem struct {
 // chatMessage is one outbound message stanza as it goes on the wire.
 type chatMessage struct {
 	stanza.Message
-	Body  string     `xml:"body"`
-	Reply *replyElem `xml:"reply,omitempty"`
+	Body   string            `xml:"body"`
+	Active *chatStateElement `xml:",omitempty"`
+	Reply  *replyElem        `xml:"reply,omitempty"`
 }
 
 // chatStanza builds one outbound message stanza. reply, when it names both an
@@ -1648,6 +1669,9 @@ func chatStanza(id string, to jid.JID, typ stanza.MessageType, body string, repl
 	msg := chatMessage{
 		Message: stanza.Message{ID: id, To: to, Type: typ},
 		Body:    body,
+	}
+	if typ == stanza.ChatMessage {
+		msg.Active = &chatStateElement{XMLName: xml.Name{Space: chatStatesNS, Local: "active"}}
 	}
 	if reply != nil && reply.author != "" && reply.id != "" {
 		msg.Reply = &replyElem{To: reply.author, ID: reply.id}

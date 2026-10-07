@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"mellium.im/xmpp/jid"
-	"mellium.im/xmpp/stanza"
 )
 
 func TestBareJid(t *testing.T) {
@@ -47,7 +46,7 @@ func TestComposingMessageXML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := xml.Marshal(composingMessage{Message: stanza.Message{To: to, Type: stanza.ChatMessage}})
+	data, err := xml.Marshal(makeChatStateMessage(to, "composing"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -664,6 +664,13 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 		stanzaID = b.xmpp.SendChatReply(to, text, reply)
 	}
 	if stanzaID == "" {
+		if kind != destRoom {
+			// If the body failed after composing was sent, explicitly clear the
+			// remote typing state rather than leaving it stuck indefinitely.
+			if err := b.xmpp.SendActive(to); err != nil {
+				b.log("warning", fmt.Sprintf("send active state to %s failed: %v", to, err))
+			}
+		}
 		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message to %s failed: no stanza was sent", to))
 		return
 	}

@@ -11,6 +11,25 @@ import (
 
 // A well-formed stanza id is a third routing target form, alongside a jid and
 // "noop" (#54). It must not collide with either, and it must not swallow prose.
+func TestDirectChatMessageClearsComposingState(t *testing.T) {
+	to := jid.MustParse("zach@example.com/phone")
+	out, err := xml.Marshal(chatStanza("out-active", to, stanza.ChatMessage, "hello", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `<active xmlns="http://jabber.org/protocol/chatstates"></active>`) {
+		t.Fatalf("direct chat message missing XEP-0085 active state: %s", out)
+	}
+
+	room, err := xml.Marshal(chatStanza("out-room", jid.MustParse("team@muc.x"), stanza.GroupChatMessage, "hello", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(room), "chatstates") {
+		t.Fatalf("groupchat unexpectedly carries a chat state: %s", room)
+	}
+}
+
 func TestReplyStanzaGoldenXML(t *testing.T) {
 	to := jid.MustParse("team@muc.x")
 	msg := chatStanza("out-1", to, stanza.GroupChatMessage, "answering alice",
