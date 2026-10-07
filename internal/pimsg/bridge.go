@@ -706,28 +706,22 @@ const (
 // archive history for an allowed room or direct-chat peer and returns it as text.
 // Reads are explicit and on demand rather than pushed into the prompt.
 //
-// By default it reads the newest `limit` messages, which stays stateless and is
-// what an agent usually wants. Two optional arguments add a window (#57):
+// `target` is required. By default it reads the newest `limit` messages, which
+// stays stateless and is what an agent usually wants. Two optional arguments
+// add a window (#57):
 // `since` bounds the archive below (RFC 3339 stamp or relative age), and
 // `before` is a stanza id cursor that pages backwards past the newest-N window.
 // Both are validated here so a bad argument fails loudly in the tool result
 // instead of silently reading the newest page.
 func (b *Bridge) handleReadMessagesRelay(id, target string, limit int, sinceArg, beforeArg string) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		b.rpc.RespondUIRelay(id, "read_messages: target is required; pass an owner, configured room, or allowed peer JID")
+		return
+	}
 	if b.xmpp == nil {
 		b.rpc.RespondUIRelay(id, "read_messages is unavailable: the bridge has no XMPP connection")
 		return
-	}
-	target = strings.TrimSpace(target)
-	if target == "" {
-		switch {
-		case !b.acct.RoomMode():
-			target = b.acct.Owner
-		case len(b.acct.Rooms) == 1:
-			target = b.acct.Rooms[0]
-		default:
-			b.rpc.RespondUIRelay(id, "read_messages needs a target: this account joins multiple rooms ("+strings.Join(b.acct.Rooms, ", ")+")")
-			return
-		}
 	}
 	bare := bareJid(target)
 	if bare == "" {
@@ -2104,7 +2098,7 @@ func (b *Bridge) messagingContract() string {
 	if b.acct.AllowArbitraryJid {
 		allow = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable."
 	}
-	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?). Choose `to` from the incoming `from:` conversation JID, use `sender:` to DM a room participant, or use owner JID %s to message the owner. %s For a threaded reply, pass the complete `stanza-id:` as `reply_to`; it must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, with the appropriate reply_to. `read_messages` reads room or 1:1 history; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
+	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?). Choose `to` from the incoming `from:` conversation JID, use `sender:` to DM a room participant, or use owner JID %s to message the owner. %s For a threaded reply, pass the complete `stanza-id:` as `reply_to`; it must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, with the appropriate reply_to. `read_messages(target, …)` reads room or 1:1 history and requires an explicit target; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a

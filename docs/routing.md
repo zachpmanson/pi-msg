@@ -47,10 +47,11 @@ rather than silently sending an unthreaded message.
 
 ## Reading history
 
-`read_messages(target?, limit?, since?, before?)` reads a room or direct-chat
-XEP-0313 archive. There is no `read_room` alias. With no target, a 1:1 account
-reads the owner's conversation; a room-mode account defaults to its sole
-configured room, and requires an explicit target if it joins multiple rooms.
+`read_messages(target, limit?, since?, before?)` reads a room or direct-chat
+XEP-0313 archive. `target` is required; there is no implicit conversation
+fallback and no `read_room` alias. Pass the owner JID for a 1:1 conversation, a
+configured room JID for room history, or another peer JID when
+`allowArbitraryJid: true`.
 
 By default, readable targets are the owner and configured rooms. Other peers
 require `allowArbitraryJid: true`; a room still must be configured. The default

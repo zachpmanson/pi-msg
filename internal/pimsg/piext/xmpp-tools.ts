@@ -443,18 +443,18 @@ ${systemPrompt}`;
 			name: "read_messages",
 			label: "Read conversation history (XMPP)",
 			description:
-				"Read an XMPP room or 1:1 chat from its XEP-0313 archive. Defaults to the newest 30 (max 100) messages; `since` and `before` narrow/page the window. By default, only the owner JID and configured rooms are readable; account config `allowArbitraryJid` can permit other peers. Returns messages oldest first with `[id …]` as the archive pagination cursor and `[stanza …]` as the message ID for send_message's `reply_to`. Includes sent lines marked `[we sent]`. Reading does not send a message.",
+				"Read an XMPP room or 1:1 chat from its XEP-0313 archive. `target` is required: pass the owner JID, a configured room JID, or an allowed peer JID. Defaults to the newest 30 (max 100) messages; `since` and `before` narrow/page the window. By default, only the owner JID and configured rooms are readable; account config `allowArbitraryJid` can permit other peers. Returns messages oldest first with `[id …]` as the archive pagination cursor and `[stanza …]` as the message ID for send_message's `reply_to`. Includes sent lines marked `[we sent]`. Reading does not send a message.",
 			promptSnippet: "Read room or 1:1 conversation history",
 			promptGuidelines: [
 				"Use read_messages when you need earlier context or a room conversation you were not addressed in.",
-				"Pass a room or peer JID as `target`. With no target, a single-room account defaults to that room; a 1:1 account defaults to the owner.",
+				"Pass the conversation JID as the required `target` on every call. Use the owner JID for 1:1 history or a configured room JID for room history; other peers require `allowArbitraryJid: true`.",
 				"By default, only the owner and configured rooms are readable. Other peers require `allowArbitraryJid: true` in account config.",
 				"Pass `since` (RFC 3339 timestamp or relative age like 2h) to bound the read, and `before` using an archive `[id …]` cursor to page older.",
 				"To reply, call send_message; use `[stanza …]` as its optional `reply_to`, never `[id …]`.",
 				"read_messages only reads. Use send_message to send a chat message; final assistant text is internal to the harness.",
 			],
 			parameters: Type.Object({
-				target: Type.Optional(Type.String({ description: "Owner or joined room JID; omitted defaults to the sole room or, for 1:1 accounts, the owner" })),
+				target: Type.String({ description: "Required conversation JID: owner, configured room, or allowed peer JID" }),
 
 				limit: Type.Optional(Type.Number({ description: "How many messages to fetch (default 30, max 100)" })),
 				since: Type.Optional(
@@ -467,8 +467,8 @@ ${systemPrompt}`;
 
 			}),
 			async execute(_toolCallId, params) {
-				const p = params as { target?: string; limit?: number; since?: string; before?: string };
-				const args: Record<string, unknown> = { target: p.target ?? "" };
+				const p = params as { target: string; limit?: number; since?: string; before?: string };
+				const args: Record<string, unknown> = { target: p.target };
 				if (typeof p.limit === "number" && Number.isFinite(p.limit)) {
 					args.limit = Math.trunc(p.limit);
 				}
@@ -484,7 +484,7 @@ ${systemPrompt}`;
 				}
 				return {
 					content: [{ type: "text", text: result }],
-					details: { target: p.target ?? "", limit: args.limit, since: args.since, before: args.before },
+					details: { target: p.target, limit: args.limit, since: args.since, before: args.before },
 				};
 			},
 		});
