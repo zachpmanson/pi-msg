@@ -406,12 +406,12 @@ ${systemPrompt}`;
 			name: "send_message",
 			label: "Send chat message (XMPP)",
 			description:
-				"Send a message explicitly to the owner, a joined room, or a known room occupant. Other valid JIDs are allowed only when account config `allowArbitraryJid` is true. Final assistant text is internal to the harness and is never sent automatically. Use `reply_to` with a `[stanza …]` message ID to thread a reply; never use an archive `[id …]` cursor.",
+				"Send a message explicitly to the owner, a joined room, or a known room occupant. Other valid JIDs are allowed only when account config `allowArbitraryJid` is true. Final assistant text is internal to the harness and is never sent automatically. `reply_to` is optional: omit it for ordinary replies; use a `[stanza …]` message ID when explicitly threading or when it materially helps associate a follow-up. Never use an archive `[id …]` cursor.",
 			promptSnippet: "Send a message to an XMPP conversation",
 			promptGuidelines: [
 				"Use send_message for every outbound chat message; a final assistant response is not delivered to chat.",
 				"Choose `to` from the conversation JID (`from:`) or sender JID (`sender:`); use the owner JID to message the owner.",
-				"Use `reply_to` only when replying to a specific stanza; a message ID from read_messages is valid. Multiple recipients require multiple calls.",
+				"Use `reply_to` when you want to thread a reply to a specific stanza or threading materially helps associate a follow-up; otherwise omit it. A message ID from read_messages is valid. Multiple recipients require multiple calls.",
 				"Only the owner, joined rooms, and known occupants are allowed by default. `allowArbitraryJid: true` permits other valid JIDs.",
 			],
 			parameters: Type.Object({
@@ -450,7 +450,7 @@ ${systemPrompt}`;
 				"Pass the conversation JID as the required `target` on every call. Use the owner JID for 1:1 history or a configured room JID for room history; other peers require `allowArbitraryJid: true`.",
 				"By default, only the owner and configured rooms are readable. Other peers require `allowArbitraryJid: true` in account config.",
 				"Pass `since` (RFC 3339 timestamp or relative age like 2h) to bound the read, and `before` using an archive `[id …]` cursor to page older.",
-				"To reply, call send_message; use `[stanza …]` as its optional `reply_to`, never `[id …]`.",
+				"To thread a reply when useful, call send_message with `[stanza …]` as its optional `reply_to`; otherwise omit it. Never use `[id …]` for `reply_to`.",
 				"read_messages only reads. Use send_message to send a chat message; final assistant text is internal to the harness.",
 			],
 			parameters: Type.Object({

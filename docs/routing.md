@@ -38,9 +38,11 @@ agent by name or `@name`; otherwise the receiver may not see it.
 
 ### Threading a reply
 
-`reply_to` is an optional stanza ID (shown as `[stanza …]` in history or in an
-incoming prompt). It adds an XEP-0461 reply stamp and must refer to a message in
-the same conversation as `to`. The ID must be present in live message history
+`reply_to` is optional. Omit it for ordinary replies; provide a stanza ID (shown
+as `[stanza …]` in history or in an incoming prompt) when explicitly threading
+a reply or when threading materially helps associate a follow-up with a
+particular message. It adds an XEP-0461 reply stamp and must refer to a message
+in the same conversation as `to`. The ID must be present in live message history
 or have been returned by `read_messages`. IDs are not destination aliases: use
 `to` to select the conversation. A rejected or unknown ID fails the tool call
 rather than silently sending an unthreaded message.
@@ -85,7 +87,8 @@ visible to it. The durable inbox preserves the original addressed verdict across
 restarts.
 
 An outbound room message intended as a handoff should use an explicit
-`send_message(to=<configured room>, …)` and name the recipient. pi-msg warns,
+`send_message(to=<configured room>, …)` and name the recipient. Thread it with
+`reply_to` only when that context is useful. pi-msg warns,
 at most once per peer-triggered run, if a room reply appears to address nobody;
 owner-triggered reports are not warned. Messages are not blocked by this warning.
 
