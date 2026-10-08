@@ -1050,3 +1050,17 @@ func TestRoutingContractStatesBareMentions(t *testing.T) {
 		t.Errorf("messaging contract does not state the room mention rule: %q", got)
 	}
 }
+
+func TestRoutingContractMakesReplyThreadingOptional(t *testing.T) {
+	got := roomBridge().messagingContract()
+	for _, want := range []string{
+		"`reply_to` is optional: omit it for ordinary replies",
+		"when you explicitly want a threaded reply or threading materially helps",
+		"It must belong to the chosen conversation.",
+		"`[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("messaging contract is missing %q: %s", want, got)
+		}
+	}
+}
