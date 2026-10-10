@@ -3575,7 +3575,7 @@ func (b *Bridge) handleStreamDelta(ev Event) {
 	case "text_start":
 		// Streamed assistant text is a private draft; send_message selects the
 		// destination and delivers only when explicitly called.
-		b.xmpp.SetPresence("dnd", "drafting…")
+		b.xmpp.SetPresence("dnd", "muttering…")
 	case "toolcall_start", "toolcall_delta", "toolcall_end":
 		b.handleStreamToolCall(ame)
 	}

@@ -920,8 +920,8 @@ func TestStreamDeltaContract(t *testing.T) {
 
 	// Streamed text is internal and must not light a chat composer.
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
-	if b.xmpp.presence != "drafting…" {
-		t.Errorf("text_start presence = %q, want drafting…", b.xmpp.presence)
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("text_start presence = %q, want muttering…", b.xmpp.presence)
 	}
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": "hello"}))
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
@@ -960,13 +960,13 @@ func TestStreamDeltaContractRoomMode(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x", Rooms: []string{"team@muc.x"}})
 
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
-	if b.xmpp.presence != "drafting…" {
-		t.Errorf("room-mode text_start presence = %q, want drafting…", b.xmpp.presence)
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("room-mode text_start presence = %q, want muttering…", b.xmpp.presence)
 	}
 	for _, d := range []string{"to: ", "zach", "@x\n", "hi"} {
 		b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": d}))
 	}
-	if b.xmpp.presence != "drafting…" {
+	if b.xmpp.presence != "muttering…" {
 		t.Errorf("private draft changed presence to %q", b.xmpp.presence)
 	}
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
@@ -982,8 +982,8 @@ func TestStreamDeltaCommentaryStaysMuttering(t *testing.T) {
 	for _, d := range []string{"let me ", "check the ", "file\n", "done"} {
 		b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": d}))
 	}
-	if b.xmpp.presence != "drafting…" {
-		t.Errorf("commentary stream presence = %q, want drafting…", b.xmpp.presence)
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("commentary stream presence = %q, want muttering…", b.xmpp.presence)
 	}
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
 
@@ -991,8 +991,8 @@ func TestStreamDeltaCommentaryStaysMuttering(t *testing.T) {
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_start"}))
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_delta", "delta": "to: noop\n"}))
 	b.handleStreamDelta(streamDelta(map[string]any{"type": "text_end"}))
-	if b.xmpp.presence != "drafting…" {
-		t.Errorf("private draft presence = %q, want drafting…", b.xmpp.presence)
+	if b.xmpp.presence != "muttering…" {
+		t.Errorf("private draft presence = %q, want muttering…", b.xmpp.presence)
 	}
 }
 
