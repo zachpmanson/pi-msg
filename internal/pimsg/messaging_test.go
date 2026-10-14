@@ -37,6 +37,26 @@ func TestDefaultMessageDestinationPolicy(t *testing.T) {
 	}
 }
 
+func TestSendMessageNoopAcceptsEmptyTextWithoutDelivery(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
+	var buf bytes.Buffer
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
+	b.handleSendMessageRelay("r1", "noop", "", "")
+	if got := buf.String(); !strings.Contains(got, `"value":"noop"`) {
+		t.Fatalf("noop response = %q, want successful noop result", got)
+	}
+	if b.replied() {
+		t.Fatal("noop must not count as a delivered message")
+	}
+}
+
+func TestSendMessageEmptyTextStillRejectedForRecipient(t *testing.T) {
+	out := relayOutput(t, ResolvedAccount{Owner: "zach@x"}, `{"action":"send_message","to":"zach@x","text":""}`)
+	if !strings.Contains(out, "send_message requires non-empty to and text") {
+		t.Fatalf("empty recipient message should be rejected, got %q", out)
+	}
+}
+
 func TestSendMessageArbitraryJidOptIn(t *testing.T) {
 	payload := `{"action":"send_message","to":"stranger@x","text":"hello"}`
 	denied := relayOutput(t, ResolvedAccount{Owner: "zach@x"}, payload)

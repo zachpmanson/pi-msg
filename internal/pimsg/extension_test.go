@@ -20,6 +20,18 @@ func TestExtensionBeforeAgentStartWiring(t *testing.T) {
 	}
 }
 
+func TestSendMessageNoopReturnsSuccessWithoutSending(t *testing.T) {
+	for _, want := range []string{
+		`to !== "noop" && !text`,
+		`result === "noop" && to === "noop"`,
+		`text: "No message sent."`,
+	} {
+		if !strings.Contains(xmppToolsExt, want) {
+			t.Errorf("embedded extension missing noop behavior %q", want)
+		}
+	}
+}
+
 func TestSendMessageResultIncludesStanzaID(t *testing.T) {
 	for _, want := range []string{
 		"const stanzaId = result.slice(\"sent:\".length)",
