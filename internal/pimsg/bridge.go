@@ -625,11 +625,15 @@ func (b *Bridge) handleUIRequest(ev Event) {
 }
 
 func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
+	to = strings.TrimSpace(to)
+	if to == "noop" {
+		b.rpc.RespondUIRelay(id, "noop")
+		return
+	}
 	if b.xmpp == nil {
 		b.rpc.RespondUIRelay(id, "send_message is unavailable: the bridge has no XMPP connection")
 		return
 	}
-	to = strings.TrimSpace(to)
 	text = strings.TrimSpace(text)
 	if to == "" || text == "" {
 		b.rpc.RespondUIRelay(id, "send_message requires non-empty to and text")

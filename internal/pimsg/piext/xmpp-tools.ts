@@ -424,8 +424,11 @@ ${systemPrompt}`;
 				const to = String(p.to ?? "").trim();
 				const text = String(p.text ?? "").trim();
 				if (!to) throw new Error("to is required");
-				if (!text) throw new Error("text is required");
+				if (to !== "noop" && !text) throw new Error("text is required");
 				const result = await relay("send_message", { to, text, replyTo: p.reply_to ?? "" });
+				if (result === "noop" && to === "noop") {
+					return { content: [{ type: "text", text: "No message sent." }], details: { to, result } };
+				}
 				if (!result.startsWith("sent:")) {
 					throw new Error("pi-msg could not send the message: " + result);
 				}
