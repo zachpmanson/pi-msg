@@ -641,7 +641,7 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 	}
 	kind := b.xmpp.classifyMessageDest(to, b.acct.AllowArbitraryJid)
 	if kind == destBlocked {
-		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: %q is not an allowed destination", to))
+		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: %q is not an allowed destination; use the configured owner, a joined room, or a known room occupant. Other peer JIDs require allowArbitraryJid=true in the account configuration. No message was sent.", to))
 		return
 	}
 	var reply *replyTarget
