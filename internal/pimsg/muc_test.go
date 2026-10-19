@@ -1055,6 +1055,7 @@ func TestRoutingContractMakesReplyThreadingOptional(t *testing.T) {
 	got := roomBridge().messagingContract()
 	for _, want := range []string{
 		"`reply_to` is optional: omit it for ordinary replies",
+		"Omit it for ordinary replies, even when an incoming stanza ID is available.",
 		"when you explicitly want a threaded reply or threading materially helps",
 		"It must belong to the chosen conversation.",
 		"`[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID",
