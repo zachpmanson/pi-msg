@@ -342,11 +342,12 @@ type InboundMessage struct {
 // exposes send/presence/chat-state helpers the bridge calls from other
 // goroutines.
 type XMPPBridge struct {
-	acct      ResolvedAccount
-	ownerBare string
-	roomBares map[string]bool // bare JIDs of the joined rooms
-	onMsg     func(InboundMessage)
-	logf      func(level, msg string)
+	acct           ResolvedAccount
+	ownerBare      string
+	roomBares      map[string]bool // bare JIDs of the joined rooms
+	onMsg          func(InboundMessage)
+	onReplyMessage func(InboundMessage)
+	logf           func(level, msg string)
 
 	mu       sync.Mutex
 	session  *xmpp.Session
@@ -1164,7 +1165,10 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if m.typ != "" && m.typ != "chat" && m.typ != "normal" {
 		return
 	}
-	if bareJid(m.from) != b.ownerBare {
+	if bareJid(m.from) == bareJid(b.acct.JID) {
+		return
+	}
+	if m.delay && bareJid(m.from) != b.ownerBare {
 		return
 	}
 	if strings.TrimSpace(m.body) == "" && len(m.reactions) == 0 {
@@ -1192,6 +1196,12 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 		b.log("info", fmt.Sprintf("delivering recent delayed 1:1 message outside the replay window (id=%s from=%s stamp=%s)", m.id, m.from, stampLabel(m.delayStamp)))
 	}
 	if m.id != "" && b.seenDuplicate(m.id) {
+		return
+	}
+	if !m.delay && strings.TrimSpace(m.body) != "" && b.onReplyMessage != nil {
+		b.onReplyMessage(InboundMessage{Body: m.body, From: m.from, Direct: true, ID: m.id, ReplyToID: m.replyToID})
+	}
+	if bareJid(m.from) != b.ownerBare {
 		return
 	}
 	// Record the inbound message in history so send_reaction can target it by ID,
@@ -1257,6 +1267,9 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	}
 	if m.id != "" && b.seenDuplicate(m.id) {
 		return
+	}
+	if strings.TrimSpace(m.body) != "" && b.onReplyMessage != nil {
+		b.onReplyMessage(InboundMessage{Body: m.body, From: m.from, Room: room, Nick: nick, ID: m.id, ReplyToID: m.replyToID})
 	}
 	// Record the inbound room message in history so send_reaction can target it
 	// by ID, and so a later reply to it can be resolved and quoted (#95).

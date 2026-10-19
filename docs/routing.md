@@ -10,7 +10,7 @@ Assistant final text is **internal to the harness**. It is never routed or sent
 automatically, in either a 1:1 or room-mode account. To send chat text, call:
 
 ```text
-send_message(to, text, reply_to?)
+send_message(to, text, reply_to?, reply_timeout_seconds?)
 ```
 
 Each call sends one message to one destination. As streamed `send_message`
@@ -23,6 +23,28 @@ successful `send_message` counts as a reply for run accounting. A successful
 `send_file` upload is not a substitute for a chat reply. If a run that should
 answer produces no successful `send_message`, pi-msg issues one bounded internal
 recovery prompt. A final response is not a substitute for `send_message`.
+
+### Optional reply watches
+
+Omitting `reply_timeout_seconds` creates no watch. A finite positive number of
+seconds opts into one internal reminder; zero, negative, invalid, overflowing,
+and below-timer-precision values are rejected before sending. The tool returns
+immediately after successful delivery with the stanza ID and watch confirmation.
+Failed sends and `to: noop` do not arm watches.
+
+A fresh body-bearing DM from the destination peer satisfies its watch. In a
+room, only a direct address to this agent or a threaded reply to the watched
+stanza qualifies. General chatter, `@everyone` / `@free` broadcasts, participation
+window traffic, own echoes, typing, presence, receipts, delayed history, archive
+reads, and replay do not satisfy watches merely by being routed or observed.
+
+There is one watch per bare conversation JID; a later watched send replaces it.
+At expiry the bridge queues a single internal prompt until the agent is idle.
+A qualifying reply or replacement can still cancel that queued prompt. The
+reminder identifies the conversation, stanza, bounded sent-text excerpt, and
+timeout, and suggests checking history before deciding whether to follow up.
+Silence is valid: expiry never sends a chat message automatically. Watches
+survive reconnects but are process-local and discarded on shutdown.
 
 By default, `to` must be the owner, a configured room, or a known occupant of a
 configured room. A configured room is an allowed groupchat destination only

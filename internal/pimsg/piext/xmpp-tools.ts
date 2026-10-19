@@ -406,26 +406,32 @@ ${systemPrompt}`;
 			name: "send_message",
 			label: "Send chat message (XMPP)",
 			description:
-				"Send a message explicitly to the owner, a joined room, or a known room occupant. Other valid JIDs are allowed only when account config `allowArbitraryJid` is true. Final assistant text is internal to the harness and is never sent automatically. `reply_to` is optional: omit it for ordinary replies; use a `[stanza …]` message ID when explicitly threading or when it materially helps associate a follow-up. Never use an archive `[id …]` cursor.",
+				"Send a message explicitly to the owner, a joined room, or a known room occupant. Other valid JIDs are allowed only when account config `allowArbitraryJid` is true. Final assistant text is internal to the harness and is never sent automatically. `reply_to` is optional: omit it for ordinary replies; use a `[stanza …]` message ID when explicitly threading or when it materially helps associate a follow-up. Never use an archive `[id …]` cursor. Set `reply_timeout_seconds` only to opt into a one-shot internal reminder when no qualifying reply arrives; omission creates no watch.",
 			promptSnippet: "Send a message to an XMPP conversation",
 			promptGuidelines: [
 				"Use send_message for every outbound chat message; a final assistant response is not delivered to chat.",
 				"Choose `to` from the conversation JID (`from:`) or sender JID (`sender:`); use the owner JID to message the owner.",
 				"Use `reply_to` when you want to thread a reply to a specific stanza or threading materially helps associate a follow-up; otherwise omit it. A message ID from read_messages is valid. Multiple recipients require multiple calls.",
+				"An optional positive finite `reply_timeout_seconds` arms a non-blocking bridge watch after sending. DMs from the peer satisfy it; rooms require a direct ping to you or a threaded reply to this stanza, not general chatter or broadcasts. The reminder may be handled silently. One watch per conversation; a later watched send replaces it. Watches are process-local and cleared on shutdown.",
 				"Only the owner, joined rooms, and known occupants are allowed by default. `allowArbitraryJid: true` permits other valid JIDs.",
 			],
 			parameters: Type.Object({
 				to: Type.String({ description: "Destination JID: owner, joined room, or known occupant; arbitrary JIDs require allowArbitraryJid=true" }),
 				text: Type.String({ description: "Message body to send" }),
 				reply_to: Type.Optional(Type.String({ description: "Optional stanza ID from an incoming message or read_messages result to thread this reply under" })),
+				reply_timeout_seconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Opt-in one-shot internal reminder if no qualifying reply arrives after this many seconds; omit for no watch" })),
 			}),
 			async execute(_toolCallId, params) {
-				const p = params as { to?: string; text?: string; reply_to?: string };
+				const p = params as { to?: string; text?: string; reply_to?: string; reply_timeout_seconds?: number };
 				const to = String(p.to ?? "").trim();
 				const text = String(p.text ?? "").trim();
 				if (!to) throw new Error("to is required");
 				if (to !== "noop" && !text) throw new Error("text is required");
-				const result = await relay("send_message", { to, text, replyTo: p.reply_to ?? "" });
+				const timeout = p.reply_timeout_seconds;
+				if (timeout !== undefined && (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0)) {
+					throw new Error("reply_timeout_seconds must be a finite positive number of seconds");
+				}
+				const result = await relay("send_message", { to, text, replyTo: p.reply_to ?? "", replyTimeoutSeconds: timeout });
 				if (result === "noop" && to === "noop") {
 					return { content: [{ type: "text", text: "No message sent." }], details: { to, result } };
 				}
@@ -434,8 +440,8 @@ ${systemPrompt}`;
 				}
 				const stanzaId = result.slice("sent:".length);
 				return {
-					content: [{ type: "text", text: `Sent to ${to} with stanza-id ${stanzaId}.` }],
-					details: { to, reply_to: p.reply_to ?? "", stanza_id: stanzaId, result },
+					content: [{ type: "text", text: `Sent to ${to} with stanza-id ${stanzaId}.` + (timeout === undefined ? "" : ` Reply watch active (${timeout} seconds).`) }],
+					details: { to, reply_to: p.reply_to ?? "", stanza_id: stanzaId, reply_timeout_seconds: timeout, reply_watch_active: timeout !== undefined, result },
 				};
 			},
 		});
