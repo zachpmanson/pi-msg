@@ -216,13 +216,64 @@ func TestResolveAccountSelection(t *testing.T) {
 	if got.Name != "work" || got.JID != "b@x.com" {
 		t.Errorf("selected %q/%q, want work/b@x.com", got.Name, got.JID)
 	}
-	// Unknown requested falls back to default.
-	got, err = resolveAccount(cfg, "nope")
-	if err != nil {
-		t.Fatalf("resolveAccount fallback: %v", err)
+	for _, requested := range []string{"", "default"} {
+		got, err := resolveAccount(cfg, requested)
+		if err != nil || got.Name != "default" {
+			t.Errorf("resolveAccount(%q) = %q, %v; want default", requested, got.Name, err)
+		}
 	}
-	if got.Name != "default" {
-		t.Errorf("fallback selected %q, want default", got.Name)
+	for _, requested := range []string{"nope", "all", "Work", " work", " "} {
+		got, err := resolveAccount(cfg, requested)
+		if err == nil || !strings.Contains(err.Error(), "unknown account ") || got.Name != "" {
+			t.Errorf("resolveAccount(%q) = %q, %v; want unknown-account error and no selection", requested, got.Name, err)
+		}
+	}
+	delete(cfg.Accounts, "default")
+	if _, err := resolveAccount(cfg, "nope"); err == nil || !strings.Contains(err.Error(), "unknown account") {
+		t.Errorf("unknown account without default: %v", err)
+	}
+	if _, err := resolveAccount(cfg, ""); err == nil || !strings.Contains(err.Error(), `no "default" account`) {
+		t.Errorf("missing default: %v", err)
+	}
+}
+
+func TestResolveAccountAliases(t *testing.T) {
+	cfg := &Config{
+		Accounts: map[string]Account{
+			"default": {JID: "a@x.com", Password: "p", Owner: "o@x.com"},
+		},
+		AccountAliases: map[string]string{"beltino": "default"},
+	}
+	// Round-trip the on-disk mapping, not just an in-memory alias.
+	loaded, err := loadConfig(writeConfig(t, *cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveAccount(loaded, "beltino")
+	if err != nil || got.Name != "default" || got.JID != "a@x.com" {
+		t.Fatalf("explicit alias = %q/%q, %v; want default/a@x.com", got.Name, got.JID, err)
+	}
+	// An alias preserves the canonical state/session key and does not enable fallback.
+	if _, err := resolveAccount(loaded, "all"); err == nil {
+		t.Fatal("unknown name resolved despite explicit alias")
+	}
+	for _, aliases := range []map[string]string{
+		{"beltino": "missing"},
+		{"default": "default"},
+		{"": "default"},
+		{" ": "default"},
+		{"beltino": "leader", "leader": "default"},
+		{"a": "b", "b": "a"},
+	} {
+		cfg.AccountAliases = aliases
+		if _, err := resolveAccount(cfg, "default"); err == nil {
+			t.Errorf("invalid aliases %v accepted", aliases)
+		}
+		// --check loads config before checking accounts, so aliases must also
+		// be validated here rather than only during startup selection.
+		if _, err := loadConfig(writeConfig(t, *cfg)); err == nil {
+			t.Errorf("invalid aliases %v accepted by loader", aliases)
+		}
 	}
 }
 
