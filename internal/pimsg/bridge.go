@@ -24,8 +24,11 @@ import (
 // becomes pi commands, and pi's events update XMPP presence or send explicit
 // bridge notices.
 type Bridge struct {
-	acct  ResolvedAccount
-	debug bool
+	replyWatchMu   sync.Mutex
+	replyWatches   map[string]*replyWatch
+	replyWatchWake chan struct{}
+	acct           ResolvedAccount
+	debug          bool
 
 	xmpp *XMPPBridge
 	rpc  *RPCClient
@@ -219,7 +222,8 @@ func toolNames(acct ResolvedAccount) []string {
 
 // NewBridge constructs a bridge for the resolved account.
 func NewBridge(acct ResolvedAccount, debug bool) *Bridge {
-	return &Bridge{acct: acct, debug: debug}
+	return &Bridge{
+		replyWatchWake: make(chan struct{}, 1), acct: acct, debug: debug}
 }
 
 func (b *Bridge) log(level, msg string) {
@@ -232,9 +236,11 @@ func (b *Bridge) log(level, msg string) {
 // Run starts pi and the XMPP connection and drives the event loop until the
 // context is canceled or pi exits.
 func (b *Bridge) Run(ctx context.Context) error {
+	defer b.stopReplyWatches()
 	b.ctx = ctx
 
 	b.xmpp = NewXMPPBridge(b.acct, b.onInbound, b.log)
+	b.xmpp.onReplyMessage = b.observeReplyMessage
 	b.inbox = newInbox(inboxPath(b.acct.Name), b.log)
 
 	// A fresh or resumed bridge is idle until something prompts it — start the
@@ -387,6 +393,8 @@ func (b *Bridge) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			b.shutdown("interrupted (SIGINT/SIGTERM)")
 			return nil
+		case <-b.replyWatchWake:
+			b.flushReplyWatches()
 		case ev, ok := <-b.rpc.Events():
 			if !ok {
 				return b.onPiExit()
@@ -452,6 +460,7 @@ func (b *Bridge) shutdown(reason string) {
 	}
 	b.shuttingDown = true
 	b.mu.Unlock()
+	b.stopReplyWatches()
 	b.log("info", "shutting down: "+reason)
 	// Record the instant we go offline so the next launch's replay window can
 	// recover messages that arrive during the swap.
@@ -528,6 +537,9 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// settle's check would suppress a legitimate "done (no reply)" for a
 		// user-initiated run that genuinely went unanswered.
 		b.flushPendingHeartbeats()
+		if !recovering {
+			b.flushReplyWatches()
+		}
 	case "message_update":
 		b.handleStreamDelta(ev)
 	case "tool_execution_start":
@@ -624,7 +636,16 @@ func (b *Bridge) handleUIRequest(ev Event) {
 	}
 }
 
-func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
+func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string, timeoutArg ...json.RawMessage) {
+	var raw json.RawMessage
+	if len(timeoutArg) > 0 {
+		raw = timeoutArg[0]
+	}
+	timeout, seconds, err := parseReplyTimeout(raw)
+	if err != nil {
+		b.rpc.RespondUIRelay(id, "send_message: "+err.Error())
+		return
+	}
 	to = strings.TrimSpace(to)
 	if to == "noop" {
 		b.rpc.RespondUIRelay(id, "noop")
@@ -662,6 +683,18 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 		}
 		reply = &replyTarget{author: entry.FromJID, id: replyToID}
 	}
+	// Serialize send + registration with fresh inbound observation. A reply
+	// received while the send is completing waits for registration, not lost.
+	b.replyWatchMu.Lock()
+	defer b.replyWatchMu.Unlock()
+	b.mu.Lock()
+	stopped := b.shuttingDown
+	b.mu.Unlock()
+	if stopped {
+		b.rpc.RespondUIRelay(id, "send_message: bridge is shutting down")
+		return
+	}
+	started := time.Now()
 	var stanzaID string
 	if kind == destRoom {
 		stanzaID = b.xmpp.SendRoomReply(bareJid(to), text, reply)
@@ -685,6 +718,9 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 		}
 		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message to %s failed: no stanza was sent", to))
 		return
+	}
+	if timeout > 0 {
+		b.armReplyWatch(to, stanzaID, text, kind == destRoom, started, timeout, seconds)
 	}
 	b.setReplied(true)
 	b.clearToolSinceDelivery()
@@ -913,6 +949,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		To           string             `json:"to"`
 		Text         string             `json:"text"`
 		ReplyTo      string             `json:"replyTo"`
+		ReplyTimeout json.RawMessage    `json:"replyTimeoutSeconds"`
 		Target       string             `json:"target"`
 		MessageID    string             `json:"messageId"`
 		From         string             `json:"from"`
@@ -987,7 +1024,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 			b.rpc.RespondUIRelay(id, url)
 		}()
 	case "send_message":
-		b.handleSendMessageRelay(id, cmd.To, cmd.Text, cmd.ReplyTo)
+		b.handleSendMessageRelay(id, cmd.To, cmd.Text, cmd.ReplyTo, cmd.ReplyTimeout)
 	case "read_messages":
 		b.handleReadMessagesRelay(id, cmd.Target, cmd.Limit, cmd.Since, cmd.Before)
 	case "process_count":
@@ -1643,6 +1680,13 @@ func (b *Bridge) handleCommand(t string) bool {
 	if t == "!" {
 		name = "interrupt"
 	}
+	// Local aborts do not emit agent_settled. Wake the event loop only after
+	// all control/session work is complete; flush also waits for onInbound's
+	// session-transition lock before delivering a pending timeout.
+	switch name {
+	case "new", "abort", "stop", "interrupt":
+		defer b.wakeReplyWatches()
+	}
 	switch name {
 	case "new":
 		if b.streaming() {
@@ -2102,7 +2146,7 @@ func (b *Bridge) messagingContract() string {
 	if b.acct.AllowArbitraryJid {
 		allow = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable."
 	}
-	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?). Choose `to` from the incoming `from:` conversation JID, use `sender:` to DM a room participant, or use owner JID %s to message the owner. %s `reply_to` is optional: omit it for ordinary replies; use the complete `stanza-id:` when you explicitly want a threaded reply or threading materially helps associate a follow-up. It must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, adding `reply_to` only where useful. `read_messages(target, …)` reads room or 1:1 history and requires an explicit target; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
+	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?, reply_timeout_seconds?). Set reply_timeout_seconds to a finite positive number only when you want one internal reminder if no qualifying reply arrives; omission creates no watch. Choose `to` from the incoming `from:` conversation JID, use `sender:` to DM a room participant, or use owner JID %s to message the owner. %s `reply_to` is optional: omit it for ordinary replies; use the complete `stanza-id:` when you explicitly want a threaded reply or threading materially helps associate a follow-up. It must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, adding `reply_to` only where useful. `read_messages(target, …)` reads room or 1:1 history and requires an explicit target; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
@@ -3790,7 +3834,12 @@ func (b *Bridge) clearQueue() int {
 // agent_settled cleanup never fires. Idempotent and mutex-guarded, so it's safe
 // if a late agent_settled also arrives.
 func (b *Bridge) settleLocally() {
-	b.setStreaming(false)
+	b.mu.Lock()
+	b.heartbeatRun = false
+	b.volunteered = false
+	b.streamingRun = false
+	b.mu.Unlock()
+	b.syncBusyMarker()
 	b.markIdle()
 	b.announceSettledPresence()
 	b.setReactionAckRun(false)
