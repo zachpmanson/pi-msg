@@ -571,7 +571,8 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// settle can't fire a tail-retry / unanswered-hint prompt (which
 		// would just 402 again).
 		if msg.Str("stopReason") == "error" {
-			if b.creditFailAlert(msg.Str("errorMessage")) {
+			errMsg := msg.Str("errorMessage")
+			if b.creditFailAlert(errMsg) || b.usageLimitFailAlert(errMsg) {
 				return // consumed: owner alerted, run marked replied
 			}
 		}
@@ -3473,28 +3474,58 @@ func isCreditError(errMsg string) bool {
 	return strings.Contains(s, "402") ||
 		strings.Contains(s, "more credits") ||
 		strings.Contains(s, "out of credits") ||
-		strings.Contains(s, "insufficient")
+		strings.Contains(s, "insufficient balance") ||
+		strings.Contains(s, "insufficient credits")
+}
+
+// isUsageLimitError reports a hard provider usage/quota limit. Transient rate
+// limits and transport failures are deliberately excluded: Pi may retry those.
+func isUsageLimitError(errMsg string) bool {
+	s := strings.ToLower(errMsg)
+	return strings.Contains(s, "usage limit") ||
+		strings.Contains(s, "usage has been reached") ||
+		strings.Contains(s, "quota exceeded") ||
+		strings.Contains(s, "insufficient_quota")
 }
 
 // creditFailAlert handles a model run that died to an OpenRouter credit
 // failure. Without this hook the run ends with no message and the owner gets
-// the generic "done (no reply)" nudge — exactly what Zach saw when a 402 hit
-// mid-work. The alert DMs the owner directly, marks the run as replied so the
-// no-reply nudge is suppressed, and returns true. Non-credit errors return
-// false and keep the existing behavior.
+// the generic "done (no reply)" nudge. The alert DMs the owner directly,
+// marks the run as replied so the no-reply nudge is suppressed, and returns
+// true. Other failures are handled separately.
 func (b *Bridge) creditFailAlert(errMsg string) bool {
 	if !isCreditError(errMsg) {
 		return false
 	}
 	b.log("warning", "model run failed on OpenRouter credits: "+errMsg)
 	b.reply("⚠️ Out of OpenRouter credits — the run couldn't proceed. Top up at https://openrouter.ai/settings/credits (" + shortError(errMsg) + ")")
-	// Mark replied so the "done (no reply)" nudge is suppressed, and clear the
-	// in-run bookkeeping so settle can't fire a tail-retry or unanswered-hint
-	// prompt — a recovery prompt would just hit the same 402 again.
+	b.markModelFailureReported()
+	return true
+}
+
+// usageLimitFailAlert forwards hard subscription usage-limit errors to the
+// owner. Otherwise these failed runs look like unanswered work and end with
+// only the generic 🫡 acknowledgement.
+func (b *Bridge) usageLimitFailAlert(errMsg string) bool {
+	if !isUsageLimitError(errMsg) {
+		return false
+	}
+	b.log("warning", "model usage limit reached: "+errMsg)
+	b.reply(usageLimitErrorText(errMsg))
+	b.markModelFailureReported()
+	return true
+}
+
+func usageLimitErrorText(errMsg string) string {
+	return "⚠️ Model usage limit reached: " + shortError(errMsg)
+}
+
+// markModelFailureReported suppresses the generic no-reply/recovery path after
+// the provider error has already been relayed to XMPP.
+func (b *Bridge) markModelFailureReported() {
 	b.setReplied(true)
 	b.resetSendTracking()
 	b.markHintPending()
-	return true
 }
 
 // shortError trims a provider error string to one readable line.

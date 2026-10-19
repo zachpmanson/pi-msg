@@ -1363,6 +1363,7 @@ func TestIsCreditError(t *testing.T) {
 		{"This request requires more credits, or fewer max_tokens.", true},
 		{"402 insufficient balance", true},
 		{"you are out of credits", true},
+		{"insufficient_quota", false},
 		{"Request timed out.", false},
 		{"529 overloaded_error: Overloaded", false},
 		{"", false},
@@ -1414,9 +1415,57 @@ func TestCreditFailAlertOnMessageEnd(t *testing.T) {
 	}
 }
 
-// Non-credit run failures (timeout, overloaded) keep the existing behavior:
-// not marked replied, so the agent_settled nudge still applies.
-func TestNonCreditErrorUnchanged(t *testing.T) {
+func TestIsUsageLimitError(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"Codex error: The usage limit has been reached", true},
+		{"quota exceeded", true},
+		{"insufficient_quota", true},
+		{"429 rate limit; retry later", false},
+		{"Request timed out.", false},
+	}
+	for _, c := range cases {
+		if got := isUsageLimitError(c.in); got != c.want {
+			t.Errorf("isUsageLimitError(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestUsageLimitErrorText(t *testing.T) {
+	got := usageLimitErrorText("Codex error: The usage limit has been reached")
+	want := "⚠️ Model usage limit reached: Codex error: The usage limit has been reached"
+	if got != want {
+		t.Errorf("usageLimitErrorText = %q, want %q", got, want)
+	}
+}
+
+// A Codex subscription usage failure is forwarded to the owner instead of
+// falling through to the generic no-reply salute.
+func TestUsageLimitFailAlertOnMessageEnd(t *testing.T) {
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	b.setReplied(false)
+
+	ev := Event{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":         "assistant",
+			"content":      []any{},
+			"stopReason":   "error",
+			"errorMessage": "Codex error: The usage limit has been reached",
+		},
+	}
+	b.handleRPCEvent(ev)
+	if !b.replied() {
+		t.Error("usage-limited run should be marked replied so the no-reply salute is suppressed")
+	}
+}
+
+// Transient failures remain eligible for Pi's retries and existing no-reply
+// handling; only hard usage/quota limits are intercepted here.
+func TestTransientModelErrorUnchanged(t *testing.T) {
 	b := roomBridge()
 	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
 	b.setReplied(false)
@@ -1432,7 +1481,7 @@ func TestNonCreditErrorUnchanged(t *testing.T) {
 	}
 	b.handleRPCEvent(ev)
 	if b.replied() {
-		t.Error("non-credit error must not mark the run replied; the no-reply nudge should still apply")
+		t.Error("transient errors should not mark the run replied")
 	}
 }
 
