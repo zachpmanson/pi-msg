@@ -214,7 +214,8 @@ type CreditWatch struct {
 // Config is the on-disk config: an arbitrary number of named accounts.
 // "default" is used when no account is selected.
 type Config struct {
-	Accounts map[string]Account `json:"accounts"`
+	Accounts       map[string]Account `json:"accounts"`
+	AccountAliases map[string]string  `json:"accountAliases,omitempty"`
 }
 
 // ResolvedAccount is a fully-resolved account ready to connect with, defaults
@@ -672,6 +673,9 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Accounts == nil {
 		return nil, fmt.Errorf("pi-msg: config at %s must have an \"accounts\" object", path)
 	}
+	if err := validateAccountAliases(&cfg); err != nil {
+		return nil, fmt.Errorf("pi-msg: config at %s is invalid: %w", path, err)
+	}
 	return &cfg, nil
 }
 
@@ -694,23 +698,45 @@ func localpart(jid string) string {
 	return jid
 }
 
-// resolveAccount selects and validates an account. Selection order:
-// requested (if present in the file) -> "default". It returns a
-// human-readable error on any misconfiguration.
+// validateAccountAliases keeps aliases explicit and unambiguous: they point
+// directly to real accounts, cannot shadow accounts, and cannot form chains.
+func validateAccountAliases(cfg *Config) error {
+	for alias, target := range cfg.AccountAliases {
+		if strings.TrimSpace(alias) == "" {
+			return errors.New("pi-msg: account alias must not be blank")
+		}
+		if _, exists := cfg.Accounts[alias]; exists {
+			return fmt.Errorf("pi-msg: account alias %q conflicts with an account", alias)
+		}
+		if _, exists := cfg.Accounts[target]; !exists {
+			return fmt.Errorf("pi-msg: account alias %q refers to unknown account %q", alias, target)
+		}
+	}
+	return nil
+}
+
+// resolveAccount selects and validates an account. An empty request selects
+// "default"; an explicit request must name an account or a configured alias.
+// Unknown names never fall back to another account.
 func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 	if len(cfg.Accounts) == 0 {
 		return ResolvedAccount{}, errors.New("pi-msg: config has no accounts")
 	}
 
-	name := defaultAccount
-	if _, ok := cfg.Accounts[requested]; requested != "" && ok {
-		name = requested
+	if err := validateAccountAliases(cfg); err != nil {
+		return ResolvedAccount{}, err
+	}
+	name := requested
+	if name == "" {
+		name = defaultAccount
+	} else if target, ok := cfg.AccountAliases[name]; ok {
+		name = target
 	}
 	acct, ok := cfg.Accounts[name]
 	if !ok {
 		names := accountNames(cfg)
 		if requested != "" {
-			return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q not found and no %q account defined", requested, defaultAccount)
+			return ResolvedAccount{}, fmt.Errorf("pi-msg: unknown account %q (configured accounts: %s)", requested, strings.Join(names, ", "))
 		}
 		return ResolvedAccount{}, fmt.Errorf("pi-msg: no %q account defined (set PI_MSG_ACCOUNT to one of: %s)", defaultAccount, strings.Join(names, ", "))
 	}

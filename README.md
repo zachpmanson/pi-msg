@@ -103,8 +103,14 @@ Per-account fields:
 | `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic 🫡 unanswered-run reaction. e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
 | `mam` | no | `true` | MAM support; set `false` to disable archive backfill |
 
-Multiple accounts: add more keys under `accounts`; `default` is used unless you set
-`PI_MSG_ACCOUNT=<name>`. In 1:1 mode only the `owner` JID may drive the agent. Outbound chat is sent only by `send_message`; see [Messaging and Room Addressing](docs/routing.md).
+Multiple accounts: add more keys under `accounts`; `default` is used only when
+`PI_MSG_ACCOUNT` is unset or empty. An explicit unknown name is an error; it never
+falls back to `default`. For an intentional alternate name, add a top-level
+`"accountAliases": {"leader": "default"}` mapping. Aliases must point directly to
+existing accounts and cannot shadow account names or chain through other aliases.
+They retain the target account's canonical name for session/inbox state.
+
+In 1:1 mode only the `owner` JID may drive the agent. Outbound chat is sent only by `send_message`; see [Messaging and Room Addressing](docs/routing.md).
 
 ## Project layout
 
