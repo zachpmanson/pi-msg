@@ -90,7 +90,7 @@ Per-account fields:
 | `resource` | no | `pi-msg` | XMPP resource (client-session label) |
 | `model` | no | Pi's default | model pattern passed to `pi --model` |
 | `workdir` | no | current dir | working directory for the agent (also where Pi discovers `AGENTS.md`/`CLAUDE.md`) |
-| `rooms` | no | `[]` | group-chat rooms: objects with `jid`, `role`, `trigger`, and `reactions`; legacy `room` and `errorRoom` fields are rejected |
+| `rooms` | no | `[]` | MUC join list and allowlist; one or more objects with `jid`, `role`, `trigger`, and `reactions` ([example](#multiple-mucs-room-allowlist)); legacy `room` and `errorRoom` fields are rejected |
 | `nick` | no | JID localpart | occupant nickname used in the room(s) |
 | `roomTrigger` | no | `nick` | account-wide address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`); override per room |
 | `uploadService` | no | auto-probed | XEP-0363 upload component JID for file transfer (e.g. `upload.chat.example.com`) |
@@ -111,6 +111,49 @@ existing accounts and cannot shadow account names or chain through other aliases
 They retain the target account's canonical name for session/inbox state.
 
 In 1:1 mode only the `owner` JID may drive the agent. Outbound chat is sent only by `send_message`; see [Messaging and Room Addressing](docs/routing.md).
+
+### Multiple MUCs (room allowlist)
+
+Multiple MUCs are already supported per account. Add each room to that account's
+`rooms` array; there is no separate MUC whitelist setting and no need to enable
+`allowArbitraryJid`:
+
+```json
+{
+  "accounts": {
+    "default": {
+      "jid": "pi@chat.example.com",
+      "password": "super-secret",
+      "owner": "you@chat.example.com",
+      "nick": "pi",
+      "rooms": [
+        {"jid": "team@muc.chat.example.com"},
+        {"jid": "testing@muc.chat.example.com", "trigger": "tester", "reactions": true},
+        {"jid": "errors@muc.chat.example.com", "role": "error"}
+      ]
+    }
+  }
+}
+```
+
+- Every normal entry (no `role`, or `"role": "normal"`) is joined and allowed
+  for incoming groupchat, `send_message(to=<room>)`, and
+  `read_messages(target=<room>)`. Unlisted rooms are ignored inbound and denied
+  by the default send/read allowlists. Room addressing rules still apply; joining
+  several rooms does not deliver all their chatter to the agent.
+- `trigger` and `reactions` override `roomTrigger` and `roomReactions` for that
+  room only. Omit them to inherit the account defaults.
+- An optional `"role": "error"` entry is a **write-only bridge error sink**, not
+  a normal agent conversation: it is excluded from incoming dispatch and the
+  default agent send/read allowlists. At most one error room is allowed.
+- Use bare room JIDs, each listed once. A single-room account uses the same
+  format with just one object: `"rooms": [{"jid": "team@muc.chat.example.com"}]`.
+  Omit `rooms` (or use `[]`) for owner-DM-only operation.
+- Retired `"room": "…"`, `"rooms": ["…"]`, and `"errorRoom": "…"` spellings are
+  rejected with migration guidance, not silently ignored. Replace them with
+  the object-array format above; existing one-object configurations need no change.
+
+See [Messaging and Room Addressing](docs/routing.md) for addressing and tool rules.
 
 ## Project layout
 
