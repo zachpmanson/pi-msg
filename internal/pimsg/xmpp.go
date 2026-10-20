@@ -2151,9 +2151,11 @@ func (b *XMPPBridge) currentPresence() (show, status string) {
 // announces an away period once (awayAnnounced), so a reconnect that cleared it
 // would leave the room reading "listening" until the agent next worked. That is
 // not cosmetic — @free addresses only away agents (#130), so a cleared away
-// state silently puts the agent out of reach of the room.
+// state silently puts the agent out of reach of the room. Likewise dnd is live
+// runtime work (parent turn, process, or subagent), not socket state: preserve
+// it until the corresponding lifecycle update clears it.
 func reconnectPresence(show, status, startStatus string) (string, string) {
-	if show == "away" {
+	if show == "away" || show == "dnd" {
 		return show, status
 	}
 	return "", startStatus

@@ -1,6 +1,93 @@
 # Subagents for beltino (running under pi-msg / `pi --mode rpc`)
 
-Status: proposed · 2026-07-23
+## Presence integration
+
+Implemented for [zpm/pi-msg#155](https://github.com/zachpmanson/pi-msg/issues/155).
+The companion extension observes `subagent:async-started` and
+`subagent:async-complete` and reconciles structured `status.json` lifecycle
+artifacts every two seconds. This does **not** call an LLM, parse chat/tool
+output, or keep the parent's turn open. The installed pi-subagents 0.35.1 API
+has no structured fleet snapshot on its RPC status channel, so the adapter
+uses its existing artifact schema rather than scraping the formatted response.
+
+Visible behavior:
+
+- A settled parent with active children shows **dnd** and `working with N
+  subagents` (singular for one). Its `.busy` marker remains present, and idle
+  auto-reset/away is suppressed while children work.
+- Running steps from concurrent runs/parallel stages are summed. Pending future
+  chain stages are excluded; queued runs and between-stage transitions count
+  as one unit of work until running steps are available. This is a count of
+  top-level active child slots, not every nested descendant.
+- A running parent keeps its thinking/tool/retry label. Process counts are
+  independent; when both kinds of background work exist, both appear, e.g.
+  `working with 2 subagents; waiting on 1 process`.
+- Complete, failed, stopped, and **paused** runs do not count as active. Paused
+  work follows the existing notification/clarification flow, not a permanent
+  dnd state. The last child finishing starts a fresh idle period, unless a
+  parent turn or background process remains active.
+- No tasks, agent-supplied summaries, credentials, or child output enter presence:
+  the bridge receives only the absolute aggregate count.
+
+Ownership and cleanup:
+
+- Match the exact current `ctx.sessionManager.getSessionId()`; ignore unowned,
+  other-session, and nested artifacts. No persona-wide or global activity sum.
+- On Unix, startup/reload/resume re-seeds from pi-subagents' per-user artifact
+  root, `$TMPDIR/pi-subagents-uid-<uid>/async-subagent-runs` (the OS temp directory
+  is used when `TMPDIR` is unset). Live lifecycle events also supply artifact
+  directories. No pi-subagents installation or artifact root is required for
+  ordinary Pi usage: the count stays zero when absent. Non-Unix discovery is
+  limited to artifact directories received through lifecycle events.
+- A missing/deleted/malformed artifact clears its contribution until a valid
+  snapshot returns. A dead runner PID clears it even without a completion event;
+  a missing PID is tolerated only during the first second of bootstrap. A
+  started event with a live PID also bridges that first second before the
+  runner has written its initial status artifact. An
+  EPERM liveness result is not considered dead. As in pi-subagents' reconciler,
+  a live/reused PID with no status update for 24 hours no longer counts. This
+  observer never repairs, kills, or writes child artifacts.
+- Shutdown clears the count, unsubscribes handlers, cancels reconciliation,
+  and invalidates in-flight callbacks. Seeds are deferred past RPC bootstrap
+  (UI replies cannot be read during `session_start`). Count relays are serialized,
+  coalesced, timed out, and retried on the next snapshot if cancelled.
+- An XMPP reconnect preserves dnd/away and the current activity label; it does
+  not replace active work with a startup label. A Pi process restart re-seeds
+  from artifacts for the resumed session instead of trusting a stale busy file.
+
+Compatibility: this small read-only adapter targets the Unix-scoped artifact
+layout and `AsyncStatus` fields in the installed pi-subagents 0.35.1 source
+(`src/shared/types.ts`, `runs/background/async-execution.ts`, and
+`stale-run-reconciler.ts`). Recheck this contract when upgrading that plugin;
+if it gains a public structured lifecycle snapshot API, prefer it here.
+Foreground work is already covered by parent-turn busy state; detached paused
+foreground workers do not become background busy work merely because they can
+be resumed.
+
+Tests (no fleet restarts, deployment, XMPP credentials, or paid model calls):
+
+```sh
+nix develop --command make test-companion
+# Full Go suite; isolate busy-marker writes from real account state:
+tmp=$(mktemp -d)
+PI_MSG_CONFIG="$tmp/config.json" nix develop --command go test ./...
+rm -rf "$tmp"
+nix develop --command go vet ./...
+```
+
+The companion tests use mocked Pi hooks/bus/UI, a fake clock, and temporary
+lifecycle artifacts. Go tests cover marker aggregation, parent/process priority,
+idle cleanup, relay acknowledgement, and reconnect presence. Disposable XMPP
+droids are optional additional live verification; production agents must not be
+restarted to test this behavior.
+
+---
+
+## Historical adoption proposal (2026-07-23)
+
+The sections below document the original plugin decision, before background
+subagent presence was implemented. Statements about "no pi-msg change" refer
+to result delivery, not the presence integration above.
 
 ## Context
 

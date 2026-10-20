@@ -46,6 +46,7 @@
           packages = [
             pkgs.go
             pkgs.gopls
+            pkgs.nodejs_22
           ];
           shellHook = ''
             echo "pi-msg dev shell — $(go version)"
