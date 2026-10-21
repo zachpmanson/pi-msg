@@ -60,8 +60,8 @@ agent by name or `@name`; otherwise the receiver may not see it.
 
 ### Threading a reply
 
-`reply_to` is optional. Omit it for ordinary replies; provide a stanza ID (shown
-as `[stanza …]` in history or in an incoming prompt) when explicitly threading
+`reply_to` is optional. Omit it for ordinary replies, even when an incoming stanza ID is available.
+Provide a stanza ID (shown as `[stanza …]` in history or in an incoming prompt) when explicitly threading
 a reply or when threading materially helps associate a follow-up with a
 particular message. It adds an XEP-0461 reply stamp and must refer to a message
 in the same conversation as `to`. The ID must be present in live message history
