@@ -1795,8 +1795,8 @@ func (b *Bridge) handleExport(_ string) {
 }
 
 // sendRenderedFile uploads a locally-rendered file to the owner via XEP-0363
-// HTTP Upload, the same network round-trip path used by /dump. On failure it
-// falls back to sending the file content inline.
+// HTTP Upload, the same network round-trip path used by /dump. Upload failures
+// are reported without sending file content inline.
 func (b *Bridge) sendRenderedFile(name, path string) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -1837,8 +1837,8 @@ func (b *Bridge) dumpSession(arg string) {
 	}
 	// Dumps are transferred as an uploaded file (XEP-0363) rather than inline:
 	// huge inline code blocks trip the markdown renderer on chat clients
-	// (RenderLoopBoundary crash rendering /dump output). Falls back to inline
-	// if the upload path fails for any reason.
+	// (RenderLoopBoundary crash rendering /dump output) and can exceed the
+	// server's stanza limit. Upload failures never fall back to inline content.
 	table := strings.EqualFold(strings.TrimSpace(arg), "table") || strings.EqualFold(strings.TrimSpace(arg), "pretty")
 	content := raw
 	name := "session-" + b.acct.Name + "-raw.jsonl"
@@ -1867,9 +1867,10 @@ var uploadDumpFile = func(x *XMPPBridge, to, path string) (string, error) {
 // The destination is deliberately NOT the current turn's: a session dump or
 // export can contain 1:1 content, so it is never delivered to a MUC, even when
 // the command was typed in a room (owner decision, zpm/beltino#56). The upload
-// is a network round-trip, so it runs off the event loop; if it fails, the
-// content is sent inline instead (wrapped in a fence and split into
-// self-contained code blocks so it stays render-safe).
+// is a network round-trip, so it runs off the event loop. On failure, send
+// only a diagnostic: HTML/JSONL can contain enormous individual lines, so an
+// inline fallback risks exceeding the server's stanza limit and disconnecting
+// the account.
 func (b *Bridge) sendDumpFile(name string, content []byte) {
 	p := filepath.Join(os.TempDir(), fmt.Sprintf("pi-msg-%s-%d-%s", b.acct.Name, time.Now().UnixNano(), name))
 	if err := os.WriteFile(p, content, 0o600); err != nil {
@@ -1878,19 +1879,10 @@ func (b *Bridge) sendDumpFile(name string, content []byte) {
 	}
 	dest := b.acct.Owner
 	go func() {
+		defer os.Remove(p)
 		if _, err := uploadDumpFile(b.xmpp, dest, p); err != nil {
-			b.reply(fmt.Sprintf("⚠️ file upload failed (%v); sending inline", err))
-			inline := string(content)
-			if len(inline) <= maxBody {
-				b.reply(inline)
-			} else {
-				// Wrap in a fence and split into render-safe self-contained blocks.
-				for _, chunk := range splitPrettyDump("```\n" + inline + "\n```") {
-					b.reply(chunk)
-				}
-			}
+			b.reply(fmt.Sprintf("⚠️ file upload failed (%d bytes): %v. Not sending inline to avoid oversized XMPP stanzas; try a smaller export or share the file via a web link.", len(content), err))
 		}
-		_ = os.Remove(p)
 	}()
 }
 
