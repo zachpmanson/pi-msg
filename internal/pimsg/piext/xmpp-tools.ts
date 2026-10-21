@@ -23,6 +23,9 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Marks a confirm as a pi-msg action relay rather than a real user dialog.
 // Kept in sync with relayPrefix in extension.go.
@@ -32,12 +35,131 @@ const RELAY_PREFIX = "pi-msg-relay:";
 // the exact exported type name.
 type RelayUI = {
 	confirm(title: string, message?: string): Promise<boolean>;
-	select(title: string, options: string[]): Promise<string | undefined>;
+	select(title: string, options: string[], config?: { timeout: number }): Promise<string | undefined>;
 };
 
 export default function xmppTools(pi: ExtensionAPI) {
 	// Captured on session_start; used by tool handlers to reach pi-msg.
 	let ui: RelayUI | undefined;
+
+	// --- Subagent presence tracking ---
+	// pi-subagents publishes async-started/async-complete on the shared bus.
+	// Its RPC status API returns prose, not a structured fleet snapshot. Read
+	// its lifecycle artifacts instead (never prompts or tool output), using
+	// exact session ownership. A bounded reconciliation tick covers missed
+	// events, chain transitions, reloads, and runners killed without an event.
+	// This is read-only: the plugin remains responsible for repairing artifacts.
+	const scope = typeof process.getuid === "function" ? `uid-${process.getuid()}` : undefined;
+	const subagentRoot = scope ? join(tmpdir(), `pi-subagents-${scope}`, "async-subagent-runs") : undefined;
+	let subagentSession: string | undefined;
+	let subagentTimer: ReturnType<typeof setInterval> | undefined;
+	let subagentSeed: ReturnType<typeof setTimeout> | undefined;
+	let subagentEpoch = 0;
+	let subagentSending = false;
+	let subagentDirty = false;
+	let lastSubagentCount: number | undefined;
+	// Event paths also cover runs stored outside the default artifact root.
+	const subagentPaths = new Set<string>();
+	const subagentStarting = new Map<string, { pid: number; until: number }>();
+
+	function subagentCount(): number {
+		if (!subagentSession) return 0;
+		const paths = new Set(subagentPaths);
+		if (subagentRoot) {
+			try {
+				for (const dir of readdirSync(subagentRoot, { withFileTypes: true })) {
+					if (dir.isDirectory()) paths.add(join(subagentRoot, dir.name));
+				}
+			} catch { /* plugin absent, or no runs yet */ }
+		}
+		let count = 0;
+		for (const dir of paths) {
+			try {
+				const status = JSON.parse(readFileSync(join(dir, "status.json"), "utf8"));
+				subagentStarting.delete(dir);
+				if (status?.sessionId !== subagentSession || status.isNested === true) continue;
+				if (status.state !== "running" && status.state !== "queued") continue;
+				// Match pi-subagents' stale-alive-PID ceiling: a reused PID
+				// cannot keep an abandoned artifact busy forever.
+				const updated = status.lastUpdate ?? status.startedAt;
+				if (typeof updated !== "number" || Date.now() - updated > 86_400_000) continue;
+				// Missing PIDs get only the runner's bootstrap grace, never an
+				// indefinite busy state. EPERM means alive but not signalable.
+				if (Number.isInteger(status.pid) && status.pid > 0) {
+					try { process.kill(status.pid, 0); }
+					catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPERM") continue; }
+				} else if (!(typeof status.startedAt === "number" && Date.now() - status.startedAt < 1000)) {
+					continue;
+				}
+				const steps = Array.isArray(status.steps) ? status.steps : [];
+				const running = steps.filter((step: { status?: string } | null) => step?.status === "running").length;
+				// Pending future chain stages are not concurrent children. Keep
+				// one unit of work visible between stages/while queued.
+				count += Math.max(1, running);
+			} catch {
+				// The started event can precede the runner's first status write.
+				// Keep that work visible immediately, but only for bootstrap.
+				const starting = subagentStarting.get(dir);
+				if (starting && Date.now() < starting.until) {
+					try { process.kill(starting.pid, 0); count++; }
+					catch (error) { if ((error as NodeJS.ErrnoException).code === "EPERM") count++; }
+				} else {
+					subagentStarting.delete(dir);
+				}
+			}
+		}
+		return count;
+	}
+
+	async function refreshSubagents() {
+		if (!ui || !subagentSession) return;
+		subagentDirty = true;
+		if (subagentSending) return;
+		subagentSending = true;
+		const epoch = subagentEpoch;
+		try {
+			while (subagentDirty && ui && epoch === subagentEpoch) {
+				subagentDirty = false;
+				const count = subagentCount();
+				if (count === lastSubagentCount) continue;
+				const result = await relay("subagent_count", { count }, 1500);
+				if (epoch === subagentEpoch && result === "ok") lastSubagentCount = count;
+			}
+		} catch { /* retry on next lifecycle event/reconciliation tick */ }
+		finally { if (epoch === subagentEpoch) subagentSending = false; }
+	}
+
+	const subagentUnsubscribes = ["subagent:async-started", "subagent:async-complete"].map((event) =>
+		pi.events.on(event, (payload: unknown) => {
+			const info = payload as { sessionId?: string; asyncDir?: string; pid?: number } | null;
+			if (!subagentSession || !info || info.sessionId !== subagentSession) return;
+			if (typeof info.asyncDir === "string") {
+				subagentPaths.add(info.asyncDir);
+				if (event === "subagent:async-started" && typeof info.pid === "number" && Number.isInteger(info.pid) && info.pid > 0) {
+					subagentStarting.set(info.asyncDir, { pid: info.pid, until: Date.now() + 1000 });
+				} else {
+					subagentStarting.delete(info.asyncDir);
+				}
+			}
+			void refreshSubagents();
+		}),
+	);
+
+	pi.on("session_shutdown", () => {
+		subagentEpoch++;
+		if (subagentTimer) clearInterval(subagentTimer);
+		if (subagentSeed) clearTimeout(subagentSeed);
+		if (flushTimer) clearInterval(flushTimer);
+		flushTimer = undefined;
+		for (const id of [...heartbeatSched.keys()]) cancelHeartbeat(id);
+		for (const unsubscribe of subagentUnsubscribes) unsubscribe();
+		subagentPaths.clear();
+		subagentStarting.clear();
+		subagentSession = undefined;
+		// Send before dropping the old UI; don't block session replacement.
+		void relay("subagent_count", { count: 0 }, 1500).catch(() => {});
+		ui = undefined;
+	});
 
 	// --- Background-process presence tracking ---
 	//
@@ -300,6 +422,14 @@ export default function xmppTools(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		ui = ctx.ui as unknown as RelayUI;
+		subagentSession = ctx.sessionManager.getSessionId() ?? undefined;
+		subagentSending = false;
+		lastSubagentCount = undefined;
+		// Same bootstrap constraint as process counts: no dialog in this hook.
+		subagentSeed = setTimeout(() => {
+			void refreshSubagents();
+			subagentTimer = setInterval(() => void refreshSubagents(), 2000);
+		}, 2000);
 		// Deferred seed of the background-process count. This must NOT happen
 		// synchronously in the hook: pi's RPC mode attaches its stdin reader
 		// only after session_start hooks resolve, so blocking on a dialog
@@ -353,11 +483,11 @@ ${systemPrompt}`;
 
 	// relay hands an action to pi-msg and blocks for its string result: "ok" on
 	// success, or a failure reason that becomes the tool error the model sees.
-	async function relay(action: string, args: Record<string, unknown>): Promise<string> {
+	async function relay(action: string, args: Record<string, unknown>, timeout?: number): Promise<string> {
 		if (!ui) {
 			throw new Error("no relay channel to pi-msg (session not started)");
 		}
-		return (await ui.select(RELAY_PREFIX + JSON.stringify({ action, ...args }), ["ok"])) ?? "relay cancelled (no response from pi-msg)";
+		return (await ui.select(RELAY_PREFIX + JSON.stringify({ action, ...args }), ["ok"], timeout === undefined ? undefined : { timeout })) ?? "relay cancelled (no response from pi-msg)";
 	}
 
 	if (enabled.has("reaction")) {
@@ -406,26 +536,32 @@ ${systemPrompt}`;
 			name: "send_message",
 			label: "Send chat message (XMPP)",
 			description:
-				"Send a message explicitly to the owner, a joined room, or a known room occupant. Other valid JIDs are allowed only when account config `allowArbitraryJid` is true. Final assistant text is internal to the harness and is never sent automatically. `reply_to` is optional: omit it for ordinary replies; use a `[stanza …]` message ID when explicitly threading or when it materially helps associate a follow-up. Never use an archive `[id …]` cursor.",
+				"Send a message explicitly to the owner, a joined room, or a known room occupant. Other valid JIDs are allowed only when account config `allowArbitraryJid` is true. Final assistant text is internal to the harness and is never sent automatically. `reply_to` is optional: omit it for ordinary replies; use a `[stanza …]` message ID when explicitly threading or when it materially helps associate a follow-up. Never use an archive `[id …]` cursor. Set `reply_timeout_seconds` only to opt into a one-shot internal reminder when no qualifying reply arrives; omission creates no watch.",
 			promptSnippet: "Send a message to an XMPP conversation",
 			promptGuidelines: [
 				"Use send_message for every outbound chat message; a final assistant response is not delivered to chat.",
 				"Choose `to` from the conversation JID (`from:`) or sender JID (`sender:`); use the owner JID to message the owner.",
 				"Use `reply_to` when you want to thread a reply to a specific stanza or threading materially helps associate a follow-up; otherwise omit it. A message ID from read_messages is valid. Multiple recipients require multiple calls.",
+				"An optional positive finite `reply_timeout_seconds` arms a non-blocking bridge watch after sending. DMs from the peer satisfy it; rooms require a direct ping to you or a threaded reply to this stanza, not general chatter or broadcasts. The reminder may be handled silently. One watch per conversation; a later watched send replaces it. Watches are process-local and cleared on shutdown.",
 				"Only the owner, joined rooms, and known occupants are allowed by default. `allowArbitraryJid: true` permits other valid JIDs.",
 			],
 			parameters: Type.Object({
 				to: Type.String({ description: "Destination JID: owner, joined room, or known occupant; arbitrary JIDs require allowArbitraryJid=true" }),
 				text: Type.String({ description: "Message body to send" }),
 				reply_to: Type.Optional(Type.String({ description: "Optional stanza ID from an incoming message or read_messages result to thread this reply under" })),
+				reply_timeout_seconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Opt-in one-shot internal reminder if no qualifying reply arrives after this many seconds; omit for no watch" })),
 			}),
 			async execute(_toolCallId, params) {
-				const p = params as { to?: string; text?: string; reply_to?: string };
+				const p = params as { to?: string; text?: string; reply_to?: string; reply_timeout_seconds?: number };
 				const to = String(p.to ?? "").trim();
 				const text = String(p.text ?? "").trim();
 				if (!to) throw new Error("to is required");
 				if (to !== "noop" && !text) throw new Error("text is required");
-				const result = await relay("send_message", { to, text, replyTo: p.reply_to ?? "" });
+				const timeout = p.reply_timeout_seconds;
+				if (timeout !== undefined && (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0)) {
+					throw new Error("reply_timeout_seconds must be a finite positive number of seconds");
+				}
+				const result = await relay("send_message", { to, text, replyTo: p.reply_to ?? "", replyTimeoutSeconds: timeout });
 				if (result === "noop" && to === "noop") {
 					return { content: [{ type: "text", text: "No message sent." }], details: { to, result } };
 				}
@@ -434,8 +570,8 @@ ${systemPrompt}`;
 				}
 				const stanzaId = result.slice("sent:".length);
 				return {
-					content: [{ type: "text", text: `Sent to ${to} with stanza-id ${stanzaId}.` }],
-					details: { to, reply_to: p.reply_to ?? "", stanza_id: stanzaId, result },
+					content: [{ type: "text", text: `Sent to ${to} with stanza-id ${stanzaId}.` + (timeout === undefined ? "" : ` Reply watch active (${timeout} seconds).`) }],
+					details: { to, reply_to: p.reply_to ?? "", stanza_id: stanzaId, reply_timeout_seconds: timeout, reply_watch_active: timeout !== undefined, result },
 				};
 			},
 		});

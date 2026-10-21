@@ -24,8 +24,11 @@ import (
 // becomes pi commands, and pi's events update XMPP presence or send explicit
 // bridge notices.
 type Bridge struct {
-	acct  ResolvedAccount
-	debug bool
+	replyWatchMu   sync.Mutex
+	replyWatches   map[string]*replyWatch
+	replyWatchWake chan struct{}
+	acct           ResolvedAccount
+	debug          bool
 
 	xmpp *XMPPBridge
 	rpc  *RPCClient
@@ -127,6 +130,7 @@ type Bridge struct {
 	ranSinceStart     bool      // a run has started on this bridge (see freeForSummons)
 	lastAwayStatus    string    // the last pithy activity shown while away (skip repeats across periods)
 	bgProcesses       int       // background processes pi has running (relayed by the pi-processes extension)
+	bgSubagents       int       // active session-owned children, relayed as an absolute count
 	pendingHeartbeats []string  // long-running-process alarms queued while a run was in flight
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
@@ -219,7 +223,8 @@ func toolNames(acct ResolvedAccount) []string {
 
 // NewBridge constructs a bridge for the resolved account.
 func NewBridge(acct ResolvedAccount, debug bool) *Bridge {
-	return &Bridge{acct: acct, debug: debug}
+	return &Bridge{
+		replyWatchWake: make(chan struct{}, 1), acct: acct, debug: debug}
 }
 
 func (b *Bridge) log(level, msg string) {
@@ -232,9 +237,11 @@ func (b *Bridge) log(level, msg string) {
 // Run starts pi and the XMPP connection and drives the event loop until the
 // context is canceled or pi exits.
 func (b *Bridge) Run(ctx context.Context) error {
+	defer b.stopReplyWatches()
 	b.ctx = ctx
 
 	b.xmpp = NewXMPPBridge(b.acct, b.onInbound, b.log)
+	b.xmpp.onReplyMessage = b.observeReplyMessage
 	b.inbox = newInbox(inboxPath(b.acct.Name), b.log)
 
 	// A fresh or resumed bridge is idle until something prompts it — start the
@@ -387,6 +394,8 @@ func (b *Bridge) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			b.shutdown("interrupted (SIGINT/SIGTERM)")
 			return nil
+		case <-b.replyWatchWake:
+			b.flushReplyWatches()
 		case ev, ok := <-b.rpc.Events():
 			if !ok {
 				return b.onPiExit()
@@ -452,6 +461,7 @@ func (b *Bridge) shutdown(reason string) {
 	}
 	b.shuttingDown = true
 	b.mu.Unlock()
+	b.stopReplyWatches()
 	b.log("info", "shutting down: "+reason)
 	// Record the instant we go offline so the next launch's replay window can
 	// recover messages that arrive during the swap.
@@ -528,6 +538,9 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// settle's check would suppress a legitimate "done (no reply)" for a
 		// user-initiated run that genuinely went unanswered.
 		b.flushPendingHeartbeats()
+		if !recovering {
+			b.flushReplyWatches()
+		}
 	case "message_update":
 		b.handleStreamDelta(ev)
 	case "tool_execution_start":
@@ -624,7 +637,16 @@ func (b *Bridge) handleUIRequest(ev Event) {
 	}
 }
 
-func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
+func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string, timeoutArg ...json.RawMessage) {
+	var raw json.RawMessage
+	if len(timeoutArg) > 0 {
+		raw = timeoutArg[0]
+	}
+	timeout, seconds, err := parseReplyTimeout(raw)
+	if err != nil {
+		b.rpc.RespondUIRelay(id, "send_message: "+err.Error())
+		return
+	}
 	to = strings.TrimSpace(to)
 	if to == "noop" {
 		b.rpc.RespondUIRelay(id, "noop")
@@ -641,7 +663,7 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 	}
 	kind := b.xmpp.classifyMessageDest(to, b.acct.AllowArbitraryJid)
 	if kind == destBlocked {
-		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: %q is not an allowed destination", to))
+		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: %q is not an allowed destination; use the configured owner, a joined room, or a known room occupant. Other peer JIDs require allowArbitraryJid=true in the account configuration. No message was sent.", to))
 		return
 	}
 	var reply *replyTarget
@@ -662,6 +684,18 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 		}
 		reply = &replyTarget{author: entry.FromJID, id: replyToID}
 	}
+	// Serialize send + registration with fresh inbound observation. A reply
+	// received while the send is completing waits for registration, not lost.
+	b.replyWatchMu.Lock()
+	defer b.replyWatchMu.Unlock()
+	b.mu.Lock()
+	stopped := b.shuttingDown
+	b.mu.Unlock()
+	if stopped {
+		b.rpc.RespondUIRelay(id, "send_message: bridge is shutting down")
+		return
+	}
+	started := time.Now()
 	var stanzaID string
 	if kind == destRoom {
 		stanzaID = b.xmpp.SendRoomReply(bareJid(to), text, reply)
@@ -685,6 +719,9 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string) {
 		}
 		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message to %s failed: no stanza was sent", to))
 		return
+	}
+	if timeout > 0 {
+		b.armReplyWatch(to, stanzaID, text, kind == destRoom, started, timeout, seconds)
 	}
 	b.setReplied(true)
 	b.clearToolSinceDelivery()
@@ -913,6 +950,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		To           string             `json:"to"`
 		Text         string             `json:"text"`
 		ReplyTo      string             `json:"replyTo"`
+		ReplyTimeout json.RawMessage    `json:"replyTimeoutSeconds"`
 		Target       string             `json:"target"`
 		MessageID    string             `json:"messageId"`
 		From         string             `json:"from"`
@@ -987,7 +1025,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 			b.rpc.RespondUIRelay(id, url)
 		}()
 	case "send_message":
-		b.handleSendMessageRelay(id, cmd.To, cmd.Text, cmd.ReplyTo)
+		b.handleSendMessageRelay(id, cmd.To, cmd.Text, cmd.ReplyTo, cmd.ReplyTimeout)
 	case "read_messages":
 		b.handleReadMessagesRelay(id, cmd.Target, cmd.Limit, cmd.Since, cmd.Before)
 	case "process_count":
@@ -995,6 +1033,9 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		// pi-processes companion extension). While any run — or any background
 		// process — is in flight, the bot shows dnd instead of available.
 		b.setBgProcesses(cmd.ProcessCount)
+		b.rpc.RespondUIRelay(id, "ok")
+	case "subagent_count":
+		b.setBgSubagents(cmd.ProcessCount)
 		b.rpc.RespondUIRelay(id, "ok")
 	case "process_heartbeat":
 		// A long-running-process alarm from the companion extension (its
@@ -1643,6 +1684,13 @@ func (b *Bridge) handleCommand(t string) bool {
 	if t == "!" {
 		name = "interrupt"
 	}
+	// Local aborts do not emit agent_settled. Wake the event loop only after
+	// all control/session work is complete; flush also waits for onInbound's
+	// session-transition lock before delivering a pending timeout.
+	switch name {
+	case "new", "abort", "stop", "interrupt":
+		defer b.wakeReplyWatches()
+	}
 	switch name {
 	case "new":
 		if b.streaming() {
@@ -1751,8 +1799,8 @@ func (b *Bridge) handleExport(_ string) {
 }
 
 // sendRenderedFile uploads a locally-rendered file to the owner via XEP-0363
-// HTTP Upload, the same network round-trip path used by /dump. On failure it
-// falls back to sending the file content inline.
+// HTTP Upload, the same network round-trip path used by /dump. Upload failures
+// are reported without sending file content inline.
 func (b *Bridge) sendRenderedFile(name, path string) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -1793,8 +1841,8 @@ func (b *Bridge) dumpSession(arg string) {
 	}
 	// Dumps are transferred as an uploaded file (XEP-0363) rather than inline:
 	// huge inline code blocks trip the markdown renderer on chat clients
-	// (RenderLoopBoundary crash rendering /dump output). Falls back to inline
-	// if the upload path fails for any reason.
+	// (RenderLoopBoundary crash rendering /dump output) and can exceed the
+	// server's stanza limit. Upload failures never fall back to inline content.
 	table := strings.EqualFold(strings.TrimSpace(arg), "table") || strings.EqualFold(strings.TrimSpace(arg), "pretty")
 	content := raw
 	name := "session-" + b.acct.Name + "-raw.jsonl"
@@ -1823,9 +1871,10 @@ var uploadDumpFile = func(x *XMPPBridge, to, path string) (string, error) {
 // The destination is deliberately NOT the current turn's: a session dump or
 // export can contain 1:1 content, so it is never delivered to a MUC, even when
 // the command was typed in a room (owner decision, zpm/beltino#56). The upload
-// is a network round-trip, so it runs off the event loop; if it fails, the
-// content is sent inline instead (wrapped in a fence and split into
-// self-contained code blocks so it stays render-safe).
+// is a network round-trip, so it runs off the event loop. On failure, send
+// only a diagnostic: HTML/JSONL can contain enormous individual lines, so an
+// inline fallback risks exceeding the server's stanza limit and disconnecting
+// the account.
 func (b *Bridge) sendDumpFile(name string, content []byte) {
 	p := filepath.Join(os.TempDir(), fmt.Sprintf("pi-msg-%s-%d-%s", b.acct.Name, time.Now().UnixNano(), name))
 	if err := os.WriteFile(p, content, 0o600); err != nil {
@@ -1834,19 +1883,10 @@ func (b *Bridge) sendDumpFile(name string, content []byte) {
 	}
 	dest := b.acct.Owner
 	go func() {
+		defer os.Remove(p)
 		if _, err := uploadDumpFile(b.xmpp, dest, p); err != nil {
-			b.reply(fmt.Sprintf("⚠️ file upload failed (%v); sending inline", err))
-			inline := string(content)
-			if len(inline) <= maxBody {
-				b.reply(inline)
-			} else {
-				// Wrap in a fence and split into render-safe self-contained blocks.
-				for _, chunk := range splitPrettyDump("```\n" + inline + "\n```") {
-					b.reply(chunk)
-				}
-			}
+			b.reply(fmt.Sprintf("⚠️ file upload failed (%d bytes): %v. Not sending inline to avoid oversized XMPP stanzas; try a smaller export or share the file via a web link.", len(content), err))
 		}
-		_ = os.Remove(p)
 	}()
 }
 
@@ -2102,7 +2142,7 @@ func (b *Bridge) messagingContract() string {
 	if b.acct.AllowArbitraryJid {
 		allow = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable."
 	}
-	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?). Choose `to` from the incoming `from:` conversation JID, use `sender:` to DM a room participant, or use owner JID %s to message the owner. %s `reply_to` is optional: omit it for ordinary replies; use the complete `stanza-id:` when you explicitly want a threaded reply or threading materially helps associate a follow-up. Omit it for ordinary replies, even when an incoming stanza ID is available. It must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, adding `reply_to` only where useful. `read_messages(target, …)` reads room or 1:1 history and requires an explicit target; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
+	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?, reply_timeout_seconds?). Set reply_timeout_seconds to a finite positive number only when you want one internal reminder if no qualifying reply arrives; omission creates no watch. Choose `to` from the incoming `from:` conversation JID, use `sender:` to DM a room participant, or use owner JID %s to message the owner. %s `reply_to` is optional: omit it for ordinary replies; use the complete `stanza-id:` when you explicitly want a threaded reply or threading materially helps associate a follow-up. Omit it for ordinary replies, even when an incoming stanza ID is available. It must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, adding `reply_to` only where useful. `read_messages(target, …)` reads room or 1:1 history and requires an explicit target; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
@@ -3790,7 +3830,12 @@ func (b *Bridge) clearQueue() int {
 // agent_settled cleanup never fires. Idempotent and mutex-guarded, so it's safe
 // if a late agent_settled also arrives.
 func (b *Bridge) settleLocally() {
-	b.setStreaming(false)
+	b.mu.Lock()
+	b.heartbeatRun = false
+	b.volunteered = false
+	b.streamingRun = false
+	b.mu.Unlock()
+	b.syncBusyMarker()
 	b.markIdle()
 	b.announceSettledPresence()
 	b.setReactionAckRun(false)
@@ -3878,7 +3923,7 @@ func (b *Bridge) setBgProcesses(n int) {
 	}
 	changed := n != b.bgProcesses
 	b.bgProcesses = n
-	streaming := b.streamingRun
+	streaming, subagents := b.streamingRun, b.bgSubagents
 	b.mu.Unlock()
 	b.syncBusyMarker()
 	if !changed || b.xmpp == nil {
@@ -3887,20 +3932,58 @@ func (b *Bridge) setBgProcesses(n int) {
 	if streaming {
 		return // a run in flight already forces dnd with its own activity label
 	}
+	if n == 0 && subagents == 0 {
+		b.markIdle()
+	}
 	b.announceSettledPresence()
 }
 
-// announceSettledPresence sets the presence of an idle agent: available +
-// "listening", unless a background process is still running, which keeps the
-// bot dnd.
+// setBgSubagents uses absolute snapshots: ending one child cannot clear another.
+// Parent-turn labels always take priority over background activity.
+func (b *Bridge) setBgSubagents(n int) {
+	b.mu.Lock()
+	if n < 0 {
+		n = 0
+	}
+	changed := n != b.bgSubagents
+	b.bgSubagents = n
+	streaming, processes := b.streamingRun, b.bgProcesses
+	b.mu.Unlock()
+	b.syncBusyMarker()
+	if !changed || streaming {
+		return
+	}
+	if n == 0 && processes == 0 {
+		b.markIdle()
+	}
+	b.announceSettledPresence()
+}
+
+// announceSettledPresence restores background activity after a parent turn ends,
+// or listening when no work remains. No task text is exposed in presence.
 func (b *Bridge) announceSettledPresence() {
 	if b.xmpp == nil {
 		return
 	}
 	b.mu.Lock()
-	bg := b.bgProcesses
+	bg, children := b.bgProcesses, b.bgSubagents
 	b.mu.Unlock()
-	if bg > 0 {
+	if children > 0 {
+		b.markActive()
+		noun := "subagents"
+		if children == 1 {
+			noun = "subagent"
+		}
+		label := fmt.Sprintf("working with %d %s", children, noun)
+		if bg > 0 {
+			processNoun := "processes"
+			if bg == 1 {
+				processNoun = "process"
+			}
+			label += fmt.Sprintf("; waiting on %d %s", bg, processNoun)
+		}
+		b.xmpp.SetPresence("dnd", label)
+	} else if bg > 0 {
 		noun := "processes"
 		if bg == 1 {
 			noun = "process"
@@ -3995,7 +4078,7 @@ func (b *Bridge) idleTick() {
 	// Read streamingRun directly rather than via streaming(), which re-locks
 	// b.mu and would deadlock this goroutine against itself.
 	// Background processes keep the bot dnd (never drift to away mid-build).
-	if !idle || b.streamingRun || b.bgProcesses > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
+	if !idle || b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
 		b.mu.Unlock()
 		return
 	}
@@ -4182,12 +4265,12 @@ func (b *Bridge) setStreaming(v bool) {
 }
 
 // syncBusyMarker keeps the on-disk busy marker in step with the agent's real
-// state: the file is present while a run streams or a background process runs,
-// absent once the agent is idle. `deploy-service pi-msg --proactive` reads it
+// state: the file is present while a run streams, a background process runs,
+// or a session-owned subagent is active; absent once the agent is idle. `deploy-service pi-msg --proactive` reads it
 // to decide which accounts to reprompt on resume; an idle agent is left silent.
 func (b *Bridge) syncBusyMarker() {
 	b.mu.Lock()
-	busy := b.streamingRun || b.bgProcesses > 0
+	busy := b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0
 	changed := busy != b.busyMarked
 	b.busyMarked = busy
 	b.mu.Unlock()
