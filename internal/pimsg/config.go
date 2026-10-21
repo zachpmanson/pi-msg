@@ -395,8 +395,8 @@ func startDirectivePath(acct string) string {
 
 // busyMarkerPath returns the per-account busy marker, stored alongside the
 // session state as <config-dir>/<account>.busy. The file exists only while the
-// account has work in flight (a run streaming, or a background process
-// running). It is how `deploy-service pi-msg --proactive` tells which agents
+// account has work in flight (a run streaming, a background process,
+// or a session-owned subagent running). It is how `deploy-service pi-msg --proactive` tells which agents
 // were busy at deploy time: the operator CLI reprompts those and leaves the
 // idle rest silent.
 func busyMarkerPath(acct string) string {

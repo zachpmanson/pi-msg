@@ -130,6 +130,7 @@ type Bridge struct {
 	ranSinceStart     bool      // a run has started on this bridge (see freeForSummons)
 	lastAwayStatus    string    // the last pithy activity shown while away (skip repeats across periods)
 	bgProcesses       int       // background processes pi has running (relayed by the pi-processes extension)
+	bgSubagents       int       // active session-owned children, relayed as an absolute count
 	pendingHeartbeats []string  // long-running-process alarms queued while a run was in flight
 
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
@@ -1032,6 +1033,9 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		// pi-processes companion extension). While any run — or any background
 		// process — is in flight, the bot shows dnd instead of available.
 		b.setBgProcesses(cmd.ProcessCount)
+		b.rpc.RespondUIRelay(id, "ok")
+	case "subagent_count":
+		b.setBgSubagents(cmd.ProcessCount)
 		b.rpc.RespondUIRelay(id, "ok")
 	case "process_heartbeat":
 		// A long-running-process alarm from the companion extension (its
@@ -3919,7 +3923,7 @@ func (b *Bridge) setBgProcesses(n int) {
 	}
 	changed := n != b.bgProcesses
 	b.bgProcesses = n
-	streaming := b.streamingRun
+	streaming, subagents := b.streamingRun, b.bgSubagents
 	b.mu.Unlock()
 	b.syncBusyMarker()
 	if !changed || b.xmpp == nil {
@@ -3928,20 +3932,58 @@ func (b *Bridge) setBgProcesses(n int) {
 	if streaming {
 		return // a run in flight already forces dnd with its own activity label
 	}
+	if n == 0 && subagents == 0 {
+		b.markIdle()
+	}
 	b.announceSettledPresence()
 }
 
-// announceSettledPresence sets the presence of an idle agent: available +
-// "listening", unless a background process is still running, which keeps the
-// bot dnd.
+// setBgSubagents uses absolute snapshots: ending one child cannot clear another.
+// Parent-turn labels always take priority over background activity.
+func (b *Bridge) setBgSubagents(n int) {
+	b.mu.Lock()
+	if n < 0 {
+		n = 0
+	}
+	changed := n != b.bgSubagents
+	b.bgSubagents = n
+	streaming, processes := b.streamingRun, b.bgProcesses
+	b.mu.Unlock()
+	b.syncBusyMarker()
+	if !changed || streaming {
+		return
+	}
+	if n == 0 && processes == 0 {
+		b.markIdle()
+	}
+	b.announceSettledPresence()
+}
+
+// announceSettledPresence restores background activity after a parent turn ends,
+// or listening when no work remains. No task text is exposed in presence.
 func (b *Bridge) announceSettledPresence() {
 	if b.xmpp == nil {
 		return
 	}
 	b.mu.Lock()
-	bg := b.bgProcesses
+	bg, children := b.bgProcesses, b.bgSubagents
 	b.mu.Unlock()
-	if bg > 0 {
+	if children > 0 {
+		b.markActive()
+		noun := "subagents"
+		if children == 1 {
+			noun = "subagent"
+		}
+		label := fmt.Sprintf("working with %d %s", children, noun)
+		if bg > 0 {
+			processNoun := "processes"
+			if bg == 1 {
+				processNoun = "process"
+			}
+			label += fmt.Sprintf("; waiting on %d %s", bg, processNoun)
+		}
+		b.xmpp.SetPresence("dnd", label)
+	} else if bg > 0 {
 		noun := "processes"
 		if bg == 1 {
 			noun = "process"
@@ -4036,7 +4078,7 @@ func (b *Bridge) idleTick() {
 	// Read streamingRun directly rather than via streaming(), which re-locks
 	// b.mu and would deadlock this goroutine against itself.
 	// Background processes keep the bot dnd (never drift to away mid-build).
-	if !idle || b.streamingRun || b.bgProcesses > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
+	if !idle || b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
 		b.mu.Unlock()
 		return
 	}
@@ -4223,12 +4265,12 @@ func (b *Bridge) setStreaming(v bool) {
 }
 
 // syncBusyMarker keeps the on-disk busy marker in step with the agent's real
-// state: the file is present while a run streams or a background process runs,
-// absent once the agent is idle. `deploy-service pi-msg --proactive` reads it
+// state: the file is present while a run streams, a background process runs,
+// or a session-owned subagent is active; absent once the agent is idle. `deploy-service pi-msg --proactive` reads it
 // to decide which accounts to reprompt on resume; an idle agent is left silent.
 func (b *Bridge) syncBusyMarker() {
 	b.mu.Lock()
-	busy := b.streamingRun || b.bgProcesses > 0
+	busy := b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0
 	changed := busy != b.busyMarked
 	b.busyMarked = busy
 	b.mu.Unlock()

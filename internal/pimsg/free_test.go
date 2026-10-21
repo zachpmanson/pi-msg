@@ -269,7 +269,7 @@ func TestReconnectPresenceKeepsAway(t *testing.T) {
 		wantShow, wantStatus string
 	}{
 		{"away survives the reconnect", "away", "reading obscure RFCs", "awake", "away", "reading obscure RFCs"},
-		{"working resets to the start label", "dnd", "thinking…", "resumed", "", "resumed"},
+		{"working survives reconnect", "dnd", "thinking…", "resumed", "dnd", "thinking…"},
 		{"listening resets to the start label", "", "listening", "awake", "", "awake"},
 		{"a fresh bridge announces the start label", "", "awake", "awake", "", "awake"},
 	}

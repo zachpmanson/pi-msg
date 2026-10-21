@@ -1,10 +1,13 @@
-.PHONY: build typecheck clean format deploy e2e-replay
+.PHONY: build typecheck clean format deploy e2e-replay test-companion
 
 build:
 	go build -o pi-msg ./cmd/pi-msg
 
 typecheck:
 	go vet ./...
+
+test-companion:
+	node --test internal/pimsg/piext/*.test.mjs
 
 clean:
 	rm -f pi-msg

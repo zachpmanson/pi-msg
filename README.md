@@ -33,8 +33,19 @@ sequenceDiagram
 - MAM supported
 - File transfer (XEP-0363/0066)
 - Reactions (XEP-0444)
-- Presence updates
+- Presence updates, including active background subagents
 - Read receipts
+
+## Background work and presence
+
+With `pi-subagents` loaded, session-owned background children keep the account
+busy after the parent turn ends: XMPP shows **dnd**, `working with 1 subagent`
+(or a plural count). Concurrent children aggregate; future chain stages do not.
+Parent thinking/tool/retry labels take priority while a parent turn is active.
+Background processes remain visible alongside subagents. Once all work finishes,
+normal listening/away behavior returns. Only counts are published, never tasks,
+prompts, or child output. See [Subagent presence integration](docs/subagents.md#presence-integration)
+for lifecycle, cleanup, and compatibility details.
 
 ## Commands
 
@@ -132,7 +143,7 @@ nix run   github:zachpmanson/pi-msg    # run the bridge
 nix build github:zachpmanson/pi-msg    # build the package (bin: pi-msg)
 ```
 
-Dev shell (Go + gopls) via `nix develop`, or automatically with
+Dev shell (Go + gopls + Node.js for companion tests) via `nix develop`, or automatically with
 [direnv](https://direnv.net/) — the repo ships a `.envrc` (`use flake`); run
 `direnv allow` once.
 
