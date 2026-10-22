@@ -47,6 +47,11 @@ normal listening/away behavior returns. Only counts are published, never tasks,
 prompts, or child output. See [Subagent presence integration](docs/subagents.md#presence-integration)
 for lifecycle, cleanup, and compatibility details.
 
+With `pi-processes`, periodic process heartbeats default to ten minutes. An
+opt-in adapter adds `heartbeatSeconds` to `process start` (including `0` to
+disable periodic reports for that process without disabling exit/log notices).
+See [Process heartbeats](docs/process-heartbeats.md) for loading and compatibility.
+
 ## Commands
 
 Your chat messages → routed to Pi:
