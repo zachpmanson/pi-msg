@@ -21,11 +21,11 @@
 // Types are erased by jiti at load time, so the `import type` never resolves at
 // runtime; only the value import (`typebox`) is resolved, against Pi's own deps.
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 // Marks a confirm as a pi-msg action relay rather than a real user dialog.
 // Kept in sync with relayPrefix in extension.go.
@@ -152,6 +152,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 		if (flushTimer) clearInterval(flushTimer);
 		flushTimer = undefined;
 		for (const id of [...heartbeatSched.keys()]) cancelHeartbeat(id);
+		for (const unsubscribe of processUnsubscribes) unsubscribe();
 		for (const unsubscribe of subagentUnsubscribes) unsubscribe();
 		subagentPaths.clear();
 		subagentStarting.clear();
@@ -221,7 +222,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 		}
 	}
 
-	pi.events.on(PROCESS_STARTED, (info: unknown) => {
+	const processUnsubscribes = [pi.events.on(PROCESS_STARTED, (info: unknown) => {
 		void refreshProcessCount();
 		// Arm the per-process heartbeat schedule anchored to this process's
 		// start time (the payload is the full ProcessInfo incl. startTime).
@@ -229,30 +230,31 @@ export default function xmppTools(pi: ExtensionAPI) {
 		const startTime = (info as { startTime?: unknown })?.startTime;
 		if (id && typeof startTime === "number") {
 			cancelHeartbeat(id); // safety: never double-schedule an id
-			heartbeatSched.set(id, { startTime, boundary: 1 });
+			heartbeatSched.set(id, { startTime, intervalMs: HEARTBEAT_INTERVAL_MS, boundary: 1 });
 			scheduleNextBoundary(id);
 		}
-	});
+	}),
 	pi.events.on(PROCESS_ENDED, (info: unknown) => {
 		void refreshProcessCount();
 		// A process that ended must not fire a stale heartbeat, and its
 		// pending report (if any) is dropped with it.
 		const id = String((info as { id?: unknown })?.id ?? "");
 		if (id) cancelHeartbeat(id);
-	});
-	// processes:changed fires on clear/rename — anything that alters the list
-	// without a start/end (e.g. the agent clearing finished entries), so the
-	// presence corrects itself instead of staying dnd on a stale count. When
-	// the manager clears the whole registry (reason "cleared") we drop every
-	// pending schedule; on started/ended it just mirrors the events above and
-	// does nothing heartbeat-specific.
+	}),
+	// clear removes finished entries, not live processes. Reconcile only this
+	// snapshot so a concurrent start cannot lose its schedule.
 	pi.events.on(PROCESS_CHANGED, (payload: unknown) => {
 		void refreshProcessCount();
 		if ((payload as { reason?: unknown })?.reason === "cleared") {
-			for (const id of [...heartbeatSched.keys()]) cancelHeartbeat(id);
-			heartbeatDue.clear();
+			const snapshot = new Map(heartbeatSched);
+			void queryProcesses().then((processes) => {
+				const live = new Set(processes.filter((p) => LIVE_STATUSES.has(String(p.status))).map((p) => String(p.id)));
+				for (const [id, schedule] of snapshot) {
+					if (!live.has(id) && heartbeatSched.get(id) === schedule) cancelHeartbeat(id);
+				}
+			});
 		}
-	});
+	})];
 
 	// --- Long-running-process heartbeats ---
 	//
@@ -261,7 +263,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 	// once the agent has settled. Rather than a wall-clock poll (which misses a
 	// 12-min run, as discovered 2026-09-04), each process's heartbeat is
 	// *scheduled*: on processes:started we arm a timer at the 10-minute
-	// boundary after start, and re-arm on each fire (10m, 20m, 30m, …). Each
+	// boundary after start by default (overridable per start), and re-arm. Each
 	// timer just marks the process "due"; a short coalescing flusher drains
 	// everything that is due-and-live into a single relayed heartbeat, so N
 	// simultaneous boundaries collapse into one wakeup. The bridge decides
@@ -273,12 +275,13 @@ export default function xmppTools(pi: ExtensionAPI) {
 	const HEARTBEAT_TAIL_LINES = 40;
 
 	// Per-process scheduled boundary timers, keyed by process id. `boundary`
-	// is the next 10-minute boundary index to fire (1 = 10m after start); it
+	// is the next interval boundary index to fire (1 = one interval); it
 	// increments each time a boundary comes due so the cadence compounds for
 	// the life of the process.
 	interface HeartbeatSched {
 		startTime: number;
 		boundary: number;
+		intervalMs: number;
 		timer?: ReturnType<typeof setTimeout>;
 	}
 	const heartbeatSched = new Map<string, HeartbeatSched>();
@@ -287,16 +290,18 @@ export default function xmppTools(pi: ExtensionAPI) {
 	const heartbeatDue = new Set<string>();
 
 	// scheduleNextBoundary arms (or re-arms) the timer for a process's next
-	// 10-minute boundary, relative to its start time. On fire it marks the
+	// interval boundary, relative to its start time. On fire it marks the
 	// process due and schedules the following boundary.
 	function scheduleNextBoundary(id: string) {
 		const s = heartbeatSched.get(id);
 		if (!s) return;
-		const nextAt = s.startTime + s.boundary * HEARTBEAT_INTERVAL_MS;
+		const nextAt = s.startTime + s.boundary * s.intervalMs;
 		const delay = Math.max(0, nextAt - Date.now());
 		s.timer = setTimeout(() => {
+			if (heartbeatSched.get(id) !== s) return;
 			heartbeatDue.add(id);
-			s.boundary += 1;
+			// Skip missed boundaries after event-loop stalls, keeping the anchor.
+			s.boundary = Math.max(s.boundary + 1, Math.floor((Date.now() - s.startTime) / s.intervalMs) + 1);
 			scheduleNextBoundary(id); // arm the next boundary
 		}, delay);
 	}
@@ -308,6 +313,77 @@ export default function xmppTools(pi: ExtensionAPI) {
 		if (s?.timer) clearTimeout(s.timer);
 		heartbeatSched.delete(id);
 		heartbeatDue.delete(id);
+	}
+
+	// Opt-in seam: initialize the original factory once and intercept its full
+	// ToolDefinition. getAllTools() is metadata; command:start is not the tool.
+	async function installProcessAdapter(entry: string): Promise<void> {
+		if (!isAbsolute(entry)) throw new Error("PI_MSG_PROCESS_EXTENSION must be an absolute primary extension entry path");
+		const module = await import(entry);
+		if (typeof module.default !== "function") throw new Error("PI_MSG_PROCESS_EXTENSION must export a default extension factory");
+		let registered = false;
+		const adapter = new Proxy(pi, {
+			get(target, property) {
+				if (property !== "registerTool") return Reflect.get(target, property, target);
+				return (tool: ToolDefinition) => {
+					if (tool.name !== "process") return target.registerTool(tool);
+					if (registered) throw new Error("upstream registered process more than once");
+					if (tool.parameters.type !== "object" || !tool.parameters.properties) {
+						throw new Error("unsupported upstream process schema: expected a top-level object");
+					}
+					registered = true;
+					const maxSeconds = Math.floor(2_147_483_647 / 1000);
+					target.registerTool({
+						...tool,
+						parameters: {
+							...tool.parameters,
+							properties: {
+								...tool.parameters.properties,
+								heartbeatSeconds: Type.Optional(Type.Integer({
+									minimum: 0, maximum: maxSeconds,
+									description: "Only for start: periodic pi-msg heartbeat seconds. Omit for the environment/default interval; 0 disables periodic heartbeats only. Exit and log-match notifications are unchanged.",
+								})),
+							},
+						},
+						async execute(...args) {
+							const params = args[1] as Record<string, unknown>;
+							const explicit = Object.prototype.hasOwnProperty.call(params, "heartbeatSeconds");
+							const seconds = params.heartbeatSeconds;
+							if (explicit) {
+								if (params.action !== "start") throw new Error("heartbeatSeconds is supported only for process start");
+								if (typeof seconds !== "number" || !Number.isInteger(seconds) || seconds < 0 || seconds > maxSeconds) {
+									throw new Error(`heartbeatSeconds must be an integer from 0 to ${maxSeconds}`);
+								}
+								// Strip only our field; forward every other argument unchanged.
+								const { heartbeatSeconds: _, ...upstreamParams } = params;
+								args[1] = upstreamParams;
+							}
+							const result = await tool.execute.apply(this, args);
+							if (explicit) {
+								const id = String((result.details as { process?: { id?: unknown } } | undefined)?.process?.id ?? "");
+								const schedule = heartbeatSched.get(id);
+								// ended/shutdown can precede this resolution. Never resurrect
+								// a removed schedule from a stale successful start result.
+								if (schedule) {
+									cancelHeartbeat(id);
+									if (seconds !== 0) {
+										const intervalMs = (seconds as number) * 1000;
+										heartbeatSched.set(id, {
+											startTime: schedule.startTime, intervalMs,
+											boundary: Math.floor(Math.max(0, Date.now() - schedule.startTime) / intervalMs) + 1,
+										});
+										scheduleNextBoundary(id);
+									}
+								}
+							}
+							return result;
+						},
+					});
+				};
+			},
+		});
+		await module.default(adapter);
+		if (!registered) throw new Error("upstream factory did not register the process tool");
 	}
 
 	// queryProcesses asks the pi-processes manager for the full process list
@@ -374,11 +450,20 @@ export default function xmppTools(pi: ExtensionAPI) {
 	// flush and is still live. Due-but-ended processes are dropped (their
 	// cancel on ended already removed them, so this is a belt-and-braces
 	// liveness check against the authoritative manager).
+	let heartbeatFlushing = false;
 	async function flushHeartbeats() {
-		if (!ui) return;
+		if (!ui || heartbeatFlushing) return;
 		if (heartbeatDue.size === 0) return;
+		heartbeatFlushing = true;
+		const epoch = subagentEpoch;
+		// Snapshot generations and drain before any await. A later boundary
+		// belongs to the next flush, and a replacement is not due merely
+		// because its predecessor was in this batch.
+		const due = [...heartbeatDue].map((id) => ({ id, schedule: heartbeatSched.get(id) }));
+		for (const { id } of due) heartbeatDue.delete(id);
 		try {
 			const processes = await queryProcesses();
+			if (epoch !== subagentEpoch) return;
 			const now = Date.now();
 			const byId = new Map<string, Record<string, unknown>>();
 			for (const p of processes) {
@@ -388,25 +473,30 @@ export default function xmppTools(pi: ExtensionAPI) {
 				}
 			}
 			const reports: Array<Record<string, unknown>> = [];
-			for (const id of heartbeatDue) {
-				heartbeatDue.delete(id); // drain: each due mark is relayed at most once
+			const reportedSchedules = new Map<string, HeartbeatSched>();
+			for (const { id, schedule } of due) {
+				if (!schedule || heartbeatSched.get(id) !== schedule) continue;
 				const p = byId.get(id);
-				if (!p) continue;
+				if (!p) { cancelHeartbeat(id); continue; }
+				const tail = await fetchProcessTail(id);
+				if (!schedule || heartbeatSched.get(id) !== schedule || epoch !== subagentEpoch) continue;
 				const startTime = p.startTime;
 				const elapsedMs = typeof startTime === "number" ? now - startTime : 0;
+				reportedSchedules.set(id, schedule);
 				reports.push({
 					id,
 					name: String(p.name ?? id),
 					command: String(p.command ?? ""),
 					elapsedSecs: Math.round(elapsedMs / 1000),
-					tail: await fetchProcessTail(id),
+					tail,
 				});
 			}
-			if (reports.length === 0) return;
-			await relay("process_heartbeat", { processes: reports });
+			const liveReports = reports.filter((p) => heartbeatSched.get(String(p.id)) === reportedSchedules.get(String(p.id)));
+			if (liveReports.length === 0 || epoch !== subagentEpoch) return;
+			await relay("process_heartbeat", { processes: liveReports });
 		} catch {
 			// Best-effort: a dropped heartbeat is just a missed status check.
-		}
+		} finally { heartbeatFlushing = false; }
 	}
 
 	// The coalescing flusher interval. Registered at session_start: setInterval
@@ -665,4 +755,7 @@ ${systemPrompt}`;
 			},
 		});
 	}
+	const processEntry = process.env.PI_MSG_PROCESS_EXTENSION;
+	if (processEntry) return installProcessAdapter(processEntry);
+
 }
