@@ -34,6 +34,7 @@ sequenceDiagram
 - File transfer (XEP-0363/0066)
 - Reactions (XEP-0444)
 - Presence updates, including active background subagents
+- Last Activity (XEP-0012) online-resource idle-time responses ([privacy and usage](docs/last-activity.md))
 - Read receipts
 
 ## Background work and presence
@@ -118,6 +119,7 @@ Per-account fields:
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
 | `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic 🫡 unanswered-run reaction. e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
 | `mam` | no | `true` | MAM support; set `false` to disable archive backfill |
+| `lastActivity` | no | `true` | XEP-0012 online-resource idle-time responses; set `false` to reply with `service-unavailable` instead |
 
 Multiple accounts: add more keys under `accounts`; `default` is used only when
 `PI_MSG_ACCOUNT` is unset or empty. An explicit unknown name is an error; it never

@@ -200,6 +200,9 @@ type Account struct {
 	// without one the bridge logs a warning and falls back to the existing
 	// delay-stanza replay, so enabling it can't break a server that lacks MAM.
 	MAM *bool `json:"mam,omitempty"`
+	// LastActivity controls XEP-0012 idle-time responses from this resource.
+	// Enabled by default; false returns service-unavailable without idle data.
+	LastActivity *bool `json:"lastActivity,omitempty"`
 }
 
 // CreditWatch configures the on-\/new OpenRouter credit report.
@@ -252,6 +255,7 @@ type ResolvedAccount struct {
 	ErrorRoom            string
 	MinCreditUsd         float64
 	MAM                  bool
+	LastActivity         bool
 }
 
 // RoomMode reports whether this account operates in MUC (group-chat) mode.
@@ -833,6 +837,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		ErrorRoom:            errorRoom,
 		MinCreditUsd:         maxCreditUsd(acct.CreditWatch),
 		MAM:                  acct.MAM == nil || *acct.MAM,
+		LastActivity:         acct.LastActivity == nil || *acct.LastActivity,
 	}, nil
 }
 
