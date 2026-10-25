@@ -109,6 +109,7 @@ var discoFeatures = []string{
 	"http://jabber.org/protocol/caps",
 	chatStatesNS,
 	discoInfoNS,
+	lastActivityNS,
 	"http://jabber.org/protocol/muc",
 	"urn:xmpp:chat-markers:0",
 	"urn:xmpp:http:upload:0",
@@ -1056,6 +1057,9 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 		toks, err := xmlstream.ReadAll(t)
 		if err != nil {
 			return err
+		}
+		if hasLastActivityQuery(toks) {
+			return b.encodeLastActivity(attr(start.Attr, "from"), attr(start.Attr, "id"), attr(start.Attr, "type"))
 		}
 		// Answer XEP-0199 ping requests so a server/peer keepalive sees us as
 		// alive. (Responses to our own pings are correlated by the session
