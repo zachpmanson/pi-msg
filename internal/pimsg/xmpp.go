@@ -374,7 +374,7 @@ type XMPPBridge struct {
 	seenOrder []string
 
 	// MUC occupant tracking (room mode), keyed by room bare JID.
-	occupants map[string]map[string]string // roomBare -> nick -> bare real JID
+	occupants map[string]map[string]string // roomBare -> nick -> bare real JID (empty for anonymous occupants)
 	selfNick  map[string]string            // roomBare -> our nick (per status code 110)
 
 	uploadMu  sync.Mutex
@@ -1303,6 +1303,11 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 	ptype := attr(start.Attr, "type")
 
 	if room := bareJid(from); b.isRoomJID(room) {
+		// Only available/unavailable presence describes room membership. Join
+		// errors and subscription/probe traffic must not invent mention targets.
+		if ptype != "" && ptype != string(stanza.UnavailablePresence) {
+			return nil
+		}
 		nick := resourcepart(from)
 		if nick == "" {
 			return nil
@@ -1323,7 +1328,7 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 		}
 		if ptype == "unavailable" {
 			delete(b.occupants[room], nick)
-		} else if real != "" {
+		} else {
 			b.occupants[room][nick] = real
 		}
 		b.mu.Unlock()
@@ -1528,13 +1533,12 @@ type destKind int
 const (
 	destBlocked destKind = iota // not permitted (unknown JID)
 	destRoom                    // a joined MUC → groupchat
-	destUser                    // owner or a known room occupant → 1:1 chat
+	destUser                    // configured owner → 1:1 chat
 )
 
 // classifyDest decides how (and whether) to deliver a reply the agent addressed
-// to an explicit JID. Rooms the bridge has joined get groupchat; the owner and
-// real JIDs currently seen in a room get 1:1 chat; anything else is refused, so
-// the agent can't message arbitrary users on the server.
+// to an explicit JID. Configured rooms get groupchat and the owner gets 1:1
+// chat. Room membership only supplies mention targets, never DM permission.
 func (b *XMPPBridge) classifyDest(dest string) destKind {
 	bare := bareJid(dest)
 	switch {
@@ -1542,7 +1546,7 @@ func (b *XMPPBridge) classifyDest(dest string) destKind {
 		return destBlocked
 	case b.isRoomJID(bare):
 		return destRoom
-	case bare == b.ownerBare, b.isOccupant(bare):
+	case bare == b.ownerBare:
 		return destUser
 	default:
 		return destBlocked
@@ -1564,52 +1568,40 @@ func (b *XMPPBridge) classifyMessageDest(dest string, allowArbitrary bool) destK
 	return destUser
 }
 
-// allowedMessageJIDs snapshots the concrete destinations accepted by classifyDest.
-// Occupants are live presence data, not archived senders or room nicknames.
-func (b *XMPPBridge) allowedMessageJIDs() []string {
+// messageDestinationGuidance keeps authorized destinations separate from room
+// mention targets. Only configured rooms contribute nicknames; real occupant
+// JIDs and archived senders never expand the destination allowlist.
+func (b *XMPPBridge) messageDestinationGuidance() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	allowed := make(map[string]bool)
+	users := []string{}
 	if b.ownerBare != "" {
-		allowed[b.ownerBare] = true
+		users = append(users, b.ownerBare)
 	}
+	rooms := []string{}
 	for room, joined := range b.roomBares {
 		if joined && room != "" {
-			allowed[room] = true
+			rooms = append(rooms, room)
 		}
 	}
-	for _, occupants := range b.occupants {
-		for _, real := range occupants {
-			if real != "" {
-				allowed[real] = true
+	sort.Strings(rooms)
+	members := make([]string, 0, len(rooms))
+	for _, room := range rooms {
+		nicks := []string{}
+		for nick := range b.occupants[room] {
+			if nick != "" {
+				nicks = append(nicks, nick)
 			}
 		}
+		sort.Strings(nicks)
+		members = append(members, fmt.Sprintf("%q: %q", room, nicks))
 	}
-	jids := make([]string, 0, len(allowed))
-	for dest := range allowed {
-		jids = append(jids, dest)
-	}
-	sort.Strings(jids)
-	return jids
+	return fmt.Sprintf("Allowed 1:1 JIDs: %q. Allowed room JIDs: %q. Room-scoped members/mention names (NOT DM destinations): [%s]. Send to the room JID and mention the member in text.", users, rooms, strings.Join(members, "; "))
 }
 
 // isRoomJID reports whether bare is one of the rooms the bridge has joined.
 func (b *XMPPBridge) isRoomJID(bare string) bool {
 	return b.roomBares[bare]
-}
-
-// isOccupant reports whether bare is a real JID currently tracked in any room.
-func (b *XMPPBridge) isOccupant(bare string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, occ := range b.occupants {
-		for _, real := range occ {
-			if real == bare {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // SetStartupStatus sets the presence <status> label announced on (re)connect,

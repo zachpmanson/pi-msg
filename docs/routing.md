@@ -46,21 +46,33 @@ timeout, and suggests checking history before deciding whether to follow up.
 Silence is valid: expiry never sends a chat message automatically. Watches
 survive reconnects but are process-local and discarded on shutdown.
 
-By default, `to` must be the owner, a configured room, or a known occupant of a
-configured room. A configured room is an allowed groupchat destination only
-while configured; room membership is not bypassed by the arbitrary-JID option.
+By default, `to` must be the configured owner (1:1 chat) or a configured normal
+room (groupchat). Room members are **only mention targets within their room**;
+knowing a member's real JID does not authorize a DM or file transfer to them.
+`send_file` uses this same owner/room allowlist, without arbitrary-JID opt-in.
+A configured room is an allowed groupchat destination only while configured;
+room membership is not bypassed by the arbitrary-JID option.
 `allowArbitraryJid` is `false` by default. When enabled, it permits other
-syntactically valid JIDs as peer destinations. It does not add unconfigured
-rooms to the set of joined rooms. A denied destination fails the tool call
-without sending a stanza. The error lists the actual allowed bare JIDs for the
-active account (owner, configured rooms, and currently known occupants), sorted
-and deduplicated, and reports whether `allowArbitraryJid` is enabled. Archived
-senders and anonymous room nicknames do not expand that list.
+syntactically valid JIDs as peer destinations for `send_message`. It does not
+add unconfigured rooms to the set of joined rooms. A denied destination fails
+the tool call without sending a stanza, typing state, or reply watch. The error
+reports whether `allowArbitraryJid` is enabled and separates these labelled,
+stably sorted categories:
 
-Choose the destination from the incoming `from:` conversation JID, use
-`sender:` to DM a participant in a room, or use the configured owner JID to
-message the owner. A room reply intended for another agent must address that
-agent by name or `@name`; otherwise the receiver may not see it.
+- **Allowed 1:1 JIDs**: the configured owner's bare JID.
+- **Allowed room JIDs**: configured normal room bare JIDs.
+- **Room-scoped members/mention names (NOT DM destinations)**: current nicknames
+  grouped by room JID, including anonymous members without a known real JID.
+
+Room departures and reconnects change only the live mention names, never the
+owner/room permissions. The write-only error room, unconfigured rooms, and
+archived senders do not contribute destinations or mention names.
+
+Choose the destination from the incoming `from:` conversation JID, or use the
+configured owner JID to message the owner. `sender:` identifies the author;
+it is **not** authorization to DM a room participant. To address a member,
+**send to the room JID and mention the member in text** by name or `@name`;
+otherwise the receiver may not see it.
 
 ### Threading a reply
 

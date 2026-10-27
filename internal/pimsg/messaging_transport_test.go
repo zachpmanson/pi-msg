@@ -42,7 +42,10 @@ func TestSendMessageDestinationTransport(t *testing.T) {
 		{name: "owner", to: "zach@x", typ: "chat"},
 		{name: "owner resource", to: "zach@x/phone", typ: "chat"},
 		{name: "joined room", to: "team@muc.x", typ: "groupchat"},
-		{name: "known occupant", to: "alice@x", typ: "chat"},
+		{name: "known occupant", to: "alice@x"},
+		{name: "known occupant resource", to: "alice@x/phone"},
+		{name: "opted in occupant", to: "alice@x", typ: "chat", arbitrary: true},
+		{name: "opted in occupant resource", to: "alice@x/phone", typ: "chat", arbitrary: true},
 		{name: "opted in peer", to: "stranger@x", typ: "chat", arbitrary: true},
 		{name: "opted in peer resource", to: "stranger@x/phone", typ: "chat", arbitrary: true},
 		{name: "invalid JID with arbitrary access", to: "bad jid", arbitrary: true},
@@ -72,13 +75,13 @@ func TestSendMessageDestinationTransport(t *testing.T) {
 				if tt.arbitrary {
 					policy = "allowArbitraryJid=true: other syntactically valid peer JIDs are also permitted."
 				}
-				for _, hint := range []string{"not an allowed destination", `Allowed JIDs (configured owner, joined rooms, known room occupants): ["alice@x" "team@muc.x" "zach@x"].`, policy, "No message was sent."} {
+				for _, hint := range []string{"not an allowed destination", `Allowed 1:1 JIDs: ["zach@x"].`, `Allowed room JIDs: ["team@muc.x"].`, `Room-scoped members/mention names (NOT DM destinations): ["team@muc.x": ["alice"]].`, "Send to the room JID and mention the member in text.", policy, "No message was sent."} {
 					if !strings.Contains(response.Value, hint) {
 						t.Errorf("rejection missing %q: %s", hint, response.Value)
 					}
 				}
-				if b.replied() {
-					t.Fatal("rejection counted as delivery")
+				if b.replied() || b.runDeliveries != 0 || len(b.replyWatches) != 0 {
+					t.Fatal("rejection counted as delivery or armed a watch")
 				}
 				return
 			}
@@ -122,23 +125,51 @@ func TestSendMessageDestinationTransport(t *testing.T) {
 }
 
 func TestBlockedSendMessageStreamDoesNotSendTyping(t *testing.T) {
-	b, wire, rpc := messageTransportBridge(t, false)
-	partial := map[string]any{"content": []any{map[string]any{
-		"type": "toolCall", "id": "call-1", "name": "send_message", "arguments": map[string]any{},
-	}}}
-	b.handleStreamDelta(streamDelta(map[string]any{
-		"type": "toolcall_start", "contentIndex": float64(0), "partial": partial,
-	}))
-	b.handleStreamDelta(streamDelta(map[string]any{
-		"type": "toolcall_delta", "contentIndex": float64(0),
-		"delta": `{"to":"stranger@x","text":"hello"}`, "partial": partial,
-	}))
-	if b.streamToolCalls[0].started || wire.Len() != 0 {
-		t.Fatalf("blocked streamed destination triggered typing: %s", wire.String())
+	for _, to := range []string{"stranger@x", "alice@x", "alice@x/phone"} {
+		t.Run(to, func(t *testing.T) {
+			b, wire, rpc := messageTransportBridge(t, false)
+			partial := map[string]any{"content": []any{map[string]any{
+				"type": "toolCall", "id": "call-1", "name": "send_message", "arguments": map[string]any{},
+			}}}
+			b.handleStreamDelta(streamDelta(map[string]any{
+				"type": "toolcall_start", "contentIndex": float64(0), "partial": partial,
+			}))
+			b.handleStreamDelta(streamDelta(map[string]any{
+				"type": "toolcall_delta", "contentIndex": float64(0),
+				"delta": `{"to":"` + to + `","text":"hello"}`, "partial": partial,
+			}))
+			if b.streamToolCalls[0].started || wire.Len() != 0 {
+				t.Fatalf("blocked streamed destination triggered typing: %s", wire.String())
+			}
+			// Authorization must precede reply lookup and every delivery side effect.
+			b.handleToolRelay("r1", `{"action":"send_message","to":"`+to+`","text":"hello","replyTo":"missing-stanza","replyTimeoutSeconds":30}`)
+			if wire.Len() != 0 || b.replied() || b.runDeliveries != 0 || len(b.replyWatches) != 0 || !strings.Contains(rpc.String(), "not an allowed destination") || strings.Contains(rpc.String(), "not in message history") {
+				t.Fatalf("blocked relay attempted delivery, watch or reply lookup: wire=%s rpc=%s", wire.String(), rpc.String())
+			}
+		})
 	}
-	// Authorization must also precede reply lookup and any delivery side effects.
-	b.handleToolRelay("r1", `{"action":"send_message","to":"stranger@x","text":"hello","replyTo":"missing-stanza"}`)
-	if wire.Len() != 0 || b.replied() || !strings.Contains(rpc.String(), "not an allowed destination") {
-		t.Fatalf("blocked relay attempted delivery or reply lookup: wire=%s rpc=%s", wire.String(), rpc.String())
+}
+
+func TestRoomMemberMentionUsesGroupchat(t *testing.T) {
+	b, wire, rpc := messageTransportBridge(t, false)
+	b.handleToolRelay("r1", `{"action":"send_message","to":"team@muc.x","text":"@alice hello"}`)
+	if !strings.Contains(rpc.String(), `"value":"sent:`) || !b.replied() || b.runDeliveries != 1 {
+		t.Fatalf("room mention was not delivered: %s", rpc.String())
+	}
+	var msg struct {
+		XMLName xml.Name
+		To      string `xml:"to,attr"`
+		Type    string `xml:"type,attr"`
+		Body    string `xml:"body"`
+	}
+	decoder := xml.NewDecoder(bytes.NewReader(wire.Bytes()))
+	if err := decoder.Decode(&msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.XMLName.Local != "message" || msg.To != "team@muc.x" || msg.Type != "groupchat" || msg.Body != "@alice hello" {
+		t.Fatalf("unexpected room mention stanza: %+v", msg)
+	}
+	if err := decoder.Decode(&msg); err != io.EOF {
+		t.Fatalf("room mention sent extra stanzas (including typing): %s; %v", wire.String(), err)
 	}
 }
