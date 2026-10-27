@@ -2,6 +2,7 @@ package pimsg
 
 import (
 	"bytes"
+	"encoding/xml"
 	"strings"
 	"sync"
 	"testing"
@@ -23,10 +24,11 @@ func TestDefaultMessageDestinationPolicy(t *testing.T) {
 	)
 	x.occupants["team@muc.x"] = map[string]string{"alice": "alice@x"}
 	for dest, want := range map[string]destKind{
-		"zach@x":     destUser,
-		"team@muc.x": destRoom,
-		"alice@x":    destUser,
-		"stranger@x": destBlocked,
+		"zach@x":        destUser,
+		"team@muc.x":    destRoom,
+		"alice@x":       destBlocked,
+		"alice@x/phone": destBlocked,
+		"stranger@x":    destBlocked,
 	} {
 		if got := x.classifyMessageDest(dest, false); got != want {
 			t.Errorf("default send destination %q = %v, want %v", dest, got, want)
@@ -37,49 +39,93 @@ func TestDefaultMessageDestinationPolicy(t *testing.T) {
 	}
 }
 
-func TestAllowedMessageJIDsReflectActiveDestinations(t *testing.T) {
+func TestMessageDestinationGuidanceSeparatesPermissionsAndMembers(t *testing.T) {
 	x := NewXMPPBridge(
-		ResolvedAccount{Rooms: []string{"team@muc.x", "other@muc.x", "team@muc.x"}, Owner: "zach@x/phone"},
+		ResolvedAccount{Rooms: []string{"team@muc.x", "other@muc.x", "team@muc.x"}, Owner: "zach@x/phone", ErrorRoom: "errors@muc.x"},
 		func(InboundMessage) {}, func(string, string) {},
 	)
 	x.occupants["team@muc.x"] = map[string]string{
 		"alice": "alice@x", "anonymous": "", "owner": "zach@x",
 	}
-	x.occupants["other@muc.x"] = map[string]string{"alice-again": "alice@x", "bob": "bob@x"}
+	x.occupants["other@muc.x"] = map[string]string{"alice": "alice@x", "bob": "bob@x"}
+	// Neither stale/unconfigured membership nor archive reads grant permission
+	// or contribute names to the advertised room-scoped mention targets.
+	x.occupants["errors@muc.x"] = map[string]string{"error-member": "error@x"}
+	x.occupants["unconfigured@muc.x"] = map[string]string{"outsider": "outside@x"}
 	x.recordReadHistory([]InboundMessage{
 		{ID: "old", From: "archived@x", Direct: true, Body: "old message"},
 	}, "archived@x")
-	check := func(want string) {
+	permissions := `Allowed 1:1 JIDs: ["zach@x"]. Allowed room JIDs: ["other@muc.x" "team@muc.x"]. `
+	check := func(members string) {
 		t.Helper()
-		got := x.allowedMessageJIDs()
-		if strings.Join(got, ", ") != want {
-			t.Fatalf("allowed JIDs = %q, want %s", got, want)
+		want := permissions + `Room-scoped members/mention names (NOT DM destinations): [` + members + `]. Send to the room JID and mention the member in text.`
+		for range 20 { // Map iteration cannot change either category or nickname ordering.
+			if got := x.messageDestinationGuidance(); got != want {
+				t.Fatalf("destination guidance = %s, want %s", got, want)
+			}
 		}
-		for _, dest := range got {
-			if x.classifyMessageDest(dest, false) == destBlocked {
-				t.Errorf("advertised destination %q is not authorized", dest)
+		for dest, want := range map[string]destKind{
+			"zach@x": destUser, "zach@x/phone": destUser,
+			"other@muc.x": destRoom, "team@muc.x": destRoom,
+			"alice@x": destBlocked, "alice@x/phone": destBlocked,
+			"bob@x": destBlocked, "archived@x": destBlocked,
+			"errors@muc.x": destBlocked, "unconfigured@muc.x": destBlocked,
+		} {
+			if got := x.classifyDest(dest); got != want {
+				t.Errorf("classifyDest(%q) = %v, want %v", dest, got, want)
 			}
 		}
 	}
-	check("alice@x, bob@x, other@muc.x, team@muc.x, zach@x")
-	// Departure/reconnect removes knowledge of occupants, not the owner or rooms.
-	delete(x.occupants["other@muc.x"], "bob")
-	check("alice@x, other@muc.x, team@muc.x, zach@x")
+	check(`"other@muc.x": ["alice" "bob"]; "team@muc.x": ["alice" "anonymous" "owner"]`)
+	// Presence departure updates mention names, not permissions.
+	start := xml.StartElement{Name: xml.Name{Local: "presence"}, Attr: []xml.Attr{
+		{Name: xml.Name{Local: "from"}, Value: "other@muc.x/bob"},
+		{Name: xml.Name{Local: "type"}, Value: "unavailable"},
+	}}
+	if err := x.handlePresence(&start, nil); err != nil {
+		t.Fatal(err)
+	}
+	check(`"other@muc.x": ["alice"]; "team@muc.x": ["alice" "anonymous" "owner"]`)
+	// Model serve's reconnect reset: only live member knowledge is discarded.
 	x.occupants = make(map[string]map[string]string)
-	check("other@muc.x, team@muc.x, zach@x")
+	check(`"other@muc.x": []; "team@muc.x": []`)
+}
+
+func TestAnonymousPresenceIsRoomScopedMentionTarget(t *testing.T) {
+	x := NewXMPPBridge(ResolvedAccount{Owner: "owner@x", Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x"}, func(InboundMessage) {}, func(string, string) {})
+	for _, room := range []string{"team@muc.x", "errors@muc.x", "other@muc.x"} {
+		start := xml.StartElement{Name: xml.Name{Local: "presence"}, Attr: []xml.Attr{
+			{Name: xml.Name{Local: "from"}, Value: room + "/anonymous"},
+		}}
+		if err := x.handlePresence(&start, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := x.OccupantNicks("team@muc.x"); strings.Join(got, ",") != "anonymous" {
+		t.Fatalf("anonymous nickname missing: %q", got)
+	}
+	if len(x.occupants) != 1 || x.occupantRealJID("team@muc.x", "anonymous") != "" {
+		t.Fatalf("unexpected anonymous membership: %v", x.occupants)
+	}
+	if !strings.Contains(x.messageDestinationGuidance(), `"team@muc.x": ["anonymous"]`) {
+		t.Fatal("anonymous member missing from room-scoped guidance")
+	}
 }
 
 func TestSendMessageDeniedOwnerOnlyConfiguration(t *testing.T) {
 	out := relayOutput(t, ResolvedAccount{Owner: "owner@example.com/phone"}, `{"action":"send_message","to":"stranger@x","text":"hello"}`)
-	if !strings.Contains(out, `Allowed JIDs (configured owner, joined rooms, known room occupants): [\"owner@example.com\"]`) {
-		t.Fatalf("denial did not report the configured bare owner: %s", out)
+	for _, want := range []string{`Allowed 1:1 JIDs: [\"owner@example.com\"]`, `Allowed room JIDs: []`, `Room-scoped members/mention names (NOT DM destinations): []`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("denial missing %q: %s", want, out)
+		}
 	}
 }
 
-func TestAllowedMessageJIDsEmptyConfiguration(t *testing.T) {
+func TestMessageDestinationGuidanceEmptyConfiguration(t *testing.T) {
 	x := NewXMPPBridge(ResolvedAccount{}, func(InboundMessage) {}, func(string, string) {})
-	if got := x.allowedMessageJIDs(); len(got) != 0 {
-		t.Fatalf("empty configuration advertised destinations: %q", got)
+	want := `Allowed 1:1 JIDs: []. Allowed room JIDs: []. Room-scoped members/mention names (NOT DM destinations): []. Send to the room JID and mention the member in text.`
+	if got := x.messageDestinationGuidance(); got != want {
+		t.Fatalf("empty configuration guidance = %q, want %q", got, want)
 	}
 }
 
@@ -158,5 +204,46 @@ func TestArchivedDirectReplyTargetUsesConversationAndAuthor(t *testing.T) {
 	b.handleSendMessageRelay("r1", "zach@x", "threaded reply", "own-stanza")
 	if got := buf.String(); !strings.Contains(got, "failed: no stanza was sent") || strings.Contains(got, "belongs to") {
 		t.Fatalf("own direct stanza should validate against conversation, then fail only on offline send: %q", got)
+	}
+}
+
+func TestMessagingContractSeparatesMembershipFromDestinations(t *testing.T) {
+	for _, arbitrary := range []bool{false, true} {
+		b := newTestBridge(ResolvedAccount{Owner: "owner@x", AllowArbitraryJid: arbitrary})
+		got := b.messagingContract()
+		for _, want := range []string{"send to the room JID and mention the member in text", "`sender:` identifies the author, not an authorized DM destination"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("contract missing %q: %s", want, got)
+			}
+		}
+		want := "By default, send_message and read_messages allow only the owner and configured rooms. Room members are mention targets within their room, NOT DM destinations."
+		if arbitrary {
+			want = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable. Room membership itself never grants DM permission."
+		}
+		if !strings.Contains(got, want) || strings.Contains(got, "use `sender:` to DM") {
+			t.Errorf("incorrect destination policy: %s", got)
+		}
+	}
+}
+
+func TestRoomMembershipDoesNotAuthorizeFilesOrHistory(t *testing.T) {
+	for _, arbitrary := range []bool{false, true} {
+		for _, to := range []string{"alice@x", "alice@x/phone"} {
+			b := newTestBridge(ResolvedAccount{Owner: "owner@x", Rooms: []string{"team@muc.x"}, AllowArbitraryJid: arbitrary})
+			b.xmpp.occupants["team@muc.x"] = map[string]string{"alice": "alice@x"}
+			var rpc bytes.Buffer
+			b.rpc = &RPCClient{stdin: &nopClose{buf: &rpc}}
+			b.handleToolRelay("r1", `{"action":"file","to":"`+to+`","path":"/nonexistent"}`)
+			if !strings.Contains(rpc.String(), "not an allowed destination") || b.replied() || b.runDeliveries != 0 {
+				t.Fatalf("room membership authorized file send (arbitrary=%v): %s", arbitrary, rpc.String())
+			}
+			if !arbitrary {
+				rpc.Reset()
+				b.handleToolRelay("r2", `{"action":"read_messages","target":"`+to+`"}`)
+				if !strings.Contains(rpc.String(), "not an allowed target") {
+					t.Fatalf("room membership authorized history read: %s", rpc.String())
+				}
+			}
+		}
 	}
 }

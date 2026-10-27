@@ -212,7 +212,8 @@ func TestClassifyDest(t *testing.T) {
 		{"team@muc.x/somenick", destRoom},
 		{"zach@x", destUser},
 		{"zach@x/phone", destUser},
-		{"alice@x", destUser},
+		{"alice@x", destBlocked},
+		{"alice@x/phone", destBlocked},
 		{"stranger@x", destBlocked},
 		{"", destBlocked},
 	}

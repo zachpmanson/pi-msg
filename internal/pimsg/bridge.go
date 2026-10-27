@@ -667,7 +667,7 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string, timeoutA
 		if b.acct.AllowArbitraryJid {
 			policy = "allowArbitraryJid=true: other syntactically valid peer JIDs are also permitted."
 		}
-		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: %q is not an allowed destination. Allowed JIDs (configured owner, joined rooms, known room occupants): %q. %s No message was sent.", to, b.xmpp.allowedMessageJIDs(), policy))
+		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message: %q is not an allowed destination. %s %s No message was sent.", to, b.xmpp.messageDestinationGuidance(), policy))
 		return
 	}
 	var reply *replyTarget
@@ -2142,11 +2142,11 @@ func compactArgs(args Event) string {
 // Final assistant text is private to the harness; send_message is the explicit
 // agent-authored path for text messages.
 func (b *Bridge) messagingContract() string {
-	allow := "By default, send_message allows the owner, configured rooms, and known occupants; read_messages allows the owner and configured rooms."
+	allow := "By default, send_message and read_messages allow only the owner and configured rooms. Room members are mention targets within their room, NOT DM destinations."
 	if b.acct.AllowArbitraryJid {
-		allow = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable."
+		allow = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable. Room membership itself never grants DM permission."
 	}
-	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?, reply_timeout_seconds?). Set reply_timeout_seconds to a finite positive number only when you want one internal reminder if no qualifying reply arrives; omission creates no watch. Choose `to` from the incoming `from:` conversation JID, use `sender:` to DM a room participant, or use owner JID %s to message the owner. %s `reply_to` is optional: omit it for ordinary replies; use the complete `stanza-id:` when you explicitly want a threaded reply or threading materially helps associate a follow-up. Omit it for ordinary replies, even when an incoming stanza ID is available. It must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, adding `reply_to` only where useful. `read_messages(target, …)` reads room or 1:1 history and requires an explicit target; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
+	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?, reply_timeout_seconds?). Set reply_timeout_seconds to a finite positive number only when you want one internal reminder if no qualifying reply arrives; omission creates no watch. Choose `to` from the incoming `from:` conversation JID or use owner JID %s to message the owner. To address a room member, send to the room JID and mention the member in text; `sender:` identifies the author, not an authorized DM destination. %s `reply_to` is optional: omit it for ordinary replies; use the complete `stanza-id:` when you explicitly want a threaded reply or threading materially helps associate a follow-up. Omit it for ordinary replies, even when an incoming stanza ID is available. It must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, adding `reply_to` only where useful. `read_messages(target, …)` reads room or 1:1 history and requires an explicit target; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
