@@ -37,6 +37,52 @@ func TestDefaultMessageDestinationPolicy(t *testing.T) {
 	}
 }
 
+func TestAllowedMessageJIDsReflectActiveDestinations(t *testing.T) {
+	x := NewXMPPBridge(
+		ResolvedAccount{Rooms: []string{"team@muc.x", "other@muc.x", "team@muc.x"}, Owner: "zach@x/phone"},
+		func(InboundMessage) {}, func(string, string) {},
+	)
+	x.occupants["team@muc.x"] = map[string]string{
+		"alice": "alice@x", "anonymous": "", "owner": "zach@x",
+	}
+	x.occupants["other@muc.x"] = map[string]string{"alice-again": "alice@x", "bob": "bob@x"}
+	x.recordReadHistory([]InboundMessage{
+		{ID: "old", From: "archived@x", Direct: true, Body: "old message"},
+	}, "archived@x")
+	check := func(want string) {
+		t.Helper()
+		got := x.allowedMessageJIDs()
+		if strings.Join(got, ", ") != want {
+			t.Fatalf("allowed JIDs = %q, want %s", got, want)
+		}
+		for _, dest := range got {
+			if x.classifyMessageDest(dest, false) == destBlocked {
+				t.Errorf("advertised destination %q is not authorized", dest)
+			}
+		}
+	}
+	check("alice@x, bob@x, other@muc.x, team@muc.x, zach@x")
+	// Departure/reconnect removes knowledge of occupants, not the owner or rooms.
+	delete(x.occupants["other@muc.x"], "bob")
+	check("alice@x, other@muc.x, team@muc.x, zach@x")
+	x.occupants = make(map[string]map[string]string)
+	check("other@muc.x, team@muc.x, zach@x")
+}
+
+func TestSendMessageDeniedOwnerOnlyConfiguration(t *testing.T) {
+	out := relayOutput(t, ResolvedAccount{Owner: "owner@example.com/phone"}, `{"action":"send_message","to":"stranger@x","text":"hello"}`)
+	if !strings.Contains(out, `Allowed JIDs (configured owner, joined rooms, known room occupants): [\"owner@example.com\"]`) {
+		t.Fatalf("denial did not report the configured bare owner: %s", out)
+	}
+}
+
+func TestAllowedMessageJIDsEmptyConfiguration(t *testing.T) {
+	x := NewXMPPBridge(ResolvedAccount{}, func(InboundMessage) {}, func(string, string) {})
+	if got := x.allowedMessageJIDs(); len(got) != 0 {
+		t.Fatalf("empty configuration advertised destinations: %q", got)
+	}
+}
+
 func TestSendMessageNoopAcceptsEmptyTextWithoutDelivery(t *testing.T) {
 	b := newTestBridge(ResolvedAccount{Owner: "zach@x"})
 	var buf bytes.Buffer

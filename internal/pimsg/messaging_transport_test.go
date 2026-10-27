@@ -44,6 +44,8 @@ func TestSendMessageDestinationTransport(t *testing.T) {
 		{name: "joined room", to: "team@muc.x", typ: "groupchat"},
 		{name: "known occupant", to: "alice@x", typ: "chat"},
 		{name: "opted in peer", to: "stranger@x", typ: "chat", arbitrary: true},
+		{name: "opted in peer resource", to: "stranger@x/phone", typ: "chat", arbitrary: true},
+		{name: "invalid JID with arbitrary access", to: "bad jid", arbitrary: true},
 		{name: "unknown peer", to: "stranger@x"},
 		{name: "unknown peer resource", to: "stranger@x/phone"},
 		{name: "unconfigured room", to: "other@muc.x"},
@@ -60,9 +62,19 @@ func TestSendMessageDestinationTransport(t *testing.T) {
 				if wire.Len() != 0 {
 					t.Fatalf("rejected destination received stanzas: %s", wire.String())
 				}
-				for _, hint := range []string{"not an allowed destination", "configured owner", "joined room", "known room occupant", "allowArbitraryJid=true", "No message was sent."} {
-					if !strings.Contains(rpc.String(), hint) {
-						t.Errorf("rejection missing %q: %s", hint, rpc.String())
+				var response struct {
+					Value string `json:"value"`
+				}
+				if err := json.Unmarshal(rpc.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				policy := "allowArbitraryJid=false: other destinations are not permitted."
+				if tt.arbitrary {
+					policy = "allowArbitraryJid=true: other syntactically valid peer JIDs are also permitted."
+				}
+				for _, hint := range []string{"not an allowed destination", `Allowed JIDs (configured owner, joined rooms, known room occupants): ["alice@x" "team@muc.x" "zach@x"].`, policy, "No message was sent."} {
+					if !strings.Contains(response.Value, hint) {
+						t.Errorf("rejection missing %q: %s", hint, response.Value)
 					}
 				}
 				if b.replied() {

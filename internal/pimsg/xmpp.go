@@ -1564,6 +1564,35 @@ func (b *XMPPBridge) classifyMessageDest(dest string, allowArbitrary bool) destK
 	return destUser
 }
 
+// allowedMessageJIDs snapshots the concrete destinations accepted by classifyDest.
+// Occupants are live presence data, not archived senders or room nicknames.
+func (b *XMPPBridge) allowedMessageJIDs() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	allowed := make(map[string]bool)
+	if b.ownerBare != "" {
+		allowed[b.ownerBare] = true
+	}
+	for room, joined := range b.roomBares {
+		if joined && room != "" {
+			allowed[room] = true
+		}
+	}
+	for _, occupants := range b.occupants {
+		for _, real := range occupants {
+			if real != "" {
+				allowed[real] = true
+			}
+		}
+	}
+	jids := make([]string, 0, len(allowed))
+	for dest := range allowed {
+		jids = append(jids, dest)
+	}
+	sort.Strings(jids)
+	return jids
+}
+
 // isRoomJID reports whether bare is one of the rooms the bridge has joined.
 func (b *XMPPBridge) isRoomJID(bare string) bool {
 	return b.roomBares[bare]
