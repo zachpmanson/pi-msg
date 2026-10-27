@@ -112,6 +112,39 @@ func TestAnonymousPresenceIsRoomScopedMentionTarget(t *testing.T) {
 	}
 }
 
+func TestNonMembershipPresenceDoesNotAdvertiseRoomMembers(t *testing.T) {
+	for _, ptype := range []string{"error", "subscribe", "subscribed", "unsubscribe", "unsubscribed", "probe"} {
+		t.Run(ptype, func(t *testing.T) {
+			x := NewXMPPBridge(ResolvedAccount{Owner: "owner@x", Rooms: []string{"team@muc.x"}}, func(InboundMessage) {}, func(string, string) {})
+			x.occupants["team@muc.x"] = map[string]string{"existing": "existing@x"}
+			x.selfNick["team@muc.x"] = "confirmed"
+			before := x.messageDestinationGuidance()
+			for _, nick := range []string{"requested-nick", "existing"} {
+				start := xml.StartElement{Name: xml.Name{Local: "presence"}, Attr: []xml.Attr{
+					{Name: xml.Name{Local: "from"}, Value: "team@muc.x/" + nick},
+					{Name: xml.Name{Local: "type"}, Value: ptype},
+				}}
+				// Even a self-presence code must not confirm a failed join.
+				toks := []xml.Token{xml.StartElement{Name: xml.Name{Local: "status"}, Attr: []xml.Attr{
+					{Name: xml.Name{Local: "code"}, Value: "110"},
+				}}}
+				if err := x.handlePresence(&start, toks); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := x.messageDestinationGuidance(); got != before {
+				t.Fatalf("non-membership presence changed guidance: %s", got)
+			}
+			if got := x.occupantRealJID("team@muc.x", "existing"); got != "existing@x" {
+				t.Fatalf("non-membership presence replaced an existing identity: %q", got)
+			}
+			if got := x.ownNick("team@muc.x"); got != "confirmed" {
+				t.Fatalf("non-membership presence changed our confirmed nick: %q", got)
+			}
+		})
+	}
+}
+
 func TestSendMessageDeniedOwnerOnlyConfiguration(t *testing.T) {
 	out := relayOutput(t, ResolvedAccount{Owner: "owner@example.com/phone"}, `{"action":"send_message","to":"stranger@x","text":"hello"}`)
 	for _, want := range []string{`Allowed 1:1 JIDs: [\"owner@example.com\"]`, `Allowed room JIDs: []`, `Room-scoped members/mention names (NOT DM destinations): []`} {

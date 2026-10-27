@@ -1303,6 +1303,11 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 	ptype := attr(start.Attr, "type")
 
 	if room := bareJid(from); b.isRoomJID(room) {
+		// Only available/unavailable presence describes room membership. Join
+		// errors and subscription/probe traffic must not invent mention targets.
+		if ptype != "" && ptype != string(stanza.UnavailablePresence) {
+			return nil
+		}
 		nick := resourcepart(from)
 		if nick == "" {
 			return nil
