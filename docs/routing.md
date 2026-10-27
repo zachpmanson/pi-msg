@@ -51,7 +51,11 @@ configured room. A configured room is an allowed groupchat destination only
 while configured; room membership is not bypassed by the arbitrary-JID option.
 `allowArbitraryJid` is `false` by default. When enabled, it permits other
 syntactically valid JIDs as peer destinations. It does not add unconfigured
-rooms to the set of joined rooms.
+rooms to the set of joined rooms. A denied destination fails the tool call
+without sending a stanza. The error lists the actual allowed bare JIDs for the
+active account (owner, configured rooms, and currently known occupants), sorted
+and deduplicated, and reports whether `allowArbitraryJid` is enabled. Archived
+senders and anonymous room nicknames do not expand that list.
 
 Choose the destination from the incoming `from:` conversation JID, use
 `sender:` to DM a participant in a room, or use the configured owner JID to
