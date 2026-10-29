@@ -11,7 +11,19 @@ const source = stripTypeScriptTypes(readFileSync(new URL("./xmpp-tools.ts", impo
 	.replace('import { Type } from "typebox";', 'const Type = new Proxy({}, { get: () => () => ({}) });');
 const { default: xmppTools } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 
+const SESSION_ID = "7ef36f22-23c6-4dd9-a04b-1202a5b64dc2";
+const OTHER_SESSION_ID = "3a164681-6bc4-467f-9da2-67ef49948a9d";
+const SESSION_FILE = `/home/agent/.pi/agent/sessions/--home-agent-project--/2026-09-28T19-30-00-000Z_${SESSION_ID}.jsonl`;
+const OTHER_SESSION_FILE = `/home/agent/.pi/agent/sessions/--home-agent-project--/2026-09-28T20-30-00-000Z_${OTHER_SESSION_ID}.jsonl`;
+const CHILD_SESSION_FILE = `${SESSION_FILE.slice(0, -6)}/1ad41c56/run-0/session.jsonl`;
+
 function fixture(t) {
+	const previousProcessExtension = process.env.PI_MSG_PROCESS_EXTENSION;
+	delete process.env.PI_MSG_PROCESS_EXTENSION;
+	t.after(() => {
+		if (previousProcessExtension === undefined) delete process.env.PI_MSG_PROCESS_EXTENSION;
+		else process.env.PI_MSG_PROCESS_EXTENSION = previousProcessExtension;
+	});
 	const dir = mkdtempSync(join(tmpdir(), "pi-msg-subagent-test-"));
 	const previousTmp = process.env.TMPDIR;
 	process.env.TMPDIR = dir;
@@ -43,7 +55,7 @@ function fixture(t) {
 	// Keep unrelated process tracking synchronous and empty.
 	bus.on("processes:request:list", ({ reply }) => reply([]));
 	const ctx = {
-		sessionManager: { getSessionId: () => "session-a" },
+		sessionManager: { getSessionFile: () => SESSION_FILE, getSessionId: () => SESSION_ID },
 		ui: { select: async (title) => { relays.push(JSON.parse(title.slice("pi-msg-relay:".length))); return "ok"; } },
 	};
 	function install() {
@@ -53,16 +65,16 @@ function fixture(t) {
 	install();
 	const start = () => hooks.get("session_start")({}, ctx);
 	const shutdown = () => hooks.get("session_shutdown")({}, ctx);
-	function write(id, overrides = {}) {
-		const path = join(root, id);
+	function write(id, overrides = {}, base = root) {
+		const path = join(base, id);
 		mkdirSync(path, { recursive: true });
 		writeFileSync(join(path, "status.json"), JSON.stringify({
-			runId: id, sessionId: "session-a", state: "running", pid: 42,
+			runId: id, sessionId: SESSION_FILE, state: "running", pid: 42,
 			startedAt: Date.now(), steps: [{ status: "running", agent: "worker" }], ...overrides,
 		}));
 		return path;
 	}
-	const emit = (id, event = "subagent:async-started", sessionId = "session-a") =>
+	const emit = (id, event = "subagent:async-started", sessionId = SESSION_FILE) =>
 		bus.emit(event, { sessionId, pid: 42, asyncDir: join(root, id), task: "SECRET PROMPT", goal: "SECRET GOAL" });
 	const counts = () => relays.filter((r) => r.action === "subagent_count");
 	const latest = () => counts().at(-1)?.count;
@@ -75,9 +87,9 @@ function fixture(t) {
 test("session-owned parallel children aggregate, then complete/fail/stop/pause cleanly", async (t) => {
 	const f = fixture(t);
 	f.write("a");
-	f.write("other", { sessionId: "session-b" });
+	f.write("other", { sessionId: OTHER_SESSION_FILE });
 	f.write("unowned", { sessionId: undefined });
-	f.write("nested", { isNested: true });
+	f.write("nested", { isNested: true, sessionId: CHILD_SESSION_FILE }, join(f.root, "..", "nested-subagent-runs", "a"));
 	f.start();
 	assert.equal(f.latest(), undefined, "bootstrap must not block on an RPC dialog");
 	await f.tick();
@@ -104,7 +116,7 @@ test("session-owned parallel children aggregate, then complete/fail/stop/pause c
 	assert.ok(f.counts().every((r) => Object.keys(r).sort().join() === "action,count"), "no task/role/output leaks");
 });
 
-test("started event is immediately visible before the first artifact, with bounded bootstrap grace", async (t) => {
+test("file-owned started event is immediately visible before the first artifact, with bounded bootstrap grace", async (t) => {
 	const f = fixture(t);
 	f.start();
 	f.emit("starting");
@@ -115,6 +127,65 @@ test("started event is immediately visible before the first artifact, with bound
 	f.write("starting");
 	await f.tick();
 	assert.equal(f.latest(), 1, "delayed valid artifact should self-heal");
+});
+
+test("routing-enabled root stays busy beyond bootstrap and recovers after reload", async (t) => {
+	const f = fixture(t);
+	const id = "f8ba129c-4cf0-4943-a71e-e51a5f4b4b81";
+	f.start();
+	f.emit(id);
+	await f.drain();
+	assert.equal(f.latest(), 1, "started event covers bootstrap");
+	const running = {
+		lifecycleArtifactVersion: 2, mode: "single", isNested: true,
+		lastUpdate: Date.now(), currentStep: 0, chainStepCount: 1,
+		steps: [{ agent: "presence-sleeper", status: "running", sessionFile: CHILD_SESSION_FILE }],
+	};
+	f.write(id, running);
+	for (let i = 0; i < 3; i++) {
+		await f.tick();
+		assert.equal(f.latest(), 1, "root must not become idle after bootstrap expires");
+	}
+	f.shutdown();
+	await f.drain();
+	assert.equal(f.latest(), 0);
+	f.install();
+	f.start(); // no lifecycle event: recover solely from top-level artifacts
+	await f.tick();
+	assert.equal(f.latest(), 1, "isNested is routing capability, not root exclusion");
+	f.write(id, { ...running, state: "complete" });
+	f.emit(id, "subagent:async-complete");
+	await f.drain();
+	assert.equal(f.latest(), 0, "root completion must still clear presence");
+});
+
+test("current-session event paths count routing-enabled roots but foreign nested runs stay isolated", async (t) => {
+	const f = fixture(t);
+	const nestedRoot = join(f.root, "..", "nested-subagent-runs", "root-run");
+	const nestedPath = f.write("nested", { isNested: true, sessionId: CHILD_SESSION_FILE }, nestedRoot);
+	// Even if a child-owned artifact appears in the scanned directory, it is foreign.
+	f.write("foreign-child", { isNested: true, sessionId: CHILD_SESSION_FILE });
+	f.start();
+	await f.tick();
+	assert.equal(f.latest(), 0, "nested artifacts must not leak through the root scan");
+	for (const asyncDir of [nestedPath, join(nestedRoot, "starting")]) {
+		f.bus.emit("subagent:async-started", { sessionId: CHILD_SESSION_FILE, pid: 42, asyncDir });
+		await f.drain();
+		assert.equal(f.latest(), 0, "foreign child events must not count artifacts or bootstrap");
+	}
+	const customRoot = join(f.root, "..", "custom-async-runs");
+	const customPath = f.write("root", { isNested: true }, customRoot);
+	await f.tick();
+	assert.equal(f.latest(), 0, "custom directories are not scanned");
+	f.bus.emit("subagent:async-started", { sessionId: SESSION_FILE, pid: 42, asyncDir: customPath });
+	await f.drain();
+	assert.equal(f.latest(), 1, "exact current-session event supplies root provenance");
+	await f.tick();
+	assert.equal(f.latest(), 1, "event-supplied root persists beyond bootstrap");
+	f.write("root", { isNested: true, state: "complete" }, customRoot);
+	f.bus.emit("subagent:async-complete", { sessionId: SESSION_FILE, asyncDir: customPath });
+	await f.drain();
+	assert.equal(f.latest(), 0);
 });
 
 test("chain gaps stay busy without counting future stages; dead/deleted/invalid artifacts clear", async (t) => {
@@ -152,7 +223,7 @@ test("chain gaps stay busy without counting future stages; dead/deleted/invalid 
 	assert.equal(f.latest(), 0);
 });
 
-test("reload re-seeds live artifacts; session replacement and shutdown discard stale callbacks", async (t) => {
+test("reload re-seeds file-owned live artifacts; session replacement and shutdown discard stale callbacks", async (t) => {
 	const f = fixture(t);
 	f.write("live");
 	f.start();
@@ -171,13 +242,96 @@ test("reload re-seeds live artifacts; session replacement and shutdown discard s
 	assert.equal(f.latest(), 1, "reload lost an existing child");
 	f.shutdown();
 	f.install();
-	f.ctx.sessionManager.getSessionId = () => "session-b";
+	f.ctx.sessionManager.getSessionFile = () => OTHER_SESSION_FILE;
+	f.ctx.sessionManager.getSessionId = () => OTHER_SESSION_ID;
 	f.start();
 	await f.tick();
 	assert.equal(f.latest(), 0, "new session inherited old work");
 	f.emit("live");
 	await f.drain();
 	assert.equal(f.latest(), 0, "foreign event leaked into session");
+});
+
+test("UUID-owned events and artifacts remain compatible alongside file-owned runs", async (t) => {
+	const f = fixture(t);
+	f.start();
+	f.emit("uuid-starting", "subagent:async-started", SESSION_ID);
+	await f.drain();
+	assert.equal(f.latest(), 1, "UUID event must bridge bootstrap even when a session file exists");
+	f.write("uuid-starting", { sessionId: SESSION_ID });
+	f.write("file-owned");
+	await f.tick();
+	assert.equal(f.latest(), 2, "both exact identities may own separate child slots");
+	f.write("uuid-starting", { sessionId: SESSION_ID, state: "complete" });
+	f.emit("uuid-starting", "subagent:async-complete", SESSION_ID);
+	await f.drain();
+	assert.equal(f.latest(), 1);
+	f.shutdown();
+	f.install();
+	delete f.ctx.sessionManager.getSessionFile;
+	f.write("uuid-recovered", { sessionId: SESSION_ID });
+	f.start();
+	await f.tick();
+	assert.equal(f.latest(), 1, "UUID-only session managers still recover their artifacts, not file-owned ones");
+});
+
+test("foreign and missing owners never match by path fragments or UUID substrings", async (t) => {
+	const f = fixture(t);
+	f.start();
+	await f.tick();
+	assert.equal(f.latest(), 0);
+	const foreignOwners = [
+		OTHER_SESSION_FILE, OTHER_SESSION_ID, undefined, null, "",
+		SESSION_FILE.split("/").at(-1), SESSION_FILE.slice(1),
+		SESSION_FILE.replace("/sessions/", "/sessions/../sessions/"),
+		`/other/sessions/${SESSION_FILE.split("/").at(-1)}`,
+		`${SESSION_FILE}.other`, `prefix-${SESSION_ID}`,
+	];
+	for (const [i, sessionId] of foreignOwners.entries()) {
+		// No artifact: a wrongly accepted event would count via bootstrap grace.
+		f.bus.emit("subagent:async-started", { sessionId, pid: 42, asyncDir: join(f.root, `event-${i}`) });
+		await f.drain();
+		assert.equal(f.latest(), 0, `foreign event: ${sessionId}`);
+		f.write(`disk-${i}`, { sessionId });
+	}
+	await f.tick();
+	assert.equal(f.latest(), 0, "foreign/unowned disk statuses must also stay isolated");
+});
+
+test("session_start replacement clears old file/UUID aliases and bootstrap paths", async (t) => {
+	const f = fixture(t);
+	f.start();
+	f.write("old-file");
+	f.write("old-uuid", { sessionId: SESSION_ID });
+	f.emit("old-starting");
+	await f.drain();
+	assert.equal(f.latest(), 3);
+	f.ctx.sessionManager.getSessionFile = () => OTHER_SESSION_FILE;
+	f.ctx.sessionManager.getSessionId = () => OTHER_SESSION_ID;
+	f.start(); // no shutdown/reinstall: same extension instance, different session
+	f.emit("new-starting", "subagent:async-started", OTHER_SESSION_FILE);
+	await f.drain();
+	assert.equal(f.latest(), 1, "old artifacts and bootstrap paths survived replacement");
+	for (const oldOwner of [SESSION_FILE, SESSION_ID]) {
+		f.emit("stale-starting", "subagent:async-started", oldOwner);
+		await f.drain();
+		assert.equal(f.latest(), 1, "replacement retained an old ownership alias");
+	}
+	await f.tick();
+	assert.equal(f.latest(), 0, "only the replacement's expired bootstrap should remain");
+});
+
+test("missing or empty current identities cannot attribute unowned work", async (t) => {
+	const f = fixture(t);
+	for (const identity of [undefined, null, ""]) {
+		f.ctx.sessionManager.getSessionFile = () => identity;
+		f.ctx.sessionManager.getSessionId = () => identity;
+		f.write("unowned", { sessionId: identity });
+		f.start();
+		f.bus.emit("subagent:async-started", { sessionId: identity, pid: 42, asyncDir: join(f.root, "unowned-starting") });
+		await f.tick();
+		assert.ok(f.counts().every((r) => r.count === 0), "missing identities must not become ownership aliases");
+	}
 });
 
 test("coalesces lifecycle events during a delayed relay and retries cancelled deliveries", async (t) => {

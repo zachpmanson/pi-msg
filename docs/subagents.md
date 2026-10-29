@@ -31,14 +31,28 @@ Visible behavior:
 
 Ownership and cleanup:
 
-- Match the exact current `ctx.sessionManager.getSessionId()`; ignore unowned,
-  other-session, and nested artifacts. No persona-wide or global activity sum.
+- Match only the exact current `ctx.sessionManager.getSessionFile()` path or
+  `getSessionId()` UUID alias, for both lifecycle events and disk artifacts.
+  The installed pi-subagents 0.35.1 `src/shared/session-identity.ts` resolves
+  ownership as `getSessionFile() ?? getSessionId()`; persisted sessions therefore
+  use an absolute JSONL path, not the UUID. The UUID alias supports older plugin
+  builds and sessions without a file. Missing/empty identities are never aliases;
+  no basename, path normalization, prefix, or substring matching is performed.
+  Ignore unowned and other-session artifacts. Aliases and tracked paths are
+  cleared on session replacement and shutdown. No persona-wide or global
+  activity sum.
 - On Unix, startup/reload/resume re-seeds from pi-subagents' per-user artifact
   root, `$TMPDIR/pi-subagents-uid-<uid>/async-subagent-runs` (the OS temp directory
-  is used when `TMPDIR` is unset). Live lifecycle events also supply artifact
-  directories. No pi-subagents installation or artifact root is required for
-  ordinary Pi usage: the count stays zero when absent. Non-Unix discovery is
-  limited to artifact directories received through lifecycle events.
+  is used when `TMPDIR` is unset), scanning only its direct run directories.
+  Exact current-session lifecycle events also supply artifact directories,
+  including custom locations. True nested runs use `nested-subagent-runs` and
+  a different child-session owner, so they are neither scanned nor accepted
+  through foreign events. Do **not** exclude by `status.isNested`: the installed
+  runner sets it whenever a routing capability exists, including top-level
+  roots. Such roots must remain counted beyond bootstrap and after reload.
+  No pi-subagents installation or artifact root is required for ordinary Pi
+  usage: the count stays zero when absent. Non-Unix discovery is limited to
+  artifact directories received through lifecycle events.
 - A missing/deleted/malformed artifact clears its contribution until a valid
   snapshot returns. A dead runner PID clears it even without a completion event;
   a missing PID is tolerated only during the first second of bootstrap. A
@@ -57,17 +71,42 @@ Ownership and cleanup:
 
 Compatibility: this small read-only adapter targets the Unix-scoped artifact
 layout and `AsyncStatus` fields in the installed pi-subagents 0.35.1 source
-(`src/shared/types.ts`, `runs/background/async-execution.ts`, and
-`stale-run-reconciler.ts`). Recheck this contract when upgrading that plugin;
-if it gains a public structured lifecycle snapshot API, prefer it here.
+(`src/shared/session-identity.ts`, `src/shared/types.ts`,
+`src/runs/background/async-execution.ts`,
+`src/runs/background/subagent-runner.ts`,
+`src/runs/foreground/subagent-executor.ts`, and `stale-run-reconciler.ts`). The
+tested identity contract includes a session manager exposing both a JSONL file
+path and UUID, file-owned event bootstrap and artifact recovery on reload, UUID
+compatibility, routing-enabled roots with `isNested: true` (also via custom
+lifecycle event paths), and foreign/missing-owner and child-session isolation. Recheck this contract when
+upgrading that plugin; if it gains a public structured lifecycle snapshot API,
+prefer it here.
 Foreground work is already covered by parent-turn busy state; detached paused
 foreground workers do not become background busy work merely because they can
 be resumed.
 
+### Live droid verification (2026-10-29)
+
+Disposable b1-1/b1-2 subjects and the b2-1 observer reproduced the broken
+behavior and verified the fixes over real XMPP, using Pi 0.84.4 and the complete
+installed pi-subagents 0.35.1 package. A real 90-second worker remained `dnd`
+with `.busy` present beyond bootstrap, recovered after a bridge restart without
+a new start event, then returned to `listening` after completion. Deterministic
+lifecycle fixtures exercised overlap/duplicate events, foreign ownership,
+pause/stop/failure/dead runners, renewed activity, and `/new`; an actual managed
+background process verified independent combined busy state. Eleven live
+assertions passed. Parent completion notifications may legitimately start a
+new busy turn; cleanup assertions wait for that turn to settle.
+
+All test bridges were stopped. No production fleet deployment/restart was part
+of this validation. Isolate test config, sessions, temp artifacts and credentials;
+never commit credential-bearing profiles. Existing scratch package copies may
+be incomplete: check that their async runner entry exists before live testing.
+
 Tests (no fleet restarts, deployment, XMPP credentials, or paid model calls):
 
 ```sh
-nix develop --command make test-companion
+env -u PI_MSG_PROCESS_EXTENSION nix develop --command make test-companion
 # Full Go suite; isolate busy-marker writes from real account state:
 tmp=$(mktemp -d)
 PI_MSG_CONFIG="$tmp/config.json" nix develop --command go test ./...

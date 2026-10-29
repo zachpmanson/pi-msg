@@ -51,7 +51,9 @@ export default function xmppTools(pi: ExtensionAPI) {
 	// This is read-only: the plugin remains responsible for repairing artifacts.
 	const scope = typeof process.getuid === "function" ? `uid-${process.getuid()}` : undefined;
 	const subagentRoot = scope ? join(tmpdir(), `pi-subagents-${scope}`, "async-subagent-runs") : undefined;
-	let subagentSession: string | undefined;
+	// Current plugin builds own runs by session file; older builds use the UUID.
+	// Both must be exact, nonempty identities from the current session manager.
+	const subagentSessions = new Set<string>();
 	let subagentTimer: ReturnType<typeof setInterval> | undefined;
 	let subagentSeed: ReturnType<typeof setTimeout> | undefined;
 	let subagentEpoch = 0;
@@ -63,7 +65,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 	const subagentStarting = new Map<string, { pid: number; until: number }>();
 
 	function subagentCount(): number {
-		if (!subagentSession) return 0;
+		if (subagentSessions.size === 0) return 0;
 		const paths = new Set(subagentPaths);
 		if (subagentRoot) {
 			try {
@@ -77,7 +79,10 @@ export default function xmppTools(pi: ExtensionAPI) {
 			try {
 				const status = JSON.parse(readFileSync(join(dir, "status.json"), "utf8"));
 				subagentStarting.delete(dir);
-				if (status?.sessionId !== subagentSession || status.isNested === true) continue;
+				// isNested records routing capability, even for top-level runs.
+				// Paths come from the top-level directory scan or an exactly
+				// current-session event; status ownership must still match.
+				if (!subagentSessions.has(status?.sessionId)) continue;
 				if (status.state !== "running" && status.state !== "queued") continue;
 				// Match pi-subagents' stale-alive-PID ceiling: a reused PID
 				// cannot keep an abandoned artifact busy forever.
@@ -112,7 +117,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 	}
 
 	async function refreshSubagents() {
-		if (!ui || !subagentSession) return;
+		if (!ui || subagentSessions.size === 0) return;
 		subagentDirty = true;
 		if (subagentSending) return;
 		subagentSending = true;
@@ -132,7 +137,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 	const subagentUnsubscribes = ["subagent:async-started", "subagent:async-complete"].map((event) =>
 		pi.events.on(event, (payload: unknown) => {
 			const info = payload as { sessionId?: string; asyncDir?: string; pid?: number } | null;
-			if (!subagentSession || !info || info.sessionId !== subagentSession) return;
+			if (typeof info?.sessionId !== "string" || !subagentSessions.has(info.sessionId)) return;
 			if (typeof info.asyncDir === "string") {
 				subagentPaths.add(info.asyncDir);
 				if (event === "subagent:async-started" && typeof info.pid === "number" && Number.isInteger(info.pid) && info.pid > 0) {
@@ -156,7 +161,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 		for (const unsubscribe of subagentUnsubscribes) unsubscribe();
 		subagentPaths.clear();
 		subagentStarting.clear();
-		subagentSession = undefined;
+		subagentSessions.clear();
 		// Send before dropping the old UI; don't block session replacement.
 		void relay("subagent_count", { count: 0 }, 1500).catch(() => {});
 		ui = undefined;
@@ -511,9 +516,19 @@ export default function xmppTools(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		// A replacement may start without unloading this extension instance.
+		subagentEpoch++;
+		if (subagentTimer) clearInterval(subagentTimer);
+		if (subagentSeed) clearTimeout(subagentSeed);
+		subagentPaths.clear();
+		subagentStarting.clear();
+		subagentSessions.clear();
+		for (const identity of [ctx.sessionManager.getSessionFile?.(), ctx.sessionManager.getSessionId()]) {
+			if (typeof identity === "string" && identity.length > 0) subagentSessions.add(identity);
+		}
 		ui = ctx.ui as unknown as RelayUI;
-		subagentSession = ctx.sessionManager.getSessionId() ?? undefined;
 		subagentSending = false;
+		subagentDirty = false;
 		lastSubagentCount = undefined;
 		// Same bootstrap constraint as process counts: no dialog in this hook.
 		subagentSeed = setTimeout(() => {
