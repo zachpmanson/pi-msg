@@ -1052,14 +1052,14 @@ func TestBgProcessesPresence(t *testing.T) {
 
 	// A process starts: dnd with the plural label.
 	b.setBgProcesses(2)
-	if b.xmpp.show != "dnd" || b.xmpp.presence != "waiting on 2 processes" {
-		t.Errorf("2 processes = show %q status %q, want dnd \"waiting on 2 processes\"", b.xmpp.show, b.xmpp.presence)
+	if b.xmpp.show != "dnd" || b.xmpp.presence != "2 shells" {
+		t.Errorf("2 processes = show %q status %q, want dnd \"2 shells\"", b.xmpp.show, b.xmpp.presence)
 	}
 
 	// Singular label for exactly one process.
 	b.setBgProcesses(1)
-	if b.xmpp.presence != "waiting on 1 process" {
-		t.Errorf("1 process status = %q, want \"waiting on 1 process\"", b.xmpp.presence)
+	if b.xmpp.presence != "1 shell" {
+		t.Errorf("1 process status = %q, want \"1 shell\"", b.xmpp.presence)
 	}
 
 	// Settling again (agent run ends) keeps dnd while a process still runs.
@@ -1162,8 +1162,8 @@ func TestToolRelayProcessCount(t *testing.T) {
 	if got != 3 {
 		t.Errorf("bgProcesses after relay = %d, want 3", got)
 	}
-	if b.xmpp.presence != "waiting on 3 processes" {
-		t.Errorf("presence after relay = %q, want \"waiting on 3 processes\"", b.xmpp.presence)
+	if b.xmpp.presence != "3 shells" {
+		t.Errorf("presence after relay = %q, want \"3 shells\"", b.xmpp.presence)
 	}
 }
 func TestHeartbeatRunNoBanner(t *testing.T) {

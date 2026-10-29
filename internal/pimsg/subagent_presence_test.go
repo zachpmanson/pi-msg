@@ -31,16 +31,16 @@ func TestSubagentPresenceAndBusyMarker(t *testing.T) {
 	b.setStreaming(false)              // parent returns, children keep working
 	b.markIdle()
 	b.announceSettledPresence()
-	assertState("dnd", "working with 2 subagents", true)
+	assertState("dnd", "2 subagents", true)
 	if !b.idleSince.IsZero() {
 		t.Fatal("background work advertised an idle timestamp")
 	}
 	b.setBgSubagents(1) // one child finishing must not clear the other
-	assertState("dnd", "working with 1 subagent", true)
+	assertState("dnd", "1 subagent", true)
 	b.setBgProcesses(1)
-	assertState("dnd", "working with 1 subagent; waiting on 1 process", true)
+	assertState("dnd", "1 subagent; 1 shell", true)
 	b.setBgSubagents(0)
-	assertState("dnd", "waiting on 1 process", true)
+	assertState("dnd", "1 shell", true)
 	b.setBgProcesses(0)
 	assertState("", "listening", false)
 	if b.idleSince.IsZero() {
@@ -69,7 +69,7 @@ func TestSubagentsIdleAndReconnect(t *testing.T) {
 		t.Fatal("subagent work drifted away")
 	}
 	show, status := reconnectPresence(b.xmpp.show, b.xmpp.presence, "starting")
-	if show != "dnd" || status != "working with 1 subagent" {
+	if show != "dnd" || status != "1 subagent" {
 		t.Fatalf("reconnect lost background presence: %q/%q", show, status)
 	}
 	b.setBgSubagents(0)
@@ -90,7 +90,7 @@ func TestSubagentCountRelay(t *testing.T) {
 	b := bgBridge()
 	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}}
 	b.handleToolRelay("children", `{"action":"subagent_count","count":3}`)
-	if b.bgSubagents != 3 || b.xmpp.presence != "working with 3 subagents" {
+	if b.bgSubagents != 3 || b.xmpp.presence != "3 subagents" {
 		t.Fatalf("relay did not update subagents: %d/%q", b.bgSubagents, b.xmpp.presence)
 	}
 	if !strings.Contains(buf.String(), `"value":"ok"`) {

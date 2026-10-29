@@ -12,8 +12,8 @@ uses its existing artifact schema rather than scraping the formatted response.
 
 Visible behavior:
 
-- A settled parent with active children shows **dnd** and `working with N
-  subagents` (singular for one). Its `.busy` marker remains present, and idle
+- A settled parent with active children shows **dnd** and `N subagents`
+  (singular for one). Its `.busy` marker remains present, and idle
   auto-reset/away is suppressed while children work.
 - Running steps from concurrent runs/parallel stages are summed. Pending future
   chain stages are excluded; queued runs and between-stage transitions count
@@ -21,7 +21,7 @@ Visible behavior:
   top-level active child slots, not every nested descendant.
 - A running parent keeps its thinking/tool/retry label. Process counts are
   independent; when both kinds of background work exist, both appear, e.g.
-  `working with 2 subagents; waiting on 1 process`.
+  `2 subagents; 1 shell`. Shell-only work shows `2 shells` (singular for one).
 - Complete, failed, stopped, and **paused** runs do not count as active. Paused
   work follows the existing notification/clarification flow, not a permanent
   dnd state. The last child finishing starts a fresh idle period, unless a

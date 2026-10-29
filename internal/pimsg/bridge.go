@@ -2481,7 +2481,7 @@ func (b *Bridge) markRan() {
 // asked of me", so @free reaches it again. Called by /new, which swaps in a
 // blank session in-process (#130); a restart gets there by construction. The
 // dnd guard in freeForSummons still holds — /new does not kill background
-// processes, so an agent that settles into "waiting on N processes" stays out
+// processes, so an agent that settles into "N shells" stays out
 // of reach.
 func (b *Bridge) markFresh() {
 	b.mu.Lock()
@@ -3978,21 +3978,21 @@ func (b *Bridge) announceSettledPresence() {
 		if children == 1 {
 			noun = "subagent"
 		}
-		label := fmt.Sprintf("working with %d %s", children, noun)
+		label := fmt.Sprintf("%d %s", children, noun)
 		if bg > 0 {
-			processNoun := "processes"
+			processNoun := "shells"
 			if bg == 1 {
-				processNoun = "process"
+				processNoun = "shell"
 			}
-			label += fmt.Sprintf("; waiting on %d %s", bg, processNoun)
+			label += fmt.Sprintf("; %d %s", bg, processNoun)
 		}
 		b.xmpp.SetPresence("dnd", label)
 	} else if bg > 0 {
-		noun := "processes"
+		noun := "shells"
 		if bg == 1 {
-			noun = "process"
+			noun = "shell"
 		}
-		b.xmpp.SetPresence("dnd", fmt.Sprintf("waiting on %d %s", bg, noun))
+		b.xmpp.SetPresence("dnd", fmt.Sprintf("%d %s", bg, noun))
 	} else {
 		b.xmpp.SetPresence("", "listening")
 	}

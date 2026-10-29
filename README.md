@@ -40,10 +40,11 @@ sequenceDiagram
 ## Background work and presence
 
 With `pi-subagents` loaded, session-owned background children keep the account
-busy after the parent turn ends: XMPP shows **dnd**, `working with 1 subagent`
+busy after the parent turn ends: XMPP shows **dnd**, `1 subagent`
 (or a plural count). Concurrent children aggregate; future chain stages do not.
 Parent thinking/tool/retry labels take priority while a parent turn is active.
-Background processes remain visible alongside subagents. Once all work finishes,
+Background processes show as `1 shell` / `2 shells`, or alongside subagents as
+`2 subagents; 2 shells`. Once all work finishes,
 normal listening/away behavior returns. Only counts are published, never tasks,
 prompts, or child output. See [Subagent presence integration](docs/subagents.md#presence-integration)
 for lifecycle, cleanup, and compatibility details.
