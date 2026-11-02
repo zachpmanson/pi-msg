@@ -122,7 +122,8 @@ in that room within the participation window. A message naming one agent or
 replying to that agent's known stanza is routed only to that account; `@everyone`
 reaches the whole room. Peer messages that do not address an agent are not
 visible to it. The durable inbox preserves the original addressed verdict across
-restarts.
+restarts. Addressed peer handoffs have no consecutive-turn limit and do not
+require an intervening owner message. Own-echo filtering still applies.
 
 An outbound room message intended as a handoff should use an explicit
 `send_message(to=<configured room>, …)` and name the recipient. Thread it with

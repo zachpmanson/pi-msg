@@ -136,13 +136,6 @@ type Bridge struct {
 	lifecycleReactTo string // snapshot of reactTo at run start, for lifecycle auto-reacts
 	lifecycleReactID string // snapshot of reactID at run start
 
-	// cascadeMu guards cascade, the count of consecutive agent-to-agent turns
-	// taken with no owner message in between (#23), and cascadeNotified, which
-	// keeps the room notice to one per episode.
-	cascadeMu       sync.Mutex
-	cascade         int
-	cascadeNotified bool
-
 	// handleWarnedRun bounds the unknown-@handle warning to one per run, so a
 	// stubbornly-misspelling agent can't be nudged in a loop.
 	handleWarnedRun bool
@@ -184,24 +177,6 @@ type pendingMarker struct {
 // pending by design, so the queue needs a ceiling rather than an unbounded
 // leak. Oldest entries are dropped first.
 const maxPendingMarkers = 64
-
-// cascadeCap bounds consecutive commentary-triggered turns with no intervening
-// owner (canonical) message, so two agents addressing each other cannot loop
-// indefinitely with no human in the path. Beyond the cap a commentary trigger
-// degrades to no-turn: the message is not handed to the agent at all (the
-// ambient buffer was removed in #106), so the cap is now a hard stop rather
-// than a demotion, and the room is told once (announceCascadeStop) instead of
-// the handoff failing silently. Any canonical message resets the count.
-//
-// This is a runaway backstop, NOT a pacing mechanism. It was originally 3,
-// which silently stalled real multi-agent work twice in one session: the budget
-// went on claim negotiation, then the handoffs that would have started the
-// actual task were dropped, and the fleet sat mute until the owner prodded it.
-// Legitimate rounds ran 8-12 agent messages, so the cap must sit far above
-// that. Reaching it now also announces itself in the room (announceCascadeStop)
-// rather than failing silently, since neither the sender nor the recipient can
-// otherwise distinguish a dropped handoff from a peer still thinking.
-const cascadeCap = 25
 
 // rpcEnv selects the companion extension's tool set. Message delivery and
 // archive reads are available in every account mode; file and reaction tools
@@ -1473,21 +1448,6 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 		return
 	}
 	action, body, _ := b.classify(m)
-	// Cascade bound (#23): an owner message resets the budget; agent-to-agent
-	// turns spend it. When exhausted the trigger is dropped rather than demoted
-	// to a buffered turn, so the count is a hard stop.
-	switch action {
-	case actionCanonical:
-		b.resetCascade()
-	case actionCommentary:
-		if ok, announce := b.spendCascade(); !ok {
-			b.log("warning", fmt.Sprintf("cascade cap (%d) reached; dropping a message from %q instead of taking another turn", cascadeCap, m.Nick))
-			if announce {
-				b.announceCascadeStop(m.Room)
-			}
-			action = actionNotOurs
-		}
-	}
 	switch action {
 	case actionCanonical:
 		// The stanza id always travels: it can be send_message's reply_to
@@ -1510,9 +1470,8 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	case actionNotOurs:
 		// Nothing is handed to the agent, so nothing may stay in the durable
 		// queue: a run will never settle for it (#104). The live path already
-		// filtered before appending, so this branch only sees a message that
-		// arrived as addressed and then hit the cascade cap above, or one
-		// replayed from the inbox — both of which were appended.
+		// filtered before appending, so this branch only sees a message
+		// replayed from the inbox.
 		b.inboxDrop(m.ID, m.From, m.Body)
 	}
 }
@@ -2700,54 +2659,6 @@ func stripCodeSpans(line string) string {
 	return sb.String()
 }
 
-// resetCascade clears the agent-to-agent turn budget; called on any canonical
-// (owner) message, since a human in the loop means this isn't a runaway.
-func (b *Bridge) resetCascade() {
-	b.cascadeMu.Lock()
-	b.cascade = 0
-	b.cascadeNotified = false
-	b.cascadeMu.Unlock()
-}
-
-// spendCascade consumes one unit of the agent-to-agent turn budget. ok reports
-// whether a turn may be taken; announce is true exactly once per episode, on
-// the first refusal, so the room is told the first time this agent goes quiet
-// rather than on every subsequent dropped handoff.
-func (b *Bridge) spendCascade() (ok, announce bool) {
-	b.cascadeMu.Lock()
-	defer b.cascadeMu.Unlock()
-	if b.cascade >= cascadeCap {
-		if b.cascadeNotified {
-			return false, false
-		}
-		b.cascadeNotified = true
-		return false, true
-	}
-	b.cascade++
-	return true, false
-}
-
-// announceCascadeStop posts a visible notice in the room when this agent stops
-// answering peer handoffs, so a stall is diagnosable from the chat itself. The
-// notice names neither an @handle nor the agent's own nick: with bare-name
-// mentions addressing agents (#106), even "pi is no longer answering" would
-// address every agent called pi and extend the cascade it is reporting. The
-// room already shows who posted it.
-func (b *Bridge) announceCascadeStop(room string) {
-	if b.xmpp == nil || room == "" {
-		return
-	}
-	b.xmpp.SendRoomTo(bareJid(room), cascadeStopNotice())
-}
-
-// cascadeStopNotice is the text announceCascadeStop posts. Split out so the
-// wording can be asserted without an XMPP session: it must not address anyone.
-func cascadeStopNotice() string {
-	return fmt.Sprintf(
-		"⚠️ No longer answering agent handoffs — %d consecutive agent-to-agent turns with no message from the owner. Further handoffs are dropped rather than kept as context. A message from the owner resumes normal operation.",
-		cascadeCap)
-}
-
 // handleRe matches an "@handle" mention. A trailing "." or "@" is excluded so
 // bare JIDs and email addresses in the body aren't mistaken for mentions.
 var handleRe = regexp.MustCompile(`@([A-Za-z0-9_-]+)`)
@@ -2990,7 +2901,7 @@ func (b *Bridge) addressesRoom(room, body string) bool {
 }
 
 // untaggedRoomNotice is the wording of the untagged-reply warning. Split out so
-// the text can be asserted without an rpc client, like cascadeStopNotice.
+// the text can be asserted without an rpc client.
 func untaggedRoomNotice(addressable []string) string {
 	var sb strings.Builder
 	sb.WriteString("[pi-msg: routing: your last message to the room tagged nobody — it named no @handle and no agent by name, so pi-msg delivered it to no agent at all. It sits in the room for the owner, who reads the untagged traffic, and for nobody else.")

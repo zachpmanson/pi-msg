@@ -2,6 +2,7 @@ package pimsg
 
 import (
 	"bytes"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -463,62 +464,6 @@ func TestInitialPromptCompose(t *testing.T) {
 	}
 }
 
-func TestCascadeCap(t *testing.T) {
-	b := roomBridge()
-	for i := 0; i < cascadeCap; i++ {
-		ok, announce := b.spendCascade()
-		if !ok {
-			t.Fatalf("turn %d denied, want allowed (cap is %d)", i+1, cascadeCap)
-		}
-		if announce {
-			t.Errorf("turn %d announced, want silent while under cap", i+1)
-		}
-	}
-	// First refusal announces; later ones stay quiet so one stall produces one
-	// notice rather than a stream of them.
-	ok, announce := b.spendCascade()
-	if ok || !announce {
-		t.Errorf("first refusal = (ok %v, announce %v), want (false, true)", ok, announce)
-	}
-	ok, announce = b.spendCascade()
-	if ok || announce {
-		t.Errorf("second refusal = (ok %v, announce %v), want (false, false)", ok, announce)
-	}
-	// An owner message puts a human back in the loop and restores the budget,
-	// including the right to announce again on a later episode.
-	b.resetCascade()
-	if ok, _ := b.spendCascade(); !ok {
-		t.Errorf("turn denied after reset, want allowed")
-	}
-	for i := 1; i < cascadeCap; i++ {
-		b.spendCascade()
-	}
-	if ok, announce := b.spendCascade(); ok || !announce {
-		t.Errorf("post-reset refusal = (ok %v, announce %v), want (false, true)", ok, announce)
-	}
-}
-
-// The cascade notice must name neither an @handle nor the agent's own nick, or
-// reporting a cascade would itself address an agent (#106 widened addressing to
-// bare names) and extend the cascade.
-func TestCascadeNoticeDoesNotAddress(t *testing.T) {
-	b := roomBridge()
-	notice := cascadeStopNotice()
-	if strings.Contains(notice, "@") {
-		t.Errorf("cascade notice contains an @mention: %q", notice)
-	}
-	if addressed, _ := b.matchTrigger("team@muc.x.com", notice); addressed {
-		t.Errorf("cascade notice addresses an agent: %q", notice)
-	}
-	// And under every nick the fleet actually uses, since bare-name mentions
-	// (#106) mean any of them appearing as a word would re-address an agent.
-	for _, trig := range []string{"peppy", "fox", "falco", "slippy", "beltino", "r2d2"} {
-		if containsMention(notice, trig) {
-			t.Errorf("cascade notice addresses %q: %q", trig, notice)
-		}
-	}
-}
-
 // A mistyped mention is inert -- it addresses nobody and reports nothing -- so
 // the bridge has to spot it. Live evidence: "@zbeltino" was written 8 times
 // against "@beltino" 5, i.e. most attempts to address that agent went nowhere.
@@ -744,26 +689,26 @@ func TestHandleRoomDropsOwnEcho(t *testing.T) {
 	}
 }
 
-// TestUnaddressedMessageDropsNothingButItself: the durable queue must not be
-// used as a parking space for messages that will never become a prompt (#104),
-// including one that arrives addressed and then hits the cascade cap.
-func TestCascadeCapDropsRatherThanBuffers(t *testing.T) {
-	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
+// Addressed peer messages must keep reaching pi without an intervening owner
+// message, including well beyond the former 25-turn handoff limit.
+func TestPeerHandoffsHaveNoTurnCap(t *testing.T) {
+	const room = "team@muc.x"
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{room}, Nick: "pi", RoomTrigger: "pi"}
 	b := newTestBridge(acct)
-	b.rpc = &RPCClient{stdin: &nopClose{buf: &bytes.Buffer{}}, mu: sync.Mutex{}}
+	var buf bytes.Buffer
+	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
 	b.inbox = newInbox(filepath.Join(t.TempDir(), "t.inbox.jsonl"), b.log)
-	for i := 0; i < cascadeCap; i++ {
-		b.spendCascade()
-	}
-	b.handleRoom(InboundMessage{
-		ID: "capped-1", Nick: "alice", Room: "team@muc.x.com",
-		From: "alice@x.com/alice", Body: "pi: one more thing",
-	})
-	if n := b.inbox.len(); n != 0 {
-		t.Errorf("a cascade-capped message left %d inbox entries, want 0", n)
-	}
-	if b.streaming() {
-		t.Error("a cascade-capped message must not start a run")
+	for i := 0; i < 100; i++ {
+		id := fmt.Sprintf("handoff-%d", i)
+		buf.Reset()
+		b.handleRoom(InboundMessage{
+			ID: id, Nick: "alice", Room: room,
+			From: room + "/alice", RealJID: "alice@x", Body: "pi: one more thing",
+		})
+		if got := capturedPrompt(t, &buf); !strings.Contains(got, "stanza-id: "+id) {
+			t.Fatalf("handoff %d did not reach pi: %q", i+1, got)
+		}
+		b.setStreaming(false)
 	}
 }
 
