@@ -315,6 +315,16 @@ func (c *RPCClient) Prompt(message, streamingBehavior string) {
 	c.Send(cmd)
 }
 
+// promptWithID reports pipe failures synchronously but leaves acceptance on the
+// ordered Events stream. It must not wait for a response inside an RPC handler.
+func (c *RPCClient) promptWithID(id, message, streamingBehavior string) error {
+	cmd := map[string]any{"id": id, "type": "prompt", "message": message}
+	if streamingBehavior != "" {
+		cmd["streamingBehavior"] = streamingBehavior
+	}
+	return c.write(cmd)
+}
+
 func (c *RPCClient) NewSession(ctx context.Context) (Event, error) {
 	return c.Request(ctx, map[string]any{"type": "new_session"}, 30*time.Second)
 }

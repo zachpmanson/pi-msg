@@ -82,7 +82,12 @@ type Bridge struct {
 	// inbound delivery, so a message at the away boundary lands in one session.
 	sessionTransitionMu sync.Mutex
 	streamingRun        bool
-	busyMarked          bool // on-disk <acct>.busy reflects work in flight (see syncBusyMarker)
+	settlingRun         bool // settle-time prompts still belong to the old session
+	nextTransition      bool // reserved under mu; RPC events must never wait on it
+	syntheticPrompts    int  // submissions reserved before synthetic-turn state changes
+	promptSequence      uint64
+	pendingPrompts      map[string]struct{} // written prompts awaiting ordered acceptance/rejection
+	busyMarked          bool                // on-disk <acct>.busy reflects work in flight (see syncBusyMarker)
 	repliedThisRun      bool
 	shuttingDown        bool
 	reactTo             string // full JID of the owner message the current run reacts to
@@ -347,6 +352,18 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// also confirms pi is live and reading stdin — a safe point to inject the
 	// proactive volunteer turn.
 	b.refreshSessionFile()
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			b.pollReconciles()
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
 
 	// Fire the invocation-time initial prompt once, on an on-demand spawn: the
 	// task IS the launch reason, so it must be the session's first prompt. Like
@@ -454,6 +471,15 @@ func (b *Bridge) shutdown(reason string) {
 // current activity label (thinking / running a tool / drafting / retrying).
 func (b *Bridge) handleRPCEvent(ev Event) {
 	switch ev.Type() {
+	case "response":
+		// Unlike Request responses, prompt acceptance is handled on the event
+		// stream: earlier agent_start/settled events must be observed first.
+		if b.finishPromptAcceptance(ev.Str("id"), !ev.success()) {
+			b.syncBusyMarker()
+			if !ev.success() {
+				b.log("warning", "prompt rejected: "+ev.errText())
+			}
+		}
 	case "agent_start":
 		b.setStreaming(true)
 		b.markRan() // this bridge has work behind it now, so @free no longer reaches it (#130)
@@ -466,6 +492,17 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.xmpp.SetPresence("dnd", "thinking…")
 		b.lifecycleReact("👀") // picked up (opt-in; ack-only runs stay silent)
 	case "agent_settled":
+		b.mu.Lock()
+		if b.nextTransition {
+			// A late old-session settle must not wake the fresh primary. /next
+			// performs local cleanup; never block the RPC event loop on the
+			// session-transition mutex while /next awaits an RPC response.
+			b.mu.Unlock()
+			return
+		}
+		b.settlingRun = true
+		b.mu.Unlock()
+		defer func() { b.mu.Lock(); b.settlingRun = false; b.mu.Unlock() }()
 		b.clearAllStreamComposing()
 		b.ackInboxSettled()
 		b.setStreaming(false)
@@ -1024,12 +1061,16 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		// never lost. The relay itself always answers ok: gathering the report
 		// is the extension's job; delivery timing is the bridge's.
 		text := b.formatHeartbeat(cmd.Processes)
-		if b.streaming() {
-			b.mu.Lock()
+		b.mu.Lock()
+		if b.nextTransition {
+			// An old-session alarm must not enter the fresh primary.
+			b.mu.Unlock()
+		} else if b.streamingRun {
 			b.pendingHeartbeats = append(b.pendingHeartbeats, text)
 			b.mu.Unlock()
 			b.log("info", fmt.Sprintf("process heartbeat queued (%d process(es), run in flight)", len(cmd.Processes)))
 		} else {
+			b.mu.Unlock()
 			b.fireHeartbeat(text)
 		}
 		b.rpc.RespondUIRelay(id, "ok")
@@ -1172,7 +1213,7 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 			excerpt = reactionExcerpt(e.Body)
 		}
 	}
-	b.rpc.Prompt(
+	b.submitPrompt(
 		fmt.Sprintf("[pi-msg: room: %s reacted %s to your message %q. You may acknowledge, act on it, or ignore; no reply is required unless you need to send a message with send_message.]", render, joint, excerpt),
 		b.steerBehavior())
 	if b.xmpp != nil {
@@ -1515,7 +1556,7 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 	// would upload the session file to whatever room the agent spoke in last
 	// (zpm/beltino#56).
 	b.setTurnDest(origin, false) // the owner wrote it, so no tag is expected
-	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!")) && b.handleCommand(t) {
+	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!") || t == "&") && b.handleCommand(t) {
 		// Handled in-process: it never becomes a prompt, so nothing will ever
 		// settle for it (#104).
 		b.inboxDrop(reactID, "", "")
@@ -1544,7 +1585,7 @@ func (b *Bridge) promptMarked(prompt string, markable bool, to, id string) {
 	if markable {
 		b.addPendingMarker(prompt, to, id)
 	}
-	b.rpc.Prompt(prompt, b.steerBehavior())
+	b.submitPrompt(prompt, b.steerBehavior())
 }
 
 // addPendingMarker queues a deferred "displayed" marker keyed by the exact
@@ -1628,7 +1669,7 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.setTurnDest(origin, true) // a peer's handoff: an untagged reply here is the mistake
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
-	b.rpc.Prompt(b.composePrompt(t, origin, sender, reactID, reactTo, replyTo, notice), b.steerBehavior())
+	b.submitPrompt(b.composePrompt(t, origin, sender, reactID, reactTo, replyTo, notice), b.steerBehavior())
 	b.busyPresence("thinking…")
 }
 
@@ -1637,6 +1678,9 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 // caller forwards it to pi as a prompt.
 func (b *Bridge) handleCommand(t string) bool {
 	name, arg := splitCommand(t)
+	if t == "&" {
+		name = "next"
+	}
 	// A lone "!" is the quick interrupt — deliberately NOT /abort. With no
 	// command name after the prefix it would otherwise fall through to pi as a
 	// degenerate literal prompt (an empty control command); instead it only
@@ -1651,40 +1695,24 @@ func (b *Bridge) handleCommand(t string) bool {
 	// all control/session work is complete; flush also waits for onInbound's
 	// session-transition lock before delivering a pending timeout.
 	switch name {
-	case "new", "abort", "stop", "interrupt":
+	case "new", "next", "abort", "stop", "interrupt":
 		defer b.wakeReplyWatches()
 	}
 	switch name {
+	case "next":
+		b.handleNext(arg)
 	case "new":
 		if b.streaming() {
 			b.rpc.Abort()
 		}
 		b.settleLocally()
 		res, err := b.rpc.NewSession(b.ctx)
+		if err == nil && res.success() && res.Obj("data").Bool("cancelled") {
+			err = fmt.Errorf("session reset cancelled")
+		}
 		b.reportResult(err, res, "🆕 new session ready", "/new")
-		if err == nil {
-			// /new also reports OpenRouter credit when a creditWatch floor is
-			// configured (see reportCreditIfWatched). It's diagnostic only —
-			// fetch it off the event loop so a slow credits endpoint can't
-			// stall /new's cleanup (session file refresh, routing re-seed) or
-			// block queued inbound messages behind the handler.
-			go b.reportCreditIfWatched()
-			// /new swaps to a brand-new session, but pi does NOT emit a
-			// session_start event over the RPC stream (it's a lifecycle hook the
-			// extension sees via pi.on(), not an event the bridge receives — the
-			// session_start case in handleRPCEvent is effectively dead code). So
-			// the saved resume pointer would otherwise go stale, and the next
-			// restart would resume an OLD conversation. Persist the new session
-			// file now so a restart continues this conversation instead.
-			b.refreshSessionFile()
-			// A fresh session has no messaging contract in context yet — re-seed
-			// it on the next prompt (once).
-			b.messagingSeeded = false
-			// /new leaves the agent with a blank session and nothing asked of it,
-			// which is the state a fresh bridge is in: make it free to @free again
-			// rather than leaving it in the settled window for idleAwayTimeout
-			// (#130). A run that starts off the back of this sets the flag again.
-			b.markFresh()
+		if err == nil && res.success() {
+			b.afterNewSession()
 		}
 	case "compact":
 		res, err := b.rpc.Compact(b.ctx, arg)
@@ -1735,6 +1763,15 @@ func (b *Bridge) handleCommand(t string) bool {
 		return false
 	}
 	return true
+}
+
+// afterNewSession preserves /new's persistence, routing seed, credit and fresh
+// state semantics for both /new and /next. No old-context prompt is injected.
+func (b *Bridge) afterNewSession() {
+	go b.reportCreditIfWatched()
+	b.refreshSessionFile()
+	b.messagingSeeded = false
+	b.markFresh()
 }
 
 // handleExport renders the current session to HTML (deterministically, via pi's
@@ -2781,6 +2818,10 @@ func (b *Bridge) handleIssues(room, body string) (unknown []string, selfTag stri
 // thing is bounded to a single warning per run so a stubbornly-misaddressing
 // agent can't be nudged in a loop.
 func (b *Bridge) warnHandleProblems(room, body string) {
+	if !b.reserveSyntheticPrompt() {
+		return
+	}
+	defer b.releaseSyntheticPrompt()
 	if b.handleWarned() {
 		return
 	}
@@ -2824,7 +2865,7 @@ func (b *Bridge) warnHandleProblems(room, body string) {
 	// fleet sat idle. Given an explicit cheap out, a fleet trained to prefer
 	// silence will take it, so state the consequence and ask for the decision.
 	sb.WriteString(" If anyone needs to act on it, resend addressing them.]")
-	b.rpc.Prompt(sb.String(), b.steerBehavior())
+	b.promptSynthetic(sb.String())
 }
 
 func (b *Bridge) setHandleWarned(v bool) { b.mu.Lock(); b.handleWarnedRun = v; b.mu.Unlock() }
@@ -2928,6 +2969,10 @@ func untaggedRoomNotice(addressable []string) string {
 // tagging is always required, which is not the rule. Non-blocking either way —
 // the message did reach the room.
 func (b *Bridge) warnUntaggedRoomReply(room, body string) {
+	if !b.reserveSyntheticPrompt() {
+		return
+	}
+	defer b.releaseSyntheticPrompt()
 	if !b.peerTriggered() || b.untaggedWarned() {
 		return
 	}
@@ -2938,7 +2983,7 @@ func (b *Bridge) warnUntaggedRoomReply(room, body string) {
 	_, _, valid := b.handleIssues(room, body)
 	b.log("warning", fmt.Sprintf("room reply in %s addressed nobody; addressable: %v", room, valid))
 	if b.rpc != nil {
-		b.rpc.Prompt(untaggedRoomNotice(valid), b.steerBehavior())
+		b.promptSynthetic(untaggedRoomNotice(valid))
 	}
 }
 
@@ -3149,11 +3194,17 @@ func (b *Bridge) unansweredRun() (inbound, delivered int, ok bool) {
 // The hint is a prompt, not a chat message: it never reaches the owner. The
 // agent answers it with send_message calls for anything still outstanding.
 func (b *Bridge) fireUnansweredHint(inbound, delivered int, history []runLogEntry) bool {
+	if !b.reserveSyntheticPrompt() {
+		return false
+	}
+	defer b.releaseSyntheticPrompt()
 	if !b.bumpHintNudge() {
 		return false
 	}
 	b.log("notice", fmt.Sprintf("run took %d messages and sent %d replies: asking the agent to check for unanswered ones", inbound, delivered))
-	b.rpc.Prompt(unansweredHintText(inbound, delivered, history), b.steerBehavior())
+	if !b.promptSynthetic(unansweredHintText(inbound, delivered, history)) {
+		return false
+	}
 	b.markHintPending()
 	return true
 }
@@ -3213,12 +3264,15 @@ func (b *Bridge) resetHintNudges() { b.mu.Lock(); b.hintNudges = 0; b.mu.Unlock(
 // fireSendRecovery asks for an explicit send_message after a run produced no
 // chat stanza. Its prompt is internal; final assistant text remains undelivered.
 func (b *Bridge) fireSendRecovery() bool {
+	if !b.reserveSyntheticPrompt() {
+		return false
+	}
+	defer b.releaseSyntheticPrompt()
 	if !b.bumpSendRecoveryNudge() {
 		return false
 	}
 	b.log("notice", "run ended without sending a chat message: asking the agent to use send_message")
-	b.rpc.Prompt("[pi-msg: recovery: No chat message was sent during the last run. Final assistant text is internal and was not delivered. If a reply is needed, call send_message(to, text, reply_to?) now; use a separate call for each message. The tool result will confirm whether each message was sent.]", b.steerBehavior())
-	return true
+	return b.promptSynthetic("[pi-msg: recovery: No chat message was sent during the last run. Final assistant text is internal and was not delivered. If a reply is needed, call send_message(to, text, reply_to?) now; use a separate call for each message. The tool result will confirm whether each message was sent.]")
 }
 
 func (b *Bridge) handleModel(arg string) {
@@ -4185,7 +4239,7 @@ func (b *Bridge) setStreaming(v bool) {
 // to decide which accounts to reprompt on resume; an idle agent is left silent.
 func (b *Bridge) syncBusyMarker() {
 	b.mu.Lock()
-	busy := b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0
+	busy := b.streamingRun || len(b.pendingPrompts) > 0 || b.bgProcesses > 0 || b.bgSubagents > 0
 	changed := busy != b.busyMarked
 	b.busyMarked = busy
 	b.mu.Unlock()
@@ -4197,9 +4251,11 @@ func (b *Bridge) streaming() bool   { b.mu.Lock(); defer b.mu.Unlock(); return b
 func (b *Bridge) setReplied(v bool) { b.mu.Lock(); b.repliedThisRun = v; b.mu.Unlock() }
 func (b *Bridge) replied() bool     { b.mu.Lock(); defer b.mu.Unlock(); return b.repliedThisRun }
 
-// steerBehavior returns "steer" when a run is already in flight, else "".
+// Pending preflight can become streaming before the next input is processed.
 func (b *Bridge) steerBehavior() string {
-	if b.streaming() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.streamingRun || len(b.pendingPrompts) > 0 {
 		return "steer"
 	}
 	return ""
@@ -4272,18 +4328,90 @@ func heartbeatTail(tail string) string {
 	return tail
 }
 
+// Synthetic submissions and /next reserve activity atomically, without holding
+// mu across transport/RPC writes. Reserve before inspecting old-turn state.
+func (b *Bridge) reserveSyntheticPrompt() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.nextTransition {
+		return false
+	}
+	b.syntheticPrompts++
+	return true
+}
+
+func (b *Bridge) releaseSyntheticPrompt() {
+	b.mu.Lock()
+	b.syntheticPrompts--
+	b.mu.Unlock()
+}
+
+// Track every submission before its pipe write. Pi can await asynchronous
+// preflight while get_state still says idle; acceptance/rejection arrives as an
+// ordered response event. Never guess actual streaming state from a write.
+func (b *Bridge) submitPrompt(text, behavior string) bool {
+	b.mu.Lock()
+	if b.nextTransition {
+		b.mu.Unlock()
+		return false
+	}
+	b.promptSequence++
+	id := fmt.Sprintf("bridge-prompt-%d", b.promptSequence)
+	if b.pendingPrompts == nil {
+		b.pendingPrompts = make(map[string]struct{})
+	}
+	b.pendingPrompts[id] = struct{}{}
+	b.mu.Unlock()
+	b.syncBusyMarker()
+	if err := b.rpc.promptWithID(id, text, behavior); err != nil {
+		b.finishPromptAcceptance(id, true)
+		b.syncBusyMarker()
+		b.log("warning", "prompt send failed: "+err.Error())
+		return false
+	}
+	return true
+}
+
+func (b *Bridge) finishPromptAcceptance(id string, rejected bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, tracked := b.pendingPrompts[id]
+	delete(b.pendingPrompts, id)
+	if tracked && rejected && !b.streamingRun && len(b.pendingPrompts) == 0 {
+		// Preflight rejection need not emit any lifecycle event to consume
+		// these one-shot flags. Do not poison later synthetic wakeups.
+		b.heartbeatRun = false
+		b.volunteered = false
+		b.reactionAckRun = false
+		b.hintPending = false
+	}
+	return tracked
+}
+
+// Caller holds a synthetic reservation through old-turn state inspection and
+// submission. Pending acceptance, not streamingRun, covers the preflight gap.
+func (b *Bridge) promptSynthetic(text string) bool {
+	return b.submitPrompt(text, b.steerBehavior())
+}
+
 // fireHeartbeat wakes the (idle) agent with a long-running-process alarm,
 // routing any response to the owner like the other synthetic prompts. The run
 // is marked heartbeatRun so its expected private/no-message outcome is treated
 // like a volunteer or reaction-ack run: no 🫡 reaction, recovery, or
 // unanswered-message hints.
 func (b *Bridge) fireHeartbeat(text string) {
+	if !b.reserveSyntheticPrompt() {
+		return
+	}
+	defer b.releaseSyntheticPrompt()
 	if text == "" {
 		return
 	}
 	b.heartbeatRun = true
 	b.setTurnDest(b.acct.Owner, false)
-	b.rpc.Prompt(text, b.steerBehavior())
+	if !b.promptSynthetic(text) {
+		return
+	}
 	b.xmpp.SetPresence("dnd", "thinking…")
 	b.log("info", "process heartbeat injected")
 }
@@ -4306,14 +4434,19 @@ func (b *Bridge) flushPendingHeartbeats() {
 // volunteer a line to the owner (start directive "proactive"). If it has
 // nothing to volunteer it replies with nothing, and agent_settled stays silent.
 func (b *Bridge) fireResumeTurn() {
+	if !b.reserveSyntheticPrompt() {
+		return
+	}
+	defer b.releaseSyntheticPrompt()
 	b.volunteered = true
 	b.setLifecycleReactTarget("", "")
 	b.setTurnDest(b.acct.Owner, false)
-	b.rpc.Prompt(
-		"[pi-msg: startup: your session was resumed (continued from a previous process). "+
-			"You may volunteer to continue the conversation or task from the previous session. "+
-			"If you have nothing worth volunteering, do not send a chat message; final assistant text is internal.]",
-		b.steerBehavior())
+	if !b.promptSynthetic(
+		"[pi-msg: startup: your session was resumed (continued from a previous process). " +
+			"You may volunteer to continue the conversation or task from the previous session. " +
+			"If you have nothing worth volunteering, do not send a chat message; final assistant text is internal.]") {
+		return
+	}
 	b.xmpp.SetPresence("dnd", "thinking…")
 }
 
@@ -4324,9 +4457,15 @@ func (b *Bridge) fireResumeTurn() {
 // messaging contract seed (messagingSeeded is false for a forced-fresh launch), and
 // the reply routes to the owner, mirroring fireResumeTurn.
 func (b *Bridge) fireInitialPrompt() {
+	if !b.reserveSyntheticPrompt() {
+		return
+	}
+	defer b.releaseSyntheticPrompt()
 	b.setLifecycleReactTarget("", "")
 	b.setTurnDest(b.acct.Owner, false)
-	b.rpc.Prompt(b.composePrompt(b.initialPrompt, b.acct.Owner, "", "", "", "", nil), b.steerBehavior())
+	if !b.promptSynthetic(b.composePrompt(b.initialPrompt, b.acct.Owner, "", "", "", "", nil)) {
+		return
+	}
 	b.xmpp.SetPresence("dnd", "thinking…")
 }
 

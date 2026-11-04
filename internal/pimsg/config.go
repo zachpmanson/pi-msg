@@ -151,6 +151,8 @@ type Account struct {
 	// Workdir is the working directory for the pi agent. Defaults to the
 	// process cwd.
 	Workdir string `json:"workdir,omitempty"`
+	// ReconcileSkill enables /next with an explicit reconcile SKILL.md path.
+	ReconcileSkill string `json:"reconcileSkill,omitempty"`
 
 	// Rooms, when set, additionally joins these bare MUC JIDs (e.g.
 	// "team@muc.chat.example.com") and relays group chat. An array of objects,
@@ -237,6 +239,7 @@ type ResolvedAccount struct {
 	ResetSessionOnAway bool
 	Model              string
 	Workdir            string
+	ReconcileSkill     string
 	// Rooms is the joined room JIDs (normal rooms only — the error room is not
 	// in here, and must never be). It is derived from RoomSpecs at resolve time.
 	Rooms []string
@@ -824,6 +827,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		ResetSessionOnAway: acct.ResetSessionOnAway,
 		Model:              acct.Model,
 		Workdir:            acct.Workdir,
+		ReconcileSkill:     acct.ReconcileSkill,
 		Rooms:              rooms,
 		RoomSpecs:          specs,
 		Nick:               nick,
