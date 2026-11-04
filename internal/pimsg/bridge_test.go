@@ -316,7 +316,7 @@ func TestInboundReactionAck(t *testing.T) {
 	// A room reaction only reaches us when it acks a message WE sent, so the
 	// target id has to be one of ours.
 	b2 := roomBridge()
-	b2.rpc = &RPCClient{} // fire-and-forget send to nowhere; avoids a nil deref
+	b2.rpc = &RPCClient{stdin: &nopClose{buf: new(bytes.Buffer)}} // accept the prompt pipe write
 	b2.xmpp = NewXMPPBridge(b2.acct, func(InboundMessage) {}, b2.log)
 	b2.xmpp.recordSelfMessage("target-123", "team@muc.x.com", "our message")
 	b2.onInbound(InboundMessage{
@@ -353,7 +353,7 @@ func TestInboundReactionAck(t *testing.T) {
 	// attribute (never seen) still wakes us: the owner is trusted traffic, and a
 	// reaction id we do not hold may be our own from before a restart.
 	b5 := roomBridge()
-	b5.rpc = &RPCClient{}
+	b5.rpc = &RPCClient{stdin: &nopClose{buf: new(bytes.Buffer)}}
 	b5.xmpp = NewXMPPBridge(b5.acct, func(InboundMessage) {}, b5.log)
 	b5.xmpp.recordInboundMessage("peppys-message", "team@muc.x.com/peppy", "we shipped", false)
 	b5.onInbound(InboundMessage{
@@ -373,7 +373,7 @@ func TestInboundReactionAck(t *testing.T) {
 
 	// Owner reacting on 1:1 renders as "owner" and turns to the owner.
 	b3 := NewBridge(ResolvedAccount{Owner: "zach@x.com", Nick: "pi"}, false)
-	b3.rpc = &RPCClient{}
+	b3.rpc = &RPCClient{stdin: &nopClose{buf: new(bytes.Buffer)}}
 	b3.onInbound(InboundMessage{
 		Direct: true, FromOwner: true, From: "zach@x.com/res",
 		Reactions: []string{"\u2705"}, ReactionID: "out-1",
@@ -396,7 +396,7 @@ func TestReactionAckRunSuppressesAutomaticReactions(t *testing.T) {
 	b.xmpp = NewXMPPBridge(acct, func(InboundMessage) {}, func(_, msg string) {
 		logs = append(logs, msg)
 	})
-	b.rpc = &RPCClient{}
+	b.rpc = &RPCClient{stdin: &nopClose{buf: new(bytes.Buffer)}}
 	b.xmpp.recordSelfMessage("target-123", "team@muc.x.com", "our message")
 	b.setLifecycleReactTarget("team@muc.x.com", "target-123")
 	b.onInbound(InboundMessage{

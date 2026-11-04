@@ -15,6 +15,15 @@ import (
 
 // Run parses command-line flags and runs the bridge.
 func Run() error {
+	// Private job runner: bypass account startup, messaging and orchestration.
+	if len(os.Args) == 3 && os.Args[1] == "--internal-reconcile" {
+		return runReconcile(os.Args[2])
+	}
+	defaultUsage := flag.Usage
+	flag.Usage = func() {
+		defaultUsage()
+		fmt.Fprintln(flag.CommandLine.Output(), "\nChat controls: /new resets; /next, !next, or standalone & reset and reconcile the old session in background (requires per-account reconcileSkill; wait for active work to settle). See docs/next.md.")
+	}
 	// Invocation-time initial prompt: spawn a fresh, on-demand persona with this
 	// task as its very first prompt (beltino#18 doer flow). --command is an
 	// alias; both are explicit "stateless spawn" requests, so the saved session
@@ -107,6 +116,9 @@ func printAccountSummary(a ResolvedAccount) {
 	fmt.Fprintf(out, "resource: %s\n", a.Resource)
 	if a.Workdir != "" {
 		fmt.Fprintf(out, "workdir: %s\n", a.Workdir)
+	}
+	if a.ReconcileSkill != "" {
+		fmt.Fprintf(out, "reconcile skill: %s\n", a.ReconcileSkill)
 	}
 	if a.Model != "" {
 		fmt.Fprintf(out, "model: %s\n", a.Model)

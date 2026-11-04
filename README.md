@@ -25,6 +25,7 @@ sequenceDiagram
 ## Supported features
 
 - Sessions resuming across restarts, `/new` to reset
+- `/next` (or standalone `&`) to reset immediately and reconcile the old session in the background
 - Pi slash commands work over chat
 - XMPP DMs and group chats
 - Explicit outbound messages via `send_message`; final assistant text is internal
@@ -63,6 +64,7 @@ Your chat messages → routed to Pi:
 | plain text | a prompt to the agent |
 | `/skill:name …`, `/template …`, any extension command | a prompt (Pi expands/runs it) |
 | `/new` | `new_session` (fresh session; connection stays up) |
+| `/next` or standalone `&` | fresh session immediately; independent background issue/wiki reconciliation of the previous session (requires `reconcileSkill`; refuses active/queued/session-owned background work) |
 | `/compact [instructions]` | `compact` |
 | `/model <provider/id>` or `/model <search>` | `set_model` |
 | `/models` | list available models with the current one marked (no LLM turn) |
@@ -76,7 +78,12 @@ Your chat messages → routed to Pi:
 | `/quit` (or `/exit`) | shut down the bridge and Pi |
 
 `!` can also be used as command prefix — `/new` and `!new` are
-interchangeable.
+interchangeable, including `/next` and `!next`. Only exact standalone `&` is
+an alias; other ampersand text is a normal prompt. `/next` takes no arguments.
+The bridge sends queued/start and final notices to the initiating conversation;
+no old context is injected into the fresh session. See [Background reconciliation](docs/next.md)
+for private artifacts, timeout/cancellation, restart recovery, and shared-wiki
+concurrency limitations.
 
 ## Configuration
 
@@ -108,6 +115,7 @@ Per-account fields:
 | `resource` | no | `pi-msg` | XMPP resource (client-session label) |
 | `model` | no | Pi's default | model pattern passed to `pi --model` |
 | `workdir` | no | current dir | working directory for the agent (also where Pi discovers `AGENTS.md`/`CLAUDE.md`) |
+| `reconcileSkill` | no | disabled | absolute path to the unattended reconciliation `SKILL.md`, e.g. `/home/beltino/beltino/.pi/skills/reconcile/SKILL.md`; enables `/next` / `&`. Read/copied before reset; sibling learn skill loaded when present. See [operations](docs/next.md). |
 | `rooms` | no | `[]` | group-chat rooms: objects with `jid`, `role`, `trigger`, and `reactions`; legacy `room` and `errorRoom` fields are rejected |
 | `nick` | no | JID localpart | occupant nickname used in the room(s) |
 | `roomTrigger` | no | `nick` | account-wide address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`); override per room |

@@ -113,6 +113,10 @@ func TestReplyWatchInterruptDrainsQueuedExpiry(t *testing.T) {
 	if !b.heartbeatRun {
 		t.Fatal("timeout not marked synthetic")
 	}
+	// Pi accepted the timeout prompt and started its synthetic run. The fake
+	// transport has no RPC event loop, so deliver those ordered events here.
+	acceptPromptResponses(b, true)
+	b.setStreaming(true)
 	// Aborting the synthetic run must not leave heartbeatRun blocking later watches.
 	if !b.handleCommand("!") {
 		t.Fatal("second interrupt not handled")

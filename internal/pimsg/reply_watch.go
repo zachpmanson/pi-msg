@@ -77,7 +77,7 @@ func (b *Bridge) wakeReplyWatches() {
 // map lets a fresh reply or replacement invalidate a busy-agent queued nudge.
 func (b *Bridge) deliverReplyWatch(w *replyWatch) {
 	b.mu.Lock()
-	blocked := b.streamingRun || b.shuttingDown || b.heartbeatRun || b.volunteered
+	blocked := b.streamingRun || len(b.pendingPrompts) > 0 || b.shuttingDown || b.heartbeatRun || b.volunteered
 	b.mu.Unlock()
 	if blocked || !w.expired || b.replyWatches[w.conversation] != w {
 		return
@@ -89,15 +89,16 @@ func (b *Bridge) deliverReplyWatch(w *replyWatch) {
 	b.mu.Lock()
 	b.heartbeatRun = true
 	b.mu.Unlock()
-	// Reserve the run before RPC's asynchronous agent_start acknowledgement so
-	// simultaneous expiries cannot submit competing prompts or change routing.
-	b.setStreaming(true)
+	// submitPrompt reserves pending acceptance before the pipe write, without
+	// inventing streaming activity if Pi rejects preflight.
 	b.setLifecycleReactTarget("", "")
 	b.setTurnDest(w.conversation, w.room)
 	var prompt strings.Builder
 	b.seedContracts(&prompt)
 	prompt.WriteString(text)
-	b.rpc.Prompt(prompt.String(), "")
+	if !b.submitPrompt(prompt.String(), "") {
+		return
+	}
 	b.xmpp.SetPresence("dnd", "thinking…")
 }
 
