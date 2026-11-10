@@ -126,7 +126,7 @@ Per-account fields:
 | `resetSessionOnAway` | no | `false` | Start a fresh Pi session when the account becomes idle/away; prior session files are retained |
 | `beforeAgentStartText` | no | — | literal text added to the system prompt before every turn; empty or whitespace means unset |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |
-| `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). A model run that dies on an OpenRouter out-of-credits error (HTTP 402) is also reported to the owner directly instead of the generic 🫡 unanswered-run reaction. e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
+| `creditWatch` | no | — | low-credit protection with a `minBelowUsd` floor. Reports the remaining OpenRouter balance after every `/new`, and a proactive watcher probes the balance hourly and DMs the owner when it drops below the floor (re-warns at most every 6h while still below). e.g. `{ "creditWatch": { "minBelowUsd": 2 } }`. Only active when pi's auth file (`<config-dir>/auth.json`) holds an `openrouter` api key; otherwise it's skipped |
 | `mam` | no | `true` | MAM support; set `false` to disable archive backfill |
 | `lastActivity` | no | `true` | XEP-0012 online-resource idle-time responses; set `false` to reply with `service-unavailable` instead |
 
@@ -138,6 +138,12 @@ existing accounts and cannot shadow account names or chain through other aliases
 They retain the target account's canonical name for session/inbox state.
 
 In 1:1 mode only the `owner` JID may drive the agent. Outbound chat is sent only by `send_message`; see [Messaging and Room Addressing](docs/routing.md).
+
+Provider failures (usage limits, exhausted credits, authentication errors, etc.)
+are reported directly to the owner as `⚠️ Model run failed: …`, without requiring
+`creditWatch`. Alerts wait until Pi's automatic retries/continuations settle, so
+recovered transient errors stay silent. A failed run does not trigger a no-reply
+recovery prompt against the same failing provider.
 
 ## Project layout
 

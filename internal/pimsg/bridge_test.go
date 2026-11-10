@@ -1354,27 +1354,6 @@ func TestFormatHeartbeat(t *testing.T) {
 		t.Errorf("formatHeartbeat(nil) = %q, want empty", empty)
 	}
 }
-func TestIsCreditError(t *testing.T) {
-	cases := []struct {
-		in   string
-		want bool
-	}{
-		// The real OpenRouter 402 body Zach pasted.
-		{`402: {"message":"This request requires more credits, or fewer max_tokens. You requested up to 384000 tokens, but can only afford 99218."}`, true},
-		{"This request requires more credits, or fewer max_tokens.", true},
-		{"402 insufficient balance", true},
-		{"you are out of credits", true},
-		{"Request timed out.", false},
-		{"529 overloaded_error: Overloaded", false},
-		{"", false},
-	}
-	for _, c := range cases {
-		if got := isCreditError(c.in); got != c.want {
-			t.Errorf("isCreditError(%q) = %v, want %v", c.in, got, c.want)
-		}
-	}
-}
-
 func TestLowCreditText(t *testing.T) {
 	if got := lowCreditText(3.5, 5); got != "⚠️ OpenRouter credit: $3.50 remaining — below your $5.00 floor, reload soon" {
 		t.Errorf("lowCreditText = %q", got)
@@ -1388,52 +1367,6 @@ func TestShortError(t *testing.T) {
 	long := strings.Repeat("x", 300)
 	if got := shortError(long); len([]rune(got)) != 158 { // 157 + ellipsis
 		t.Errorf("shortError(long) len = %d, want 158", len([]rune(got)))
-	}
-}
-
-// A message_end carrying an errored assistant message with the OpenRouter 402
-// body must DM the owner (marked replied) instead of falling through to the
-// "done (no reply)" nudge.
-func TestCreditFailAlertOnMessageEnd(t *testing.T) {
-	b := roomBridge()
-	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
-	b.acct.MinCreditUsd = 2
-	b.setReplied(false)
-
-	ev := Event{
-		"type": "message_end",
-		"message": map[string]any{
-			"role":         "assistant",
-			"content":      []any{},
-			"stopReason":   "error",
-			"errorMessage": `402: {"message":"This request requires more credits, or fewer max_tokens."}`,
-		},
-	}
-	b.handleRPCEvent(ev)
-	if !b.replied() {
-		t.Error("credit-failed run should be marked replied so the no-reply nudge is suppressed")
-	}
-}
-
-// Non-credit run failures (timeout, overloaded) keep the existing behavior:
-// not marked replied, so the agent_settled nudge still applies.
-func TestNonCreditErrorUnchanged(t *testing.T) {
-	b := roomBridge()
-	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
-	b.setReplied(false)
-
-	ev := Event{
-		"type": "message_end",
-		"message": map[string]any{
-			"role":         "assistant",
-			"content":      []any{},
-			"stopReason":   "error",
-			"errorMessage": "Request timed out.",
-		},
-	}
-	b.handleRPCEvent(ev)
-	if b.replied() {
-		t.Error("non-credit error must not mark the run replied; the no-reply nudge should still apply")
 	}
 }
 

@@ -96,6 +96,9 @@ type Bridge struct {
 	messagingSeeded     bool   // the pi-msg messaging contract has been injected into this session (once)
 	reactionAckRun      bool   // a run was woken by an inbound reaction ack (suppress automatic reactions and no-reply recovery)
 	heartbeatRun        bool   // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
+	// runError holds the last assistant failure until agent_settled, so a
+	// transient error that pi recovers from never produces a failure alert.
+	runError string
 	// runActive is when the current run last took a message into its context —
 	// an injected steer or a fresh assistant turn begins one. The inbox compares
 	// it with a delivery stamp at settle to tell a message the run consumed from
@@ -484,6 +487,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setStreaming(true)
 		b.markRan() // this bridge has work behind it now, so @free no longer reaches it (#130)
 		b.setReplied(false)
+		b.setRunError("")
 		b.setHandleWarned(false)
 		b.setUntaggedWarned(false)
 		b.resetSendTracking() // fresh run: no message seen, no tool since delivery
@@ -508,12 +512,17 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		b.setStreaming(false)
 		b.markIdle() // now idle — arm the away clock and stamp the XEP-0319 idle element
 		b.announceSettledPresence()
-		b.lifecycleReact("✅") // done
+		failed := b.reportRunError()
+		if failed {
+			b.lifecycleReact("❌")
+		} else {
+			b.lifecycleReact("✅") // done
+		}
 		// Final assistant text is internal. If this run sent no XMPP message,
 		// prompt once for an explicit send_message rather than implying the text
 		// was delivered. Keep the no-reply reaction suppressed while that retry
 		// is in flight.
-		recovering := b.needsSendRecovery() && b.fireSendRecovery()
+		recovering := !failed && b.needsSendRecovery() && b.fireSendRecovery()
 		// Several messages entered this run but fewer replies left it. Pi
 		// injects a steer the moment a tool yields, so the model can read the
 		// next question before answering the last — and then never answer it.
@@ -521,7 +530,7 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// A run that answered a hint is never hinted about itself, however its
 		// tally looks. takeHintPending consumes the mark, so the run after it is
 		// judged normally again.
-		if !recovering && !b.takeHintPending() {
+		if !recovering && !b.takeHintPending() && !failed {
 			if n, m, ok := b.unansweredRun(); ok {
 				recovering = b.fireUnansweredHint(n, m, b.runLogSnapshot())
 			}
@@ -563,6 +572,11 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 	case "auto_retry_start":
 		b.xmpp.SetPresence("dnd", "retrying (transient error)…")
 	case "auto_retry_end":
+		// Cancelling retry backoff emits no new assistant message to clear
+		// the transient failure; Pi uses this finalError sentinel instead.
+		if ev.Str("finalError") == "Retry cancelled" {
+			b.setRunError("")
+		}
 		b.xmpp.SetPresence("dnd", "thinking…")
 	case "session_start":
 		// Defensive only: pi does NOT emit a session_start event over the RPC
@@ -589,16 +603,17 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		if msg == nil || msg.Str("role") != "assistant" {
 			return
 		}
-		// A run that died on OpenRouter credits (HTTP 402) has no text to
-		// deliver — without this hook the owner got the generic "done (no
-		// reply)" nudge and no hint WHY. DM them the failure instead (see
-		// creditFailAlert), and clear the in-run recovery bookkeeping so
-		// settle can't fire a tail-retry / unanswered-hint prompt (which
-		// would just 402 again).
+		// Wait for settle before reporting provider failures: pi may still
+		// retry this message or recover through compaction. Any later
+		// successful (or deliberately aborted) assistant message clears it.
 		if msg.Str("stopReason") == "error" {
-			if b.creditFailAlert(msg.Str("errorMessage")) {
-				return // consumed: owner alerted, run marked replied
+			errMsg := strings.TrimSpace(msg.Str("errorMessage"))
+			if errMsg == "" {
+				errMsg = "provider returned no error details"
 			}
+			b.setRunError(errMsg)
+		} else {
+			b.setRunError("")
 		}
 		// Record whether THIS message carried text before delivering it: at
 		// settle, only the last message's answer matters, and a run whose final
@@ -3472,37 +3487,29 @@ func lowCreditText(remaining, floor float64) string {
 	return fmt.Sprintf("⚠️ OpenRouter credit: $%.2f remaining — below your $%.2f floor, reload soon", remaining, floor)
 }
 
-// isCreditError reports whether a model-run error is an OpenRouter
-// out-of-credits failure (HTTP 402). pi relays the provider error verbatim in
-// the errored assistant message's errorMessage, so the 402 body text —
-// "requires more credits", "can only afford N tokens", "insufficient" — is
-// what we match.
-func isCreditError(errMsg string) bool {
-	s := strings.ToLower(errMsg)
-	return strings.Contains(s, "402") ||
-		strings.Contains(s, "more credits") ||
-		strings.Contains(s, "out of credits") ||
-		strings.Contains(s, "insufficient")
+func (b *Bridge) setRunError(errMsg string) {
+	b.mu.Lock()
+	b.runError = errMsg
+	b.mu.Unlock()
 }
 
-// creditFailAlert handles a model run that died to an OpenRouter credit
-// failure. Without this hook the run ends with no message and the owner gets
-// the generic "done (no reply)" nudge — exactly what Zach saw when a 402 hit
-// mid-work. The alert DMs the owner directly, marks the run as replied so the
-// no-reply nudge is suppressed, and returns true. Non-credit errors return
-// false and keep the existing behavior.
-func (b *Bridge) creditFailAlert(errMsg string) bool {
-	if !isCreditError(errMsg) {
+// reportRunError consumes the final provider failure once the session settles.
+// All providers use the same RPC error envelope; matching error strings both
+// misses new quota formats and mislabels unrelated errors as OpenRouter credit
+// failures. Report the actual error and do not ask the failed model to explain
+// itself through a send-recovery or unanswered-message prompt.
+func (b *Bridge) reportRunError() bool {
+	b.mu.Lock()
+	errMsg := b.runError
+	b.runError = ""
+	b.mu.Unlock()
+	if errMsg == "" {
 		return false
 	}
-	b.log("warning", "model run failed on OpenRouter credits: "+errMsg)
-	b.reply("⚠️ Out of OpenRouter credits — the run couldn't proceed. Top up at https://openrouter.ai/settings/credits (" + shortError(errMsg) + ")")
-	// Mark replied so the "done (no reply)" nudge is suppressed, and clear the
-	// in-run bookkeeping so settle can't fire a tail-retry or unanswered-hint
-	// prompt — a recovery prompt would just hit the same 402 again.
+	b.log("warning", "model run failed: "+errMsg)
+	b.reply("⚠️ Model run failed: " + shortError(errMsg))
 	b.setReplied(true)
 	b.resetSendTracking()
-	b.markHintPending()
 	return true
 }
 
@@ -3803,6 +3810,7 @@ func (b *Bridge) settleLocally() {
 	b.heartbeatRun = false
 	b.volunteered = false
 	b.streamingRun = false
+	b.runError = ""
 	b.mu.Unlock()
 	b.syncBusyMarker()
 	b.markIdle()
