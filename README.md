@@ -4,6 +4,10 @@ Drive the [Pi](https://pi.dev) coding agent entirely over XMPP.
 
 `pi-msg` launches `pi --mode rpc`, then bridges Pi's JSONL event stream to XMPP, with command interception for system commands like `/new`.
 
+RPC stdout records support up to 64 MiB, including image-heavy aggregate events.
+Read/framing failures terminate the broken transport instead of silently leaving
+Pi blocked; see [RPC transport limits and lifecycle](docs/rpc.md).
+
 
 ## Comms
 
