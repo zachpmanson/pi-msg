@@ -392,3 +392,315 @@ func TestInboxRedeliveryIsNotSuppressedBySeen(t *testing.T) {
 		t.Errorf("both sources must be delivered: %q", out)
 	}
 }
+
+func TestInboxProtectedSessionAndRestart(t *testing.T) {
+	path := t.TempDir() + "/private/inbox.jsonl"
+	at := time.Unix(100, 0).UTC()
+	in := newInbox(path, nil)
+	e, err := in.appendProtected(inboxEntry{NextBoundaryID: "boundary", Body: "held", At: at})
+	if err != nil || e.Key == "" {
+		t.Fatalf("append: %+v %v", e, err)
+	}
+	for i := 0; i < 3; i++ {
+		if n := in.ackSettled(ackPolicy{Now: at.Add(24 * time.Hour), SessionID: "old", LastActive: at.Add(time.Hour)}); n != 0 {
+			t.Fatal("aged protected entry acknowledged")
+		}
+		in = newInbox(path, nil)
+	}
+	if n, err := in.assignTargetSession("boundary", "fresh"); err != nil || n != 1 {
+		t.Fatalf("assign = %d %v", n, err)
+	}
+	in = newInbox(path, nil)
+	got := in.protectedPending()
+	if len(got) != 1 || got[0].Key != e.Key || got[0].NextBoundaryID != "boundary" || got[0].TargetSessionID != "fresh" {
+		t.Fatalf("lost tags: %+v", got)
+	}
+	got[0].Body = "mutated copy"
+	if in.protectedPending()[0].Body != "held" {
+		t.Fatal("pending aliases queue")
+	}
+	if ok, err := in.markDeliveredKey(e.Key, "old", at); err == nil || ok {
+		t.Fatalf("wrong delivery = %v %v", ok, err)
+	}
+	if n := in.markDelivered("", "", "held", at); n != 0 {
+		t.Fatal("legacy mark touched protected entry")
+	}
+	if n := in.ackSettled(ackPolicy{Now: at.Add(24 * time.Hour), SessionID: "fresh", LastActive: at.Add(time.Hour)}); n != 0 {
+		t.Fatal("assigned entry age-acked")
+	}
+	if ok, err := in.markDeliveredKey(e.Key, "fresh", at); err != nil || !ok {
+		t.Fatalf("delivery = %v %v", ok, err)
+	}
+	for _, p := range []ackPolicy{
+		{Now: at.Add(24 * time.Hour), SessionID: "old", LastActive: at.Add(time.Hour)},
+		{Now: at.Add(24 * time.Hour), LastActive: at.Add(time.Hour)},
+		{Now: at.Add(24 * time.Hour), SessionID: "fresh"},
+		{Now: at.Add(24 * time.Hour), SessionID: "fresh", LastActive: at.Add(-time.Second)},
+	} {
+		if n := in.ackSettled(p); n != 0 {
+			t.Fatalf("invalid evidence acked: %+v", p)
+		}
+	}
+	// Delivery evidence must not survive a process restart.
+	in = newInbox(path, nil)
+	p := ackPolicy{Now: at.Add(24 * time.Hour), SessionID: "fresh", LastActive: at.Add(time.Hour)}
+	if n := in.ackSettled(p); n != 0 {
+		t.Fatal("persisted delivery evidence")
+	}
+	if ok, err := in.markDeliveredKey(e.Key, "fresh", at); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if n, err := in.ackSettledErr(p); err != nil || n != 1 {
+		t.Fatalf("consume = %d %v", n, err)
+	}
+	if n := newInbox(path, nil).len(); n != 0 {
+		t.Fatalf("consumed entry reloaded: %d", n)
+	}
+}
+
+func TestInboxProtectedUniqueKeys(t *testing.T) {
+	in := newInbox(t.TempDir()+"/inbox.jsonl", nil)
+	now := time.Unix(100, 0)
+	for _, id := range []string{"duplicate", ""} {
+		var entries []inboxEntry
+		for _, room := range []string{"a@rooms", "b@rooms"} {
+			e, err := in.appendProtected(inboxEntry{ID: id, From: "same", Room: room, Body: "identical", NextBoundaryID: "b", TargetSessionID: "s", At: now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries = append(entries, e)
+		}
+		if entries[0].Key == entries[1].Key {
+			t.Fatal("duplicate keys")
+		}
+		if n := in.markDelivered(id, "same", "identical", now); n != 0 {
+			t.Fatal("legacy mark touched protected")
+		}
+		if n := in.drop(id, "same", "identical"); n != 0 {
+			t.Fatal("legacy drop touched protected")
+		}
+		if ok, err := in.markDeliveredKey(entries[1].Key, "s", now); err != nil || !ok {
+			t.Fatalf("mark = %v %v", ok, err)
+		}
+		if ok, err := in.dropKey(entries[0].Key); err != nil || !ok {
+			t.Fatalf("drop = %v %v", ok, err)
+		}
+		if n, err := in.ackSettledErr(ackPolicy{Now: now.Add(time.Hour), SessionID: "s", LastActive: now}); err != nil || n != 1 {
+			t.Fatalf("ack = %d %v", n, err)
+		}
+		if in.len() != 0 {
+			t.Fatal("key operation changed wrong entry")
+		}
+	}
+}
+
+func TestInboxProtectedCap(t *testing.T) {
+	path := t.TempDir() + "/inbox.jsonl"
+	warned := false
+	in := newInbox(path, func(level, msg string) {
+		if strings.Contains(msg, "protected storage exceeds") {
+			warned = true
+		}
+	})
+	for i := 0; i < inboxCap+2; i++ {
+		if _, err := in.appendProtected(inboxEntry{Body: "held", NextBoundaryID: "b"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < inboxCap+3; i++ {
+		in.append(inboxEntry{Body: "ordinary"})
+	}
+	if !warned {
+		t.Fatal("no protected-cap warning")
+	}
+	in = newInbox(path, nil)
+	if in.len() != 2*inboxCap+2 || len(in.protectedPending()) != inboxCap+2 {
+		t.Fatalf("cap lost protected input: total=%d protected=%d", in.len(), len(in.protectedPending()))
+	}
+	if n := in.ackSettled(ackPolicy{Now: time.Now().Add(time.Hour)}); n != inboxCap {
+		t.Fatalf("ordinary ack = %d", n)
+	}
+	if len(newInbox(path, nil).protectedPending()) != inboxCap+2 {
+		t.Fatal("rewrite lost protected entries")
+	}
+}
+
+func TestInboxProtectedLoadDiagnostics(t *testing.T) {
+	for _, data := range []string{
+		"not json\n",
+		"{\"body\":\"legacy\"}\nnot json\n",
+		"{\"body\":\"held\",\"nextBoundaryID\":\"b\"}\n",
+		"{\"key\":\"k\",\"nextBoundaryID\":\"b\"}\n{\"key\":\"k\",\"targetSessionID\":\"s\"}\n",
+	} {
+		path := t.TempDir() + "/inbox.jsonl"
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		in := newInbox(path, nil)
+		if in.loadError() == nil {
+			t.Fatalf("missing diagnostic for %q", data)
+		}
+		if _, err := in.appendProtected(inboxEntry{NextBoundaryID: "b"}); err == nil {
+			t.Fatal("overwrote corrupt inbox")
+		}
+		if _, err := in.assignTargetSession("b", "s"); err == nil {
+			t.Fatal("assigned corrupt inbox")
+		}
+		if _, err := in.dropKey("k"); err == nil {
+			t.Fatal("dropped from corrupt inbox")
+		}
+		if _, err := in.markDeliveredKey("k", "s", time.Unix(1, 0)); err == nil {
+			t.Fatal("marked corrupt inbox")
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != data {
+			t.Fatal("failed operation changed disk")
+		}
+	}
+	in := newInbox(t.TempDir(), nil)
+	if in.loadError() == nil {
+		t.Fatal("missing unreadable diagnostic")
+	}
+}
+
+func TestInboxProtectedFailedPersistence(t *testing.T) {
+	path := t.TempDir() + "/inbox.jsonl"
+	in := newInbox(path, nil)
+	e, err := in.appendProtected(inboxEntry{NextBoundaryID: "b", Body: "prior", At: time.Unix(1, 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.appendProtected(inboxEntry{NextBoundaryID: "b", At: time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)}); err == nil {
+		t.Fatal("invalid timestamp persisted")
+	}
+	if in.len() != 1 {
+		t.Fatal("failed save committed memory")
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("failed save changed disk")
+	}
+	// A nonempty directory forces a deterministic rename error, even as root.
+	blocked := t.TempDir()
+	if err := os.WriteFile(blocked+"/marker", []byte("prior"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in.path = blocked
+	if _, err := in.appendProtected(inboxEntry{NextBoundaryID: "b"}); err == nil {
+		t.Fatal("append reported success")
+	}
+	if _, err := in.assignTargetSession("b", "s"); err == nil {
+		t.Fatal("assignment reported success")
+	}
+	if _, err := in.dropKey(e.Key); err == nil {
+		t.Fatal("drop reported success")
+	}
+	in.append(inboxEntry{Body: "ordinary"})
+	if in.len() != 1 || in.pending()[0].TargetSessionID != "" {
+		t.Fatalf("failure changed memory: %+v", in.pending())
+	}
+	// Simulate prior valid process-local delivery so acknowledgement also rewrites.
+	in.entries[0].TargetSessionID = "s"
+	if _, err := in.markDeliveredKey(e.Key, "s", time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := in.ackSettledErr(ackPolicy{Now: time.Unix(100, 0), LastActive: time.Unix(3, 0), SessionID: "s"}); err == nil || n != 0 {
+		t.Fatalf("ack failure = %d %v", n, err)
+	}
+	if in.len() != 1 {
+		t.Fatal("failed ack changed memory")
+	}
+	if got, err := os.ReadFile(blocked + "/marker"); err != nil || string(got) != "prior" {
+		t.Fatal("rename changed prior destination")
+	}
+	after, _ = os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("rename failure changed prior inbox file")
+	}
+}
+
+func TestInboxProtectedValidationAndModes(t *testing.T) {
+	path := t.TempDir() + "/private/inbox.jsonl"
+	in := newInbox(path, nil)
+	if _, err := in.appendProtected(inboxEntry{TargetSessionID: "s"}); err == nil {
+		t.Fatal("accepted without boundary")
+	}
+	e, err := in.appendProtected(inboxEntry{Key: "explicit", NextBoundaryID: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.appendProtected(e); err == nil {
+		t.Fatal("accepted duplicate key")
+	}
+	if _, err := in.assignTargetSession("b", ""); err == nil {
+		t.Fatal("accepted empty target")
+	}
+	if _, err := in.assignTargetSession("b", "s"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.assignTargetSession("b", "other"); err == nil {
+		t.Fatal("retargeted assigned entry")
+	}
+	st, err := os.Stat(path)
+	if err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("private file: %v %v", st, err)
+	}
+	st, err = os.Stat(strings.TrimSuffix(path, "/inbox.jsonl"))
+	if err != nil || st.Mode().Perm() != 0o700 {
+		t.Fatalf("private directory: %v %v", st, err)
+	}
+}
+
+func TestInboxProtectedAssignmentFIFOAndTargetOnly(t *testing.T) {
+	path := t.TempDir() + "/inbox.jsonl"
+	in := newInbox(path, nil)
+	at := time.Unix(1, 0)
+	var keys []string
+	for _, boundary := range []string{"b", "other", "b"} {
+		e, err := in.appendProtected(inboxEntry{NextBoundaryID: boundary, Body: boundary, At: at})
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, e.Key)
+	}
+	if n, err := in.assignTargetSession("b", "fresh"); err != nil || n != 2 {
+		t.Fatalf("assign = %d %v", n, err)
+	}
+	in = newInbox(path, nil)
+	for i, e := range in.protectedPending() {
+		if e.Key != keys[i] {
+			t.Fatal("assignment changed FIFO")
+		}
+		want := "fresh"
+		if i == 1 {
+			want = ""
+		}
+		if e.TargetSessionID != want {
+			t.Fatalf("target = %q want %q", e.TargetSessionID, want)
+		}
+	}
+	// Protection is retained even when only the target tag is present on disk.
+	if err := os.WriteFile(path, []byte("{\"key\":\"target-only\",\"targetSessionID\":\"fresh\",\"body\":\"held\",\"at\":\"1970-01-01T00:00:01Z\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in = newInbox(path, nil)
+	if in.loadError() != nil {
+		t.Fatal(in.loadError())
+	}
+	if in.drop("", "", "held") != 0 || in.markDelivered("", "", "held", at) != 0 {
+		t.Fatal("legacy paths mutated target-only entry")
+	}
+	if n := in.ackSettled(ackPolicy{Now: at.Add(24 * time.Hour), SessionID: "fresh", LastActive: at}); n != 0 {
+		t.Fatal("target-only entry age-acked")
+	}
+	if ok, err := in.markDeliveredKey("target-only", "fresh", at); err != nil || !ok {
+		t.Fatalf("mark = %v %v", ok, err)
+	}
+	if n, err := in.ackSettledErr(ackPolicy{Now: at.Add(time.Hour), SessionID: "fresh", LastActive: at}); err != nil || n != 1 {
+		t.Fatalf("consume = %d %v", n, err)
+	}
+}

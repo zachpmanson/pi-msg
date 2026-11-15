@@ -2,7 +2,9 @@ package pimsg
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -65,21 +67,27 @@ import (
 // that took it in shows activity (see ackPolicy).
 const inboxAckGrace = 5 * time.Second
 
-// inboxCap bounds the file. Entries past it are dropped oldest-first with a
-// warning: a run that never settles must not grow the inbox forever.
+// inboxCap bounds ordinary entries only; protected promises are never evicted.
 const inboxCap = 500
+
+// Includes JSON escaping/metadata, excludes the terminating newline. Protected
+// writes must never accept a record that the restart scanner cannot recover.
+const maxInboxRecordBytes = (1 << 20) - 1
 
 // inboxEntry is one inbound message received by the bridge but not yet
 // acknowledged by a settled run.
 type inboxEntry struct {
-	ID        string `json:"id,omitempty"`
-	From      string `json:"from,omitempty"`
-	Body      string `json:"body"`
-	Room      string `json:"room,omitempty"`
-	Nick      string `json:"nick,omitempty"`
-	RealJID   string `json:"realJID,omitempty"`
-	FromOwner bool   `json:"fromOwner,omitempty"`
-	Direct    bool   `json:"direct,omitempty"`
+	Key             string `json:"key,omitempty"`
+	NextBoundaryID  string `json:"nextBoundaryID,omitempty"`
+	TargetSessionID string `json:"targetSessionID,omitempty"`
+	ID              string `json:"id,omitempty"`
+	From            string `json:"from,omitempty"`
+	Body            string `json:"body"`
+	Room            string `json:"room,omitempty"`
+	Nick            string `json:"nick,omitempty"`
+	RealJID         string `json:"realJID,omitempty"`
+	FromOwner       bool   `json:"fromOwner,omitempty"`
+	Direct          bool   `json:"direct,omitempty"`
 	// Addressed is the verdict of the room-address check that gated this append
 	// (see InboundMessage.Addressed): re-delivery must not have to re-derive it.
 	Addressed bool `json:"addressed,omitempty"`
@@ -97,8 +105,11 @@ type inboxEntry struct {
 	// re-delivery is that the new process has not seen the entry yet), and a
 	// stale on-disk value would let a settle in the new process acknowledge an
 	// entry it never delivered.
-	deliveredAt time.Time
+	deliveredAt        time.Time
+	deliveredSessionID string
 }
+
+func (e inboxEntry) protected() bool { return e.NextBoundaryID != "" || e.TargetSessionID != "" }
 
 // message turns the entry back into the transport-agnostic inbound message the
 // dispatch path works on, so re-delivery runs the normal classification.
@@ -125,6 +136,7 @@ type inbox struct {
 	path    string
 	log     func(level, msg string)
 	entries []inboxEntry
+	loadErr error
 }
 
 // newInbox opens (and loads) the inbox at path. A missing file is an empty
@@ -146,14 +158,16 @@ func (in *inbox) load() {
 	f, err := os.Open(in.path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			in.warn("open: " + err.Error())
+			in.loadErr = fmt.Errorf("open inbox: %w", err)
+			in.warn(in.loadErr.Error())
 		}
 		return
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	sc.Buffer(make([]byte, 0, 64*1024), maxInboxRecordBytes+1)
 	var entries []inboxEntry
+	keys := make(map[string]bool)
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -161,18 +175,29 @@ func (in *inbox) load() {
 		}
 		var e inboxEntry
 		if err := json.Unmarshal(line, &e); err != nil {
+			in.loadErr = errors.Join(in.loadErr, fmt.Errorf("unparsable inbox entry: %w", err))
 			in.warn("skipping unparsable entry: " + err.Error())
 			continue
+		}
+		if e.protected() && (e.Key == "" || keys[e.Key]) {
+			in.loadErr = errors.Join(in.loadErr, fmt.Errorf("protected inbox entry has missing or duplicate key %q", e.Key))
+		}
+		if e.Key != "" {
+			keys[e.Key] = true
 		}
 		entries = append(entries, e)
 	}
 	if err := sc.Err(); err != nil {
+		in.loadErr = errors.Join(in.loadErr, fmt.Errorf("read inbox: %w", err))
 		in.warn("read: " + err.Error())
 	}
 	if len(entries) > 0 {
 		in.logf("info", fmt.Sprintf("%d unacknowledged inbound message(s) recovered from %s", len(entries), filepath.Base(in.path)))
 	}
 	in.entries = entries
+	if len(in.protectedPendingLocked()) > inboxCap {
+		in.warn(fmt.Sprintf("protected storage exceeds %d entries; retaining all promised input", inboxCap))
+	}
 }
 
 func (in *inbox) logf(level, msg string) {
@@ -181,20 +206,234 @@ func (in *inbox) logf(level, msg string) {
 	}
 }
 
-// append records a message before it is handed to pi, and returns the entry.
+// append records an ordinary message before it is handed to pi.
 func (in *inbox) append(e inboxEntry) {
+	// Protected callers must use the error-returning append path.
+	if e.protected() {
+		in.warn("protected entry requires appendProtected")
+		return
+	}
 	if e.At.IsZero() {
 		e.At = time.Now()
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	in.entries = append(in.entries, e)
-	if len(in.entries) > inboxCap {
-		drop := len(in.entries) - inboxCap
-		in.entries = in.entries[drop:]
-		in.warn(fmt.Sprintf("over %d entries; dropped the oldest %d", inboxCap, drop))
+	next := append(append([]inboxEntry(nil), in.entries...), e)
+	next = in.capOrdinary(next)
+	if err := in.commitLocked(next, false); err != nil {
+		in.warn(err.Error())
 	}
+}
+
+// loadError retains diagnostics even when legacy corrupt-line recovery succeeds.
+func (in *inbox) loadError() error {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.loadErr
+}
+
+func (in *inbox) protectedReadyLocked() error {
+	if in.loadErr != nil {
+		return fmt.Errorf("protected inbox unavailable; repair/reload %s: %w", in.path, in.loadErr)
+	}
+	return nil
+}
+
+func (in *inbox) appendProtected(e inboxEntry) (inboxEntry, error) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if err := in.protectedReadyLocked(); err != nil {
+		return inboxEntry{}, err
+	}
+	if e.NextBoundaryID == "" {
+		return inboxEntry{}, fmt.Errorf("protected append requires boundary ID")
+	}
+	if e.Key == "" {
+		var err error
+		e.Key, err = randomLocalKey()
+		if err != nil {
+			return inboxEntry{}, err
+		}
+	}
+	for _, old := range in.entries {
+		if old.Key == e.Key {
+			return inboxEntry{}, fmt.Errorf("duplicate inbox key %q", e.Key)
+		}
+	}
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	e.deliveredAt = time.Time{}
+	e.deliveredSessionID = ""
+	next := append(append([]inboxEntry(nil), in.entries...), e)
+	if err := in.commitLocked(next, true); err != nil {
+		return inboxEntry{}, err
+	}
+	if len(in.protectedPendingLocked()) > inboxCap {
+		in.warn(fmt.Sprintf("protected storage exceeds %d entries; retaining all promised input", inboxCap))
+	}
+	return e, nil
+}
+
+func (in *inbox) assignTargetSession(boundaryID, sessionID string) (int, error) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if err := in.protectedReadyLocked(); err != nil {
+		return 0, err
+	}
+	if boundaryID == "" || sessionID == "" {
+		return 0, fmt.Errorf("target assignment requires boundary and session IDs")
+	}
+	next := append([]inboxEntry(nil), in.entries...)
+	n := 0
+	for i := range next {
+		if next[i].NextBoundaryID != boundaryID {
+			continue
+		}
+		if next[i].TargetSessionID != "" && next[i].TargetSessionID != sessionID {
+			return 0, fmt.Errorf("inbox key %q already targets session %q", next[i].Key, next[i].TargetSessionID)
+		}
+		next[i].TargetSessionID = sessionID
+		n++
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	if err := in.commitLocked(next, true); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func (in *inbox) protectedPendingLocked() []inboxEntry {
+	var entries []inboxEntry
+	for _, e := range in.entries {
+		if e.protected() {
+			entries = append(entries, e)
+		}
+	}
+	return entries
+}
+
+func (in *inbox) protectedPending() []inboxEntry {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.protectedPendingLocked()
+}
+
+// Delivery evidence is local and explicitly tied to the exact target session.
+func (in *inbox) markDeliveredKey(key, sessionID string, at time.Time) (bool, error) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if err := in.protectedReadyLocked(); err != nil {
+		return false, err
+	}
+	if key == "" || sessionID == "" || at.IsZero() {
+		return false, fmt.Errorf("delivery requires key, session and timestamp")
+	}
+	for i := range in.entries {
+		e := &in.entries[i]
+		if e.Key != key || !e.protected() {
+			continue
+		}
+		if e.TargetSessionID != sessionID {
+			return false, fmt.Errorf("inbox key %q does not target session %q", key, sessionID)
+		}
+		e.deliveredAt, e.deliveredSessionID = at, sessionID
+		return true, nil
+	}
+	return false, nil
+}
+
+func (in *inbox) dropKey(key string) (bool, error) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if err := in.protectedReadyLocked(); err != nil {
+		return false, err
+	}
+	if key == "" {
+		return false, fmt.Errorf("drop requires inbox key")
+	}
+	for i, e := range in.entries {
+		if e.Key != key || !e.protected() {
+			continue
+		}
+		next := append([]inboxEntry(nil), in.entries[:i]...)
+		next = append(next, in.entries[i+1:]...)
+		if err := in.commitLocked(next, true); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (in *inbox) capOrdinary(entries []inboxEntry) []inboxEntry {
+	ordinary := 0
+	for _, e := range entries {
+		if !e.protected() {
+			ordinary++
+		}
+	}
+	drop := ordinary - inboxCap
+	if drop <= 0 {
+		return entries
+	}
+	in.warn(fmt.Sprintf("over %d ordinary entries; dropped the oldest %d", inboxCap, drop))
+	kept := make([]inboxEntry, 0, len(entries)-drop)
+	for _, e := range entries {
+		if !e.protected() && drop > 0 {
+			drop--
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept
+}
+
+func hasProtected(entries []inboxEntry) bool {
+	for _, e := range entries {
+		if e.protected() {
+			return true
+		}
+	}
+	return false
+}
+
+// Stage a separate slice: failed protected persistence must not mutate memory.
+func (in *inbox) commitLocked(next []inboxEntry, forceDurable bool) error {
+	// A skipped corrupt record may itself be protected. Even an ordinary append,
+	// drop or settle must not overwrite that unknown input after a failed load.
+	if err := in.protectedReadyLocked(); err != nil {
+		return err
+	}
+	if forceDurable || hasProtected(in.entries) || hasProtected(next) {
+		var err error
+		if len(next) == 0 {
+			err = durableRemove(in.path)
+		} else {
+			var b bytes.Buffer
+			enc := json.NewEncoder(&b)
+			for _, e := range next {
+				start := b.Len()
+				if err := enc.Encode(e); err != nil {
+					return fmt.Errorf("encode inbox: %w", err)
+				}
+				if b.Len()-start-1 > maxInboxRecordBytes {
+					return fmt.Errorf("encoded inbox record exceeds %d bytes; input not durably accepted", maxInboxRecordBytes)
+				}
+			}
+			err = durableWritePrivate(in.path, b.Bytes())
+		}
+		if err != nil {
+			return fmt.Errorf("persist protected inbox %s: %w", in.path, err)
+		}
+		in.entries = next
+		return nil
+	}
+	in.entries = next
 	in.flushLocked()
+	return nil
 }
 
 // pending copies the unacknowledged entries in arrival order.
@@ -202,6 +441,21 @@ func (in *inbox) pending() []inboxEntry {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	return append([]inboxEntry(nil), in.entries...)
+}
+
+// clearOrdinary is explicit /new recovery only. Protected promises are untouched.
+func (in *inbox) clearOrdinary() (int, error) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	kept := in.protectedPendingLocked()
+	n := len(in.entries) - len(kept)
+	if n == 0 {
+		return 0, nil
+	}
+	if err := in.commitLocked(kept, true); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // markDelivered records that pi was handed this message, so the settle that ends
@@ -212,7 +466,7 @@ func (in *inbox) markDelivered(id, from, body string, at time.Time) int {
 	defer in.mu.Unlock()
 	n := 0
 	for i := range in.entries {
-		if matchesEntry(in.entries[i], id, from, body) {
+		if !in.entries[i].protected() && matchesEntry(in.entries[i], id, from, body) {
 			in.entries[i].deliveredAt = at
 			n++
 		}
@@ -228,10 +482,10 @@ func (in *inbox) markDelivered(id, from, body string, at time.Time) int {
 func (in *inbox) drop(id, from, body string) int {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	kept := in.entries[:0]
+	kept := make([]inboxEntry, 0, len(in.entries))
 	dropped := 0
 	for _, e := range in.entries {
-		if matchesEntry(e, id, from, body) {
+		if !e.protected() && matchesEntry(e, id, from, body) {
 			dropped++
 			continue
 		}
@@ -240,8 +494,10 @@ func (in *inbox) drop(id, from, body string) int {
 	if dropped == 0 {
 		return 0
 	}
-	in.entries = kept
-	in.flushLocked()
+	if err := in.commitLocked(kept, false); err != nil {
+		in.warn(err.Error())
+		return 0
+	}
 	return dropped
 }
 
@@ -268,6 +524,10 @@ func (in *inbox) len() int {
 // ackPolicy is what a settling run reports about itself, so the inbox can tell
 // the entries it consumed from the ones it merely outlived.
 type ackPolicy struct {
+	// Default false preserves legacy ordinary behaviour outside an admission fence.
+	SuppressOrdinaryGrace bool
+	// SessionID is the exact session whose delivery/activity is settling.
+	SessionID string
 	// Now is the settle time.
 	Now time.Time
 	// LastActive is when the settling run last produced assistant text or ran a
@@ -282,33 +542,52 @@ type ackPolicy struct {
 // consumed (delivered, with run activity after the delivery), and entries that
 // have been pending longer than inboxAckGrace without any delivery evidence.
 func (in *inbox) ackSettled(p ackPolicy) int {
+	n, err := in.ackSettledErr(p)
+	if err != nil {
+		in.warn(err.Error())
+	}
+	return n
+}
+
+// Boundary callers use the error-returning variant to detect persistence failure.
+func (in *inbox) ackSettledErr(p ackPolicy) (int, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	kept := in.entries[:0]
+	kept := make([]inboxEntry, 0, len(in.entries))
 	acked := 0
+	var ackLogs []string
 	for _, e := range in.entries {
 		consumed := !e.deliveredAt.IsZero() && !p.LastActive.IsZero() && !p.LastActive.Before(e.deliveredAt)
-		if consumed || p.Now.Sub(e.At) >= inboxAckGrace {
+		eligible := consumed || (!p.SuppressOrdinaryGrace && p.Now.Sub(e.At) >= inboxAckGrace)
+		if e.protected() {
+			eligible = consumed && p.SessionID != "" && e.TargetSessionID == p.SessionID && e.deliveredSessionID == p.SessionID
+		}
+		if eligible {
 			reason := "grace_period"
 			if consumed {
 				reason = "run_activity_after_delivery"
 			}
-			in.logf("info", fmt.Sprintf("inbox: acknowledged stanza_id=%q reason=%s", e.ID, reason))
+			ackLogs = append(ackLogs, fmt.Sprintf("inbox: acknowledged stanza_id=%q reason=%s", e.ID, reason))
 			acked++
 			continue
 		}
 		kept = append(kept, e)
 	}
 	if acked == 0 {
-		return 0
+		return 0, nil
 	}
-	in.entries = kept
-	in.flushLocked()
-	return acked
+	if err := in.commitLocked(kept, false); err != nil {
+		return 0, err
+	}
+	for _, msg := range ackLogs {
+		in.logf("info", msg)
+	}
+	return acked, nil
 }
 
-// flushLocked rewrites the file with what remains, atomically (temp + rename) so
-// a crash mid-write cannot truncate the queue. An empty queue removes the file.
+// flushLocked is the legacy best-effort writer, used only by commitLocked when
+// neither the old nor new queue contains protected entries. An empty queue
+// removes the file.
 func (in *inbox) flushLocked() {
 	if len(in.entries) == 0 {
 		if err := os.Remove(in.path); err != nil && !os.IsNotExist(err) {

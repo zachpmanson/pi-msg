@@ -80,22 +80,26 @@ type Bridge struct {
 	streamComposing map[string]string // tool-call ID → destination, for cleanup at execution end
 	// sessionTransitionMu serializes an idle-triggered fresh-session swap with
 	// inbound delivery, so a message at the away boundary lands in one session.
-	sessionTransitionMu sync.Mutex
-	streamingRun        bool
-	settlingRun         bool // settle-time prompts still belong to the old session
-	nextTransition      bool // reserved under mu; RPC events must never wait on it
-	syntheticPrompts    int  // submissions reserved before synthetic-turn state changes
-	promptSequence      uint64
-	pendingPrompts      map[string]struct{} // written prompts awaiting ordered acceptance/rejection
-	busyMarked          bool                // on-disk <acct>.busy reflects work in flight (see syncBusyMarker)
-	repliedThisRun      bool
-	shuttingDown        bool
-	reactTo             string // full JID of the owner message the current run reacts to
-	reactID             string // stanza id of that message (XEP-0444 target); "" disables
-	turnDest            string // reply destination for the current turn (owner or room jid)
-	messagingSeeded     bool   // the pi-msg messaging contract has been injected into this session (once)
-	reactionAckRun      bool   // a run was woken by an inbound reaction ack (suppress automatic reactions and no-reply recovery)
-	heartbeatRun        bool   // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
+	sessionTransitionMu  sync.Mutex
+	streamingRun         bool
+	settlingRun          bool // settle-time prompts still belong to the old session
+	next                 nextQueue
+	sessionID            string // actual identity, including namespace (id: or file:)
+	nextTransition       bool   // reserved under mu; RPC events must never wait on it
+	syntheticPrompts     int    // submissions reserved before synthetic-turn state changes
+	promptSequence       uint64
+	protectedPrompts     map[string]protectedPrompt
+	protectedPromptError string
+	pendingPrompts       map[string]struct{} // written prompts awaiting ordered acceptance/rejection
+	busyMarked           bool                // on-disk <acct>.busy reflects work in flight (see syncBusyMarker)
+	repliedThisRun       bool
+	shuttingDown         bool
+	reactTo              string // full JID of the owner message the current run reacts to
+	reactID              string // stanza id of that message (XEP-0444 target); "" disables
+	turnDest             string // reply destination for the current turn (owner or room jid)
+	messagingSeeded      bool   // the pi-msg messaging contract has been injected into this session (once)
+	reactionAckRun       bool   // a run was woken by an inbound reaction ack (suppress automatic reactions and no-reply recovery)
+	heartbeatRun         bool   // a run was woken by a long-running-process heartbeat (noop is the expected outcome)
 	// runError holds the last assistant failure until agent_settled, so a
 	// transient error that pi recovers from never produces a failure alert.
 	runError string
@@ -226,6 +230,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.xmpp = NewXMPPBridge(b.acct, b.onInbound, b.log)
 	b.xmpp.onReplyMessage = b.observeReplyMessage
 	b.inbox = newInbox(inboxPath(b.acct.Name), b.log)
+	if err := b.loadNextQueue(); err != nil {
+		return fmt.Errorf("pending /next recovery: %w", err)
+	}
 
 	// A fresh or resumed bridge is idle until something prompts it — start the
 	// idle clock now so an unused agent drifts to "away" after the timeout.
@@ -280,6 +287,21 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// Missing/deleted files fall back to a fresh session.
 	// The presence label reflects the outcome: "resumed" for a continuation,
 	// "awake" for a fresh start.
+	if r := b.next.record; r != nil {
+		prev := loadSessionState(b.acct.Name)
+		if r.FreshSessionID != "" {
+			prev = r.FreshSessionFile
+		}
+		if len(b.inbox.protectedPending()) > 0 && !sessionFileUsable(prev) {
+			return fmt.Errorf("pending /next requires usable exact saved session; refusing generic fresh fallback")
+		}
+		if r.FreshSessionID != "" && loadSessionState(b.acct.Name) != r.FreshSessionFile {
+			return fmt.Errorf("pending /next target resume pointer mismatch; inspect artifacts")
+		}
+	}
+	if b.next.record != nil && len(b.inbox.protectedPending()) > 0 && b.initialPrompt != "" {
+		return fmt.Errorf("protected input forbids stateless fresh startup")
+	}
 	if b.initialPrompt != "" {
 		b.log("info", "on-demand spawn: initial prompt set, starting fresh session")
 		b.xmpp.SetStartupStatus("awake")
@@ -345,6 +367,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// No connect callback: the bot appearing online (presence "listening") is
 	// the startup signal now, in place of a chat banner. The callback is used to
 	// trigger the buffered-message replay once the connection is up.
+	if b.next.record != nil && b.initialPrompt != "" {
+		return fmt.Errorf("stateless launch cannot consume pending /next")
+	}
 	go b.xmpp.Run(ctx, b.onXMPPConnected)
 	if err := b.rpc.Start(); err != nil {
 		return err
@@ -355,6 +380,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// also confirms pi is live and reading stdin — a safe point to inject the
 	// proactive volunteer turn.
 	b.refreshSessionFile()
+	b.startNextQueue()
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -435,6 +461,9 @@ func (b *Bridge) refreshSessionFile() {
 		b.log("warning", "session persistence: get_state failed: "+err.Error())
 		return
 	}
+	b.mu.Lock()
+	b.sessionID = stateIdentity(res.Obj("data"))
+	b.mu.Unlock()
 	p := res.Obj("data").Str("sessionFile")
 	if p == "" {
 		b.log("warning", "session persistence: get_state returned no session file")
@@ -473,7 +502,12 @@ func (b *Bridge) shutdown(reason string) {
 // (dnd while a run is in flight, available when idle), and <status> is the
 // current activity label (thinking / running a tool / drafting / retrying).
 func (b *Bridge) handleRPCEvent(ev Event) {
+	if ev.Type() != "bridge_observation" {
+		defer b.wakeNext()
+	}
 	switch ev.Type() {
+	case "bridge_observation":
+		ev["waiter"].(chan Event) <- ev["response"].(Event)
 	case "response":
 		// Unlike Request responses, prompt acceptance is handled on the event
 		// stream: earlier agent_start/settled events must be observed first.
@@ -988,6 +1022,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		Limit        int                `json:"limit"`
 		Since        string             `json:"since"`
 		Before       string             `json:"before"`
+		SessionID    string             `json:"sessionIdentity"`
 		ProcessCount int                `json:"count"`
 		Processes    []HeartbeatProcess `json:"processes"`
 	}
@@ -995,6 +1030,15 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		b.log("warning", "bad tool-relay payload: "+err.Error())
 		b.rpc.RespondUIRelay(id, "bad tool-relay payload: "+err.Error())
 		return
+	}
+	if cmd.Action == "process_count" || cmd.Action == "subagent_count" || cmd.Action == "process_heartbeat" {
+		b.mu.Lock()
+		stale := b.nextTransition || (b.sessionID != "" && cmd.SessionID != b.sessionID)
+		b.mu.Unlock()
+		if stale {
+			b.rpc.RespondUIRelay(id, "stale session ignored")
+			return
+		}
 	}
 	switch cmd.Action {
 	case "react":
@@ -1118,6 +1162,25 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	// hand-off, not before: if the process dies while the run is in flight the
 	// message is still outside the cursor and the next reconnect's backfill picks
 	// it up (#94).
+	if len(m.Reactions) == 0 {
+		// Preserve ordinary inbound idle/presence semantics when no boundary
+		// applies, but classify eligible boundary input before old-turn changes.
+		eligible := true
+		if !m.Direct {
+			action, _, _ := b.classify(m)
+			eligible = action != actionNotOurs
+			if eligible {
+				m.Addressed = true
+			}
+			if m.Nick != "" && b.xmpp != nil && strings.EqualFold(m.Nick, b.xmpp.ownNick(m.Room)) {
+				eligible = false
+			}
+		}
+		if eligible && b.admitNext(m) {
+			b.noteInboundHandled()
+			return
+		}
+	}
 	defer b.noteInboundHandled()
 	b.resetSendRecoveryNudges() // fresh user turn — allow one empty-tail recovery again
 	b.resetHintNudges()         // fresh user turn — allow one unanswered-message hint again
@@ -1717,6 +1780,10 @@ func (b *Bridge) handleCommand(t string) bool {
 	case "next":
 		b.handleNext(arg)
 	case "new":
+		if b.inbox != nil && len(b.inbox.protectedPending()) > 0 {
+			b.reply("/new: unresolved exact-target input retained; consume it in the original session before resetting")
+			return true
+		}
 		if b.streaming() {
 			b.rpc.Abort()
 		}
@@ -4049,13 +4116,14 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 func (b *Bridge) idleTick() {
 	b.sessionTransitionMu.Lock()
 	defer b.sessionTransitionMu.Unlock()
+	pendingNext := b.nextPending() || (b.inbox != nil && len(b.inbox.protectedPending()) > 0)
 	b.mu.Lock()
 	idle := !b.idleSince.IsZero()
 	elapsed := time.Since(b.idleSince)
 	// Read streamingRun directly rather than via streaming(), which re-locks
 	// b.mu and would deadlock this goroutine against itself.
 	// Background processes keep the bot dnd (never drift to away mid-build).
-	if !idle || b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
+	if b.nextTransition || pendingNext || !idle || b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
 		b.mu.Unlock()
 		return
 	}
@@ -4384,6 +4452,16 @@ func (b *Bridge) finishPromptAcceptance(id string, rejected bool) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	_, tracked := b.pendingPrompts[id]
+	if p, ok := b.protectedPrompts[id]; ok {
+		delete(b.protectedPrompts, id)
+		if rejected {
+			b.protectedPromptError = "protected prompt rejected; retained for exact target"
+		} else {
+			if _, err := b.inbox.markDeliveredKey(p.key, p.session, p.at); err != nil {
+				b.protectedPromptError = err.Error()
+			}
+		}
+	}
 	delete(b.pendingPrompts, id)
 	if tracked && rejected && !b.streamingRun && len(b.pendingPrompts) == 0 {
 		// Preflight rejection need not emit any lifecycle event to consume
@@ -4442,6 +4520,9 @@ func (b *Bridge) flushPendingHeartbeats() {
 // volunteer a line to the owner (start directive "proactive"). If it has
 // nothing to volunteer it replies with nothing, and agent_settled stays silent.
 func (b *Bridge) fireResumeTurn() {
+	if b.nextPending() {
+		return
+	}
 	if !b.reserveSyntheticPrompt() {
 		return
 	}
@@ -4626,21 +4707,54 @@ func (b *Bridge) mamFetch(ctx context.Context, since time.Time) []InboundMessage
 // delivered live, in the process that then died, so a recorded `seen` id would
 // suppress exactly the message this path exists to recover.
 func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
+	// Archive/delay copies must not bypass a durable original's admission or
+	// historical-control quarantine. MAM backfill can call with nil inboxes,
+	// before the later startup inbox drain, so include the live durable queue.
+	durable := append(append([]inboxEntry(nil), inboxes...), b.inboxPending()...)
 	fresh := make([]InboundMessage, 0, len(msgs))
 	for _, m := range msgs {
 		if b.xmpp.hasSeen(m.ID) {
 			continue
 		}
-		fresh = append(fresh, m)
+		overlap := false
+		for _, e := range durable {
+			if sameProtectedStanza(e, m) {
+				overlap = true
+				if !e.protected() && historicalBoundaryControl(e.message(), b) {
+					b.next.quarantined.Store(true)
+				}
+				break
+			}
+		}
+		if !overlap {
+			fresh = append(fresh, m)
+		}
 	}
 	total := len(fresh) + len(inboxes)
 	if total == 0 || b.ctx.Err() != nil {
 		return
 	}
-	b.reply(fmt.Sprintf("Back online, catching up on %d messages", total))
+	banner := fmt.Sprintf("Back online, catching up on %d messages", total)
+	b.next.mu.Lock()
+	pendingDest := ""
+	if r := b.next.record; r != nil {
+		pendingDest = r.Destination
+	}
+	b.next.mu.Unlock()
+	if pendingDest != "" {
+		b.sendReconcileNotice(pendingDest, banner)
+	} else {
+		b.reply(banner)
+	}
 	for _, m := range fresh {
 		b.xmpp.markSeen(m.ID)
 		b.noteInboundHandled()
+		b.sessionTransitionMu.Lock()
+		held := b.admitNext(m)
+		b.sessionTransitionMu.Unlock()
+		if held {
+			continue
+		}
 		if m.Direct {
 			b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil, m.Markable)
 		} else {
@@ -4692,7 +4806,23 @@ const inboxNote = "[pi-msg: re-delivered after a restart — this was queued to 
 // settles, so a repeated stop cannot lose it; the note is appended rather than
 // prepended so a room trigger at the start of the body still matches.
 func (b *Bridge) deliverInbox(e inboxEntry) {
+	if e.protected() {
+		b.wakeNext()
+		return
+	}
 	m := e.message()
+	// Ordinary durable input predates any reconstructed admission provenance.
+	// Never migrate it into a later boundary (which can fail the encoded bound),
+	// and never execute historical destructive controls against today's session.
+	if historicalBoundaryControl(m, b) {
+		b.next.quarantined.Store(true)
+		b.log("warning", "recovered destructive control quarantined; inspect original durable inbox")
+		return
+	}
+	if b.next.fenced.Load() {
+		b.log("warning", "pre-boundary ordinary inbox retained; resolve in old session or explicitly /new")
+		return
+	}
 	if strings.TrimSpace(m.Body) == "" {
 		b.inboxDrop(m.ID, m.From, m.Body)
 		return
@@ -4715,7 +4845,10 @@ func (b *Bridge) ackInboxSettled() {
 	if b.inbox == nil {
 		return
 	}
-	p := ackPolicy{Now: time.Now(), LastActive: b.lastRunActivity()}
+	b.mu.Lock()
+	sessionID := b.sessionID
+	b.mu.Unlock()
+	p := ackPolicy{Now: time.Now(), LastActive: b.lastRunActivity(), SessionID: sessionID, SuppressOrdinaryGrace: b.next.fenced.Load() || b.next.quarantined.Load()}
 	b.log("info", fmt.Sprintf("inbox: run settled; pending=%d", b.inbox.len()))
 	if n := b.inbox.ackSettled(p); n > 0 {
 		b.log("info", fmt.Sprintf("inbox: acknowledged %d message(s)", n))

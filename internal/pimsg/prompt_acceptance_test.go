@@ -50,7 +50,15 @@ func TestNextRefusesPendingPromptAcceptance(t *testing.T) {
 			if len(f.jobs(t)) != 0 || strings.Contains(fileText(filepath.Join(f.dir, "commands")), `"type":"new_session"`) {
 				t.Fatal("/next reset while ordinary prompt preflight was pending")
 			}
-			acceptPromptResponses(f.b, true) // handled without an LLM turn, e.g. an extension command
+			acceptPromptResponses(f.b, true) // preflight completion alone is not consumption
+			if source == "canonical" {
+				f.step()
+				if len(f.jobs(t)) != 0 || f.b.inbox.len() != 1 {
+					t.Fatal("accepted but unread ordinary input crossed reset boundary")
+				}
+				f.b.noteRunActivity() // prove old-context consumption before reset
+				f.b.ackInboxSettled()
+			}
 			f.command("/next", f.b.acct.Owner)
 			if len(f.jobs(t)) != 1 {
 				t.Fatal("accepted non-streaming prompt left false activity")

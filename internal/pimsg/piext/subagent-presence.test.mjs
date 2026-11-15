@@ -113,7 +113,7 @@ test("session-owned parallel children aggregate, then complete/fail/stop/pause c
 		await f.tick();
 		assert.equal(f.latest(), 1);
 	}
-	assert.ok(f.counts().every((r) => Object.keys(r).sort().join() === "action,count"), "no task/role/output leaks");
+	assert.ok(f.counts().every((r) => Object.keys(r).sort().join() === "action,count,sessionIdentity" && r.sessionIdentity === `id:${SESSION_ID}`), "only count and exact captured session identity; no task/role/output leaks");
 });
 
 test("file-owned started event is immediately visible before the first artifact, with bounded bootstrap grace", async (t) => {
