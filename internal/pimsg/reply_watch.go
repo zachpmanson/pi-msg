@@ -82,6 +82,12 @@ func (b *Bridge) deliverReplyWatch(w *replyWatch) {
 	if blocked || !w.expired || b.replyWatches[w.conversation] != w {
 		return
 	}
+	// Reset sealing releases sessionTransitionMu before the RPC round trip.
+	// Reserve before touching the watch or any run/destination/contract state.
+	if !b.reserveSyntheticPrompt() {
+		return
+	}
+	defer b.releaseSyntheticPrompt()
 	delete(b.replyWatches, w.conversation)
 	text := fmt.Sprintf("[pi-msg: reply-timeout: No qualifying reply received from %s within %g seconds of stanza %s. Sent text: %q. Check conversation history to see whether unaddressed chatter answered it, then decide whether any follow-up is needed. Remaining silent is valid; this is not an instruction to send a message.]", w.conversation, w.seconds, w.stanzaID, w.text)
 	// Reuse the heartbeat synthetic-run exemption: silence must not cause send

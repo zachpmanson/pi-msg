@@ -35,6 +35,7 @@ func init() {
 }
 
 type nextFixture struct {
+	t       *testing.T
 	b       *Bridge
 	wire    *bytes.Buffer
 	dir, pi string
@@ -61,7 +62,8 @@ func nextSetup(t *testing.T) *nextFixture {
 		}
 	}
 	b.acct.ReconcileSkill = skill
-	f := &nextFixture{b: b, wire: wire, dir: dir}
+	f := &nextFixture{b: b, wire: wire, dir: dir, t: t}
+	b.inbox = newInbox(inboxPath(b.acct.Name), b.log)
 	for n := 0; n < 5; n++ {
 		source := filepath.Join(dir, fmt.Sprintf("source-%d.jsonl", n))
 		raw := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":\"s%d\",\"cwd\":%q}\n{\"type\":\"message\",\"id\":\"m%d\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"old task, not authorization to continue\"}}\n", n, dir, n)
@@ -69,7 +71,7 @@ func nextSetup(t *testing.T) *nextFixture {
 			t.Fatal(err)
 		}
 		f.sources = append(f.sources, source)
-		state := map[string]any{"sessionFile": source, "isStreaming": false, "isCompacting": false, "pendingMessageCount": 0, "model": map[string]string{"provider": "fake", "id": "model"}, "thinkingLevel": "high"}
+		state := map[string]any{"sessionId": fmt.Sprintf("s%d", n), "sessionFile": source, "isStreaming": false, "isCompacting": false, "pendingMessageCount": 0, "model": map[string]string{"provider": "fake", "id": "model"}, "thinkingLevel": "high"}
 		data, _ := json.Marshal(state)
 		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("state-%d.json", n)), data, 0600); err != nil {
 			t.Fatal(err)
@@ -110,6 +112,14 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$base/commands"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   case "$line" in
+    *'"type":"test_settle"'*)
+      printf '{"type":"agent_settled"}\n';;
+    *'"type":"prompt"'*)
+      printf 'prompt-session-%s\n' "$n" >> "$base/commands"
+      if [ -f "$base/prompt-normal" ]; then
+        printf '{"type":"agent_start"}\n'
+        printf '{"type":"response","id":"%s","success":true}\n' "$id"
+      fi;;
     *'"type":"get_state"'*)
       printf '{"type":"response","id":"%s","success":true,"data":%s}\n' "$id" "$(cat "$base/state-$n.json")";;
     *'"type":"new_session"'*)
@@ -200,6 +210,28 @@ func (f *nextFixture) command(body, dest string) {
 		body = "pi: " + body
 	}
 	f.b.onInbound(InboundMessage{Body: body, Direct: dest == f.b.acct.Owner, FromOwner: true, Room: dest, From: f.b.acct.Owner, ID: fmt.Sprint(time.Now().UnixNano())})
+	f.step()
+}
+
+// Legacy tests drive one off-loop executor iteration to completion while
+// consuming real ordered RPC events. Production runs this on its own wake loop.
+func (f *nextFixture) step() {
+	done := make(chan struct{})
+	go func() { f.b.executeNextQueue(); close(done) }()
+	timer := time.NewTimer(8 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case ev, ok := <-f.b.rpc.Events():
+			if ok {
+				f.b.handleRPCEvent(ev)
+			}
+		case <-timer.C:
+			f.t.Fatal("executor iteration timed out")
+		}
+	}
 }
 func fileText(path string) string { raw, _ := os.ReadFile(path); return string(raw) }
 func touchNext(t *testing.T, path string) {
@@ -766,12 +798,12 @@ func TestNextRefusesThroughoutSettlement(t *testing.T) {
 
 func TestNextTransitionRejectsSyntheticAndLateSettle(t *testing.T) {
 	f := nextSetup(t)
-	// Hold get_state on the real RPC pipe after /next has reserved the idle
+	// Hold new_session on the real RPC pipe after /next has reserved the idle
 	// generation. Events must return immediately, not wait on the session mutex.
 	original := f.b.rpc.stdin
 	w := &nextBlockedWriter{Writer: original, entered: make(chan struct{}), release: make(chan struct{})}
 	t.Cleanup(w.unblock)
-	f.b.rpc.stdin = &nextBlockedCloser{nextBlockedWriter: w, Closer: original}
+	f.b.rpc.stdin = &nextResetBlocker{nextBlockedCloser: nextBlockedCloser{nextBlockedWriter: w, Closer: original}}
 	done := make(chan struct{})
 	go func() { f.command("/next", f.b.acct.Owner); close(done) }()
 	waitNextSignal(t, w.entered)
@@ -972,4 +1004,14 @@ func TestNextResetAuthorityCrashGaps(t *testing.T) {
 			f.b.pollReconciles()
 		})
 	}
+}
+
+// Block only reset, not the read-only ordered idle observation.
+type nextResetBlocker struct{ nextBlockedCloser }
+
+func (w *nextResetBlocker) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`"type":"new_session"`)) {
+		return w.nextBlockedWriter.Write(p)
+	}
+	return w.Writer.Write(p)
 }

@@ -86,6 +86,7 @@ type RPCClient struct {
 	cmd             *exec.Cmd
 	stdin           io.WriteCloser
 	nextID          int
+	ordered         map[string]bool
 	pending         map[string]chan Event
 	closed          bool
 	readerCancelled bool // wait forcibly closed stdout after child exit
@@ -316,13 +317,21 @@ func (c *RPCClient) route(ev Event) bool {
 		if id := ev.Str("id"); id != "" {
 			c.mu.Lock()
 			ch, ok := c.pending[id]
+			ordered := c.ordered[id]
+			delete(c.ordered, id)
 			if ok {
 				delete(c.pending, id)
+				delete(c.ordered, id)
 			}
 			c.mu.Unlock()
 			if ok {
-				ch <- ev
-				return true
+				if ordered {
+					// A narrow transition observation passes prior buffered events.
+					ev = Event{"type": "bridge_observation", "response": ev, "waiter": ch}
+				} else {
+					ch <- ev
+					return true
+				}
 			}
 		}
 	}
@@ -392,12 +401,20 @@ func (c *RPCClient) Request(ctx context.Context, cmd map[string]any, timeout tim
 	id := fmt.Sprintf("r%d", c.nextID)
 	ch := make(chan Event, 1)
 	c.pending[id] = ch
+	if ordered, _ := cmd["bridgeOrdered"].(bool); ordered {
+		if c.ordered == nil {
+			c.ordered = make(map[string]bool)
+		}
+		c.ordered[id] = true
+	}
+	delete(cmd, "bridgeOrdered")
 	c.mu.Unlock()
 
 	cmd["id"] = id
 	if err := c.write(cmd); err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
+		delete(c.ordered, id)
 		c.mu.Unlock()
 		return nil, err
 	}
@@ -410,11 +427,13 @@ func (c *RPCClient) Request(ctx context.Context, cmd map[string]any, timeout tim
 	case <-timer.C:
 		c.mu.Lock()
 		delete(c.pending, id)
+		delete(c.ordered, id)
 		c.mu.Unlock()
 		return nil, fmt.Errorf("timeout waiting for %v", cmd["type"])
 	case <-ctx.Done():
 		c.mu.Lock()
 		delete(c.pending, id)
+		delete(c.ordered, id)
 		c.mu.Unlock()
 		return nil, ctx.Err()
 	case <-c.done:
@@ -427,6 +446,7 @@ func (c *RPCClient) Request(ctx context.Context, cmd map[string]any, timeout tim
 		}
 		c.mu.Lock()
 		delete(c.pending, id)
+		delete(c.ordered, id)
 		err := c.exitErr
 		c.mu.Unlock()
 		if err != nil {
@@ -560,4 +580,9 @@ func (c *RPCClient) StoppedIntentionally() bool {
 	default:
 		return false
 	}
+}
+
+// observedState is only safe off the event-consumer goroutine.
+func (c *RPCClient) observedState(ctx context.Context) (Event, error) {
+	return c.Request(ctx, map[string]any{"type": "get_state", "bridgeOrdered": true}, 30*time.Second)
 }

@@ -625,75 +625,11 @@ func (b *Bridge) sendReconcileNotice(dest, text string) bool {
 	return b.xmpp.SendChatTo(dest, text) != ""
 }
 
-// Called under sessionTransitionMu by canonical inbound dispatch.
+// Legacy canonical entry points still use the same durable admission seam.
 func (b *Bridge) handleNext(arg string) {
 	dest := b.currentTurnDest()
 	if dest == "" {
 		dest = b.acct.Owner
 	}
-	fail := func(err error) { b.sendReconcileNotice(dest, "/next: "+err.Error()) }
-	if arg != "" {
-		fail(fmt.Errorf("takes no arguments"))
-		return
-	}
-	b.mu.Lock()
-	busy := b.streamingRun || b.settlingRun || b.syntheticPrompts > 0 || len(b.pendingPrompts) > 0 || len(b.pendingHeartbeats) > 0 || b.bgProcesses > 0 || b.bgSubagents > 0
-	if !busy {
-		b.nextTransition = true
-	}
-	b.mu.Unlock()
-	if busy {
-		fail(fmt.Errorf("wait for the active run/background work to finish; session unchanged"))
-		return
-	}
-	defer func() { b.mu.Lock(); b.nextTransition = false; b.mu.Unlock() }()
-	res, err := b.rpc.GetState(b.ctx)
-	if err != nil {
-		fail(err)
-		return
-	}
-	if !res.success() {
-		fail(fmt.Errorf("get_state: %s", res.errText()))
-		return
-	}
-	state := res.Obj("data")
-	if state.Bool("isStreaming") || state.Bool("isCompacting") || state.F64("pendingMessageCount") > 0 {
-		fail(fmt.Errorf("Pi is active or has queued messages; wait until settled; session unchanged"))
-		return
-	}
-	dir, j, err := prepareReconcile(b.acct, state, dest, b.rpc.bin)
-	if err != nil {
-		fail(err)
-		return
-	}
-	gate, err := startReconcile(dir)
-	if err != nil {
-		j.State, j.Summary = "failed", err.Error()
-		_ = saveReconcile(dir, j)
-		fail(err)
-		return
-	}
-	defer gate.Close()
-	res, err = b.rpc.NewSession(b.ctx)
-	if err == nil && (!res.success() || res.Obj("data").Bool("cancelled")) {
-		err = fmt.Errorf("reset rejected/cancelled: %s", res.errText())
-	}
-	if err != nil {
-		_, _ = io.WriteString(gate, "cancel\n")
-		fail(err)
-		return
-	}
-	// Persist reset authority before opening the gate or claiming queued success.
-	// If the bridge dies before/after this write, recovery never replays the job.
-	authorizeErr := authorizeReconcile(dir)
-	b.settleLocally()
-	b.afterNewSession()
-	if authorizeErr != nil {
-		fail(fmt.Errorf("fresh session ready but could not persist worker authorization: %w; no worker authorized; inspect %s", authorizeErr, dir))
-		return
-	}
-	b.reportReconcileQueued(dir, j)
-	if _, err := io.WriteString(gate, "run\n"); err != nil {
-		fail(fmt.Errorf("fresh session ready but worker authorization failed: %w; inspect %s", err, dir))
-	}
+	b.admitNext(InboundMessage{Body: "/next " + arg, Direct: dest == b.acct.Owner, FromOwner: true, Room: dest, From: b.acct.Owner})
 }

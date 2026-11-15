@@ -22,21 +22,22 @@ unattended skill: no questions, interactive login, or waiting for approval.
 
 ## Sequence and notices
 
-1. Refuse while the primary is streaming, compacting, awaits prompt acceptance,
-   has pending messages, is still processing settlement (including recovery/hints/heartbeats),
-   or owns background shells/subagents. Every bridge prompt is reserved before
-   its pipe write, until its correlated acceptance/rejection response is processed;
-   a rejected input does not invent permanent streaming activity. Synthetic
-   submissions also reserve old-turn state inspection atomically against `/next`;
-   old-session alarms cannot enter the fresh primary during the transition. Wait for work to settle; `/next` never
-   aborts or snapshots a live run.
+1. Durably accept one pending boundary and acknowledge its identity immediately,
+   even while busy. Duplicate aliases refer to the same boundary and never retry
+   a failed reset. Later eligible owner/peer chat is held in a protected durable
+   inbox, FIFO by admission, not sent as old-session steers. Old work finishes
+   normally, including settlement/recovery, pending prompt acceptance, heartbeats
+   and owned background processes/subagents. An off-event-loop executor waits
+   for every bridge guard and an ordered actual Pi idle/noncompacting/no-pending
+   observation before reserving reset. No snapshot/reset occurs while busy.
 2. Snapshot the old JSONL, original cwd, model and thinking level. Register a
    durable job and ready a separate internal runner **before** reset. Preparation
    errors leave the primary unchanged.
 3. Call the same `new_session` RPC as `/new`. Failure or `cancelled:true` never
    authorizes reconciliation or a fresh/queued success notice. Persist successful
    reset authority before opening the worker gate or sending that notice.
-   On success, refresh the resume pointer, re-arm
+   On success, prove a distinct actual identity and durably persist the exact
+   resume pointer and target before held assignment/submission. Re-arm
    messaging seeding and fresh-session state, and return immediately without
    waiting for any model response.
 4. Send `new session ready; [reconcile job-…] queued in background`. The runner
@@ -44,7 +45,13 @@ unattended skill: no questions, interactive login, or waiting for approval.
    private copy**, never on the original JSONL. On observed process start the
    bridge sends `reconciliation running in background`. A job finishing before
    the first poll instead gets the truthful `reconciliation ran in background`.
-5. Send a labelled completion/failure/cancellation summary directly to the
+5. Release held chat FIFO into the proven target, preserving authority, original
+   routing/reply/marker metadata and protected keys. Only one protected prompt
+   enters asynchronous preflight at a time; correlated success releases its
+   successor. Retire the admission fence once all held inputs are accepted and
+   their exact target has a usable resume pointer, without waiting for settlement.
+   Target tags remain until consumption. Rejection/submission failure blocks.
+6. Send a labelled completion/failure/cancellation summary directly to the
    initiating conversation. Later turns, `/new`, and subsequent `/next` calls
    cannot redirect it. Worker output never enters the fresh primary context.
 
@@ -104,7 +111,7 @@ but the job is interrupted without worker effects. Neither gap is auto-replayed.
 The deadline terminates Pi with SIGTERM (Pi cleans up its tracked shell children),
 then escalates to its process group after five seconds. For manual cancellation,
 verify the live runner PID from `job.json` against its command line and job lock
-before sending SIGTERM. `/abort`, `/new`, and `!` affect only the primary, not
+before sending SIGTERM. `/abort`, `/new`, and `!` without a pending boundary affect only the primary, not
 these jobs. `/quit` does not promise cancellation of independent runners.
 Hard kills or untracked/detached external processes can defeat graceful cleanup;
 external requests already sent cannot be rolled back. Pi inherits the job and
@@ -121,3 +128,55 @@ can duplicate a notice (not worker effects). This is not end-to-end delivery
 acknowledgement. No automatic retention policy: archive/delete terminal job
 directories manually after inspection; never delete live jobs or lock files.
 Presence remains primary/session-owned and does not count these independent jobs.
+
+## Queued-boundary recovery and candidate acceptance gates
+
+The private pending record is `<config-dir>/<account>.next.json`. Protected inbox
+entries retain boundary identity, local keys and (after proof) exact target
+identity. They are never age-acked or capped like ordinary input. Encoded records
+are limited to 1 MiB minus one byte (excluding LF), ensuring restart readability.
+Append failures, including oversize input, are reported explicitly; input never
+falls through to the old session. If not accepted durably, retain and resend it
+after repair.
+
+Interrupted pre-reset boundaries become **blocked**, even if startup appears idle.
+A proven post-reset target may resume/replay input at least once, without another
+reset or reopening a reconciliation gate. Missing/corrupt/mismatched state or
+unusable target files hold with diagnostics; protected data never uses generic
+fresh-session fallback. Stateless initial-prompt launches refuse another boundary.
+Assigned protected input without a pending record recovers only for exact-target
+replay, proving actual resumed identity before dispatch; mixed or unassigned
+orphan data fails closed. A later `&` creates a distinct boundary even during the
+fresh turn, but no subsequent reset (including `/new` or idle reset) may cross
+unresolved older exact-target input. Old tags are never reassigned.
+
+Unresolved ordinary old-session input blocks reset and cannot age-ack while the
+boundary is pending. Proven old consumption can clear it. Recovered ordinary
+input is conservatively retained, not migrated into a newer boundary; historical
+destructive controls are quarantined rather than executed against today's session.
+Explicit pre-target `/new` may discard old primary inbox work, reporting the
+count, while preserving every post-boundary protected entry.
+
+While pending, native controls are refused without redirecting ongoing old-turn
+output. Unknown extension commands are held as chat; peer apparent controls never
+gain owner authority. **The owner decision for /abort, /stop and bare ! remains
+outstanding**: this candidate refuses them, does not abort old work or discard
+held chat, and is not control-complete. No-boundary abort/interrupt is unchanged.
+/quit preserves the durable boundary and queue.
+
+Explicit owner /new may supersede waiting/blocked reconciliation only before any
+held entry is target-bound/submitted, and only while the executor is inactive.
+It uses deliberate-new abort/reset semantics, proves and persists a distinct
+target, then releases input without authorizing/restarting the old job. Already
+assigned/partially released input is refused, never silently retargeted;
+post-target recovery remains an acceptance gate requiring inspection.
+
+Automatic companion count/heartbeat relays include captured session identity;
+stale buffered old-session relays cannot change or wake the fresh primary.
+Physical-work guards remain, but zero active subagent artifacts does **not** prove
+completion notices were drained. Actual Pi replacement emits session_shutdown
+and disposes old extensions, potentially cancelling undelivered batched notices.
+No external plugin changes or sleeps are used, and neither a proven real
+cross-session leak nor proven notification preservation is claimed. Installed-Pi
+notification-drain/disposable-droid validation and independent review remain
+required before rollout.

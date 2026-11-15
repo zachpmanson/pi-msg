@@ -443,6 +443,21 @@ func (in *inbox) pending() []inboxEntry {
 	return append([]inboxEntry(nil), in.entries...)
 }
 
+// clearOrdinary is explicit /new recovery only. Protected promises are untouched.
+func (in *inbox) clearOrdinary() (int, error) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	kept := in.protectedPendingLocked()
+	n := len(in.entries) - len(kept)
+	if n == 0 {
+		return 0, nil
+	}
+	if err := in.commitLocked(kept, true); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // markDelivered records that pi was handed this message, so the settle that ends
 // the run can acknowledge it without waiting for the grace. It matches by stanza
 // id when there is one, else by (from, body). Returns how many entries matched.
@@ -509,6 +524,8 @@ func (in *inbox) len() int {
 // ackPolicy is what a settling run reports about itself, so the inbox can tell
 // the entries it consumed from the ones it merely outlived.
 type ackPolicy struct {
+	// Default false preserves legacy ordinary behaviour outside an admission fence.
+	SuppressOrdinaryGrace bool
 	// SessionID is the exact session whose delivery/activity is settling.
 	SessionID string
 	// Now is the settle time.
@@ -541,7 +558,7 @@ func (in *inbox) ackSettledErr(p ackPolicy) (int, error) {
 	var ackLogs []string
 	for _, e := range in.entries {
 		consumed := !e.deliveredAt.IsZero() && !p.LastActive.IsZero() && !p.LastActive.Before(e.deliveredAt)
-		eligible := consumed || p.Now.Sub(e.At) >= inboxAckGrace
+		eligible := consumed || (!p.SuppressOrdinaryGrace && p.Now.Sub(e.At) >= inboxAckGrace)
 		if e.protected() {
 			eligible = consumed && p.SessionID != "" && e.TargetSessionID == p.SessionID && e.deliveredSessionID == p.SessionID
 		}

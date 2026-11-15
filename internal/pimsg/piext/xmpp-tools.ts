@@ -41,6 +41,7 @@ type RelayUI = {
 export default function xmppTools(pi: ExtensionAPI) {
 	// Captured on session_start; used by tool handlers to reach pi-msg.
 	let ui: RelayUI | undefined;
+	let sessionIdentity = "";
 
 	// --- Subagent presence tracking ---
 	// pi-subagents publishes async-started/async-complete on the shared bus.
@@ -220,8 +221,11 @@ export default function xmppTools(pi: ExtensionAPI) {
 	async function refreshProcessCount() {
 		if (!ui) return;
 		try {
-			const count = await queryProcessCount();
-			await relay("process_count", { count });
+			const epoch = subagentEpoch;
+            const identity = sessionIdentity;
+            const count = await queryProcessCount();
+            if (epoch !== subagentEpoch) return;
+			await relay("process_count", { count, sessionIdentity: identity });
 		} catch {
 			// Best-effort: presence is cosmetic; a dropped relay is harmless.
 		}
@@ -516,6 +520,9 @@ export default function xmppTools(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+        const id = ctx.sessionManager.getSessionId();
+        const file = ctx.sessionManager.getSessionFile?.();
+        sessionIdentity = id ? `id:${id}` : file ? `file:${file}` : "";
 		// A replacement may start without unloading this extension instance.
 		subagentEpoch++;
 		if (subagentTimer) clearInterval(subagentTimer);
@@ -592,7 +599,7 @@ ${systemPrompt}`;
 		if (!ui) {
 			throw new Error("no relay channel to pi-msg (session not started)");
 		}
-		return (await ui.select(RELAY_PREFIX + JSON.stringify({ action, ...args }), ["ok"], timeout === undefined ? undefined : { timeout })) ?? "relay cancelled (no response from pi-msg)";
+		return (await ui.select(RELAY_PREFIX + JSON.stringify({ action, ...((action === "process_count" || action === "subagent_count" || action === "process_heartbeat") ? { sessionIdentity } : {}), ...args }), ["ok"], timeout === undefined ? undefined : { timeout })) ?? "relay cancelled (no response from pi-msg)";
 	}
 
 	if (enabled.has("reaction")) {
