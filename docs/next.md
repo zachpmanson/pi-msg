@@ -50,7 +50,14 @@ unattended skill: no questions, interactive login, or waiting for approval.
    enters asynchronous preflight at a time; correlated success releases its
    successor. Retire the admission fence once all held inputs are accepted and
    their exact target has a usable resume pointer, without waiting for settlement.
-   Target tags remain until consumption. Rejection/submission failure blocks.
+   Pi may accept prompts before writing the session file at first assistant
+   output. Until that file becomes usable, keep the boundary in `releasing`
+   and hold the admission fence; poll only the same target's release, without
+   resubmitting accepted prompts, resetting, or restarting reconciliation. Later
+   input still joins this target's FIFO. Protected submissions explicitly request
+   native steering, valid both idle and busy, rather than relying on lagging bridge
+   busy flags. Target tags remain until consumption. Rejection/submission failure
+   or a missing/mismatched saved pointer blocks.
 6. Send a labelled completion/failure/cancellation summary directly to the
    initiating conversation. Later turns, `/new`, and subsequent `/next` calls
    cannot redirect it. Worker output never enters the fresh primary context.
@@ -143,7 +150,14 @@ Interrupted pre-reset boundaries become **blocked**, even if startup appears idl
 A proven post-reset target may resume/replay input at least once, without another
 reset or reopening a reconciliation gate. Missing/corrupt/mismatched state or
 unusable target files hold with diagnostics; protected data never uses generic
-fresh-session fallback. Stateless initial-prompt launches refuse another boundary.
+fresh-session fallback. A crash while waiting for the target's first file write
+cannot recover until a usable exact file and matching saved pointer exist;
+startup refuses to substitute a fresh session. The historical blocked diagnostic
+`accepted target has no usable exact resume pointer` alone is recoverable on
+restart once that exact file/pointer is usable. Recovery still proves the active
+RPC identity and file before assigning or replaying input, never resets or
+reopens a reconciliation gate, and leaves every other blocked reason blocked.
+Stateless initial-prompt launches refuse another boundary.
 Assigned protected input without a pending record recovers only for exact-target
 replay, proving actual resumed identity before dispatch; mixed or unassigned
 orphan data fails closed. A later `&` creates a distinct boundary even during the
@@ -169,7 +183,9 @@ held entry is target-bound/submitted, and only while the executor is inactive.
 It uses deliberate-new abort/reset semantics, proves and persists a distinct
 target, then releases input without authorizing/restarting the old job. Already
 assigned/partially released input is refused, never silently retargeted;
-post-target recovery remains an acceptance gate requiring inspection.
+post-target recovery is limited to proven exact-target replay and the historical
+session-materialization condition described above; other blocked states require
+inspection.
 
 Automatic companion count/heartbeat relays include captured session identity;
 stale buffered old-session relays cannot change or wake the fresh primary.

@@ -28,6 +28,15 @@ func (b *Bridge) nextPath() string {
 	return strings.TrimSuffix(inboxPath(b.acct.Name), ".inbox.jsonl") + ".next.json"
 }
 
+// Historical releases used to block on Pi's delayed first session-file write.
+// Only this exact diagnostic is eligible for automatic post-target recovery.
+const nextAcceptedTargetNotDurable = "accepted target has no usable exact resume pointer"
+
+func (b *Bridge) nextResumeUsable(r *nextBoundaryRecord) bool {
+	return r.FreshSessionID != "" && r.FreshSessionFile != "" &&
+		loadSessionState(b.acct.Name) == r.FreshSessionFile && sessionFileUsable(r.FreshSessionFile)
+}
+
 func (b *Bridge) loadNextQueue() error {
 	r, err := loadNextBoundary(b.nextPath())
 	if err != nil {
@@ -51,16 +60,34 @@ func (b *Bridge) loadNextQueue() error {
 				return fmt.Errorf("mixed orphan protected targets/boundaries; refusing recovery")
 			}
 		}
-		// Replay-only transient fence. Actual RPC identity is proved by releaseNext;
-		// this phase can never reset or authorize a reconciliation worker.
+		// Persist the replay-only fence before admitting new unassigned input;
+		// a crash before assignment must retain its exact target authority.
+		// releaseNext still proves actual RPC identity; this phase can never
+		// reset or authorize a reconciliation worker.
 		r = &nextBoundaryRecord{Version: nextBoundaryVersion, ID: first.NextBoundaryID, Command: "exact-target-replay", AcceptedAt: time.Now(), Phase: nextBoundaryReleasing, FreshSessionID: first.TargetSessionID, FreshSessionFile: prev, Destination: b.acct.Owner}
+		if err := saveNextBoundary(b.nextPath(), r); err != nil {
+			return err
+		}
 	}
 	for _, e := range b.inbox.pending() {
 		if !e.protected() && historicalBoundaryControl(e.message(), b) {
 			b.next.quarantined.Store(true)
 		}
 	}
-	if r != nil && r.Phase != nextBoundaryResetConfirmed && r.Phase != nextBoundaryReleasing {
+	if r != nil && r.Phase == nextBoundaryBlocked && r.LastError == nextAcceptedTargetNotDurable && b.initialPrompt == "" && b.nextResumeUsable(r) {
+		// This is replay authority only. releaseNext must still prove the active
+		// RPC identity/file before assignment, and never resets or opens a job gate.
+		r.Phase, r.LastError = nextBoundaryReleasing, ""
+		if err := saveNextBoundary(b.nextPath(), r); err != nil {
+			return err
+		}
+	}
+	if r != nil && (r.Phase == nextBoundaryResetConfirmed || r.Phase == nextBoundaryReleasing) && len(entries) > 0 && !b.nextResumeUsable(r) {
+		// After a crash an unmaterialized target cannot be resumed safely. Do
+		// not replay into a generic fresh fallback; retain the boundary and input.
+		return fmt.Errorf("pending /next requires usable exact target resume pointer")
+	}
+	if r != nil && r.Phase != nextBoundaryResetConfirmed && r.Phase != nextBoundaryReleasing && r.Phase != nextBoundaryBlocked {
 		r.Phase = nextBoundaryBlocked
 		r.LastError = "interrupted before proven target; inspect pending boundary and job artifacts; not automatically retried"
 		if err := saveNextBoundary(b.nextPath(), r); err != nil {
@@ -495,6 +522,10 @@ func (b *Bridge) releaseNext(r *nextBoundaryRecord) {
 	}
 	b.next.mu.Lock()
 	defer b.next.mu.Unlock()
+	if r.FreshSessionID == "" || r.FreshSessionFile == "" || loadSessionState(b.acct.Name) != r.FreshSessionFile {
+		b.blockNext(r, fmt.Errorf("target resume pointer missing or mismatched; inspect artifacts"))
+		return
+	}
 	b.mu.Lock()
 	b.sessionID = r.FreshSessionID
 	b.mu.Unlock()
@@ -504,10 +535,12 @@ func (b *Bridge) releaseNext(r *nextBoundaryRecord) {
 			return
 		}
 	}
-	r.Phase = nextBoundaryReleasing
-	if err = saveNextBoundary(b.nextPath(), r); err != nil {
-		b.blockNext(r, err)
-		return
+	if r.Phase != nextBoundaryReleasing {
+		r.Phase = nextBoundaryReleasing
+		if err = saveNextBoundary(b.nextPath(), r); err != nil {
+			b.blockNext(r, err)
+			return
+		}
 	}
 	if _, err = b.inbox.assignTargetSession(r.ID, r.FreshSessionID); err != nil {
 		b.blockNext(r, err)
@@ -546,8 +579,15 @@ func (b *Bridge) releaseNext(r *nextBoundaryRecord) {
 	}
 	// All held prompts have been accepted, not necessarily consumed. Durable
 	// target tags survive retirement and support exact-target replay on restart.
-	if len(b.inbox.protectedPending()) > 0 && (!sessionFileUsable(r.FreshSessionFile) || loadSessionState(b.acct.Name) != r.FreshSessionFile) {
-		b.blockNext(r, fmt.Errorf("accepted target has no usable exact resume pointer"))
+	if len(b.inbox.protectedPending()) > 0 && loadSessionState(b.acct.Name) != r.FreshSessionFile {
+		b.blockNext(r, fmt.Errorf("target resume pointer missing or mismatched; inspect artifacts"))
+		return
+	}
+	if len(b.inbox.protectedPending()) > 0 && !sessionFileUsable(r.FreshSessionFile) {
+		// Pi may acknowledge a prompt before persisting its session (normally
+		// at first assistant output). Keep the admission fence and exact target;
+		// ordered observations/polls retry only release, not accepted prompts,
+		// reset, or reconciliation. New arrivals still join this target's FIFO.
 		return
 	}
 	if err = removeNextBoundary(b.nextPath()); err != nil {
@@ -591,7 +631,10 @@ func (b *Bridge) deliverProtected(e inboxEntry) bool {
 	if m.Direct && m.Markable {
 		b.addPendingMarker(prompt, m.From, m.ID)
 	}
-	if !b.submitProtectedPrompt(prompt, b.steerBehavior(), e) {
+	// Native acceptance can precede agent_start, leaving local busy flags idle.
+	// Explicit steer is also valid when Pi is idle and safely queues the FIFO
+	// successor if Pi is already processing the previously accepted prompt.
+	if !b.submitProtectedPrompt(prompt, "steer", e) {
 		return false
 	}
 	return true
