@@ -1157,70 +1157,36 @@ type HeartbeatProcess struct {
 func (b *Bridge) onInbound(m InboundMessage) {
 	b.sessionTransitionMu.Lock()
 	defer b.sessionTransitionMu.Unlock()
-	// Everything that reaches here has been taken in by the agent, so the
-	// persistent last-inbound cursor advances with it. Written after the
-	// hand-off, not before: if the process dies while the run is in flight the
-	// message is still outside the cursor and the next reconnect's backfill picks
-	// it up (#94).
-	if len(m.Reactions) == 0 {
-		// Preserve ordinary inbound idle/presence semantics when no boundary
-		// applies, but classify eligible boundary input before old-turn changes.
-		eligible := true
-		if !m.Direct {
-			action, _, _ := b.classify(m)
-			eligible = action != actionNotOurs
-			if eligible {
-				m.Addressed = true
-			}
-			if m.Nick != "" && b.xmpp != nil && strings.EqualFold(m.Nick, b.xmpp.ownNick(m.Room)) {
-				eligible = false
-			}
-		}
-		if eligible && b.admitNext(m) {
-			b.noteInboundHandled()
-			return
-		}
-	}
+	// Advance the persistent inbound cursor after routing, including ignored
+	// traffic. For accepted messages, write it after handoff so a crash before
+	// delivery leaves the message available to reconnect backfill.
 	defer b.noteInboundHandled()
-	b.resetSendRecoveryNudges() // fresh user turn — allow one empty-tail recovery again
-	b.resetHintNudges()         // fresh user turn — allow one unanswered-message hint again
-	// Any inbound message is activity: come back to available and restart the
-	// idle-away timer from now (a run still in flight keeps dnd — leave its
-	// presence alone).
-	//
-	// This runs before the room-address filter below, so an unaddressed room
-	// message still counts as activity — the bridge is in the room and heard it.
-	// The clock is re-armed with markIdle rather than left in markActive's cleared
-	// state, because many inbound messages never become a run (#106 dropped the
-	// rest), so there is no agent_settled to re-arm it later: with only markActive,
-	// idleSince stays zero forever and the watcher can never drift the agent back
-	// to "away". markActive first resets awayAnnounced/lastAwayStatus so the next
-	// idle period announces a fresh away, then markIdle restarts the timer; if the
-	// message does start a run, that run's own agent_start/agent_settled lifecycle
-	// takes over the clock as usual.
-	b.markActive()
-	b.markIdle()
-	if !b.streaming() && b.xmpp != nil {
-		b.announceSettledPresence()
+	// Filter own echoes before either ordinary-message or reaction activity.
+	// The transport normally suppresses these; keep the dispatch guard as well.
+	if !m.Direct && m.Nick != "" && b.xmpp != nil && strings.EqualFold(m.Nick, b.xmpp.ownNick(m.Room)) {
+		b.log("warning", fmt.Sprintf("own-echo reached dispatch despite transport guard (nick %q in %s); dropping", m.Nick, m.Room))
+		b.inboxDrop(m.ID, m.From, m.Body)
+		return
 	}
-	// An inbound XEP-0444 reaction is an acknowledgment signal, not a
-	// conversation turn: it wakes the agent only when idle (issue #27).
+	// Reactions decide relevance and busy drops before recording any activity.
 	if len(m.Reactions) > 0 {
 		b.handleReaction(m)
 		return
 	}
-	// Room chatter that does not address this agent is not part of its world at
-	// all (#106): no turn, no durable record, no context. Classify BEFORE the
-	// inbox append so such a message never enters the durable queue — the same
-	// property the "drop an unactioned ambient entry" path used to buy after the
-	// fact, now by construction.
 	if !m.Direct {
+		// Classify using the pre-activity state: @free and owner broadcasts can
+		// depend on being away. Preserve that verdict through admission/dispatch.
 		if action, _, _ := b.classify(m); action == actionNotOurs {
 			b.log("info", fmt.Sprintf("room message in %s from %q does not address us; ignored", m.Room, m.Nick))
 			return
 		}
 		m.Addressed = true
 	}
+	// A queued boundary admits input before ANY old-turn state mutation.
+	if b.admitNext(m) {
+		return
+	}
+	b.noteInboundActivity()
 	// Durably record the message BEFORE any prompt goes out (#96): a run that
 	// dies before its next tool yield would otherwise take the instruction with
 	// it, and a live-delivered message is not replayed by the server either.
@@ -1232,6 +1198,19 @@ func (b *Bridge) onInbound(m InboundMessage) {
 		return
 	}
 	b.handleRoom(m)
+}
+
+// noteInboundActivity is only for traffic accepted by this primary session.
+// Controls may not start a run, so re-arm the idle clock now rather than relying
+// on agent_settled. A run's own lifecycle takes over if one starts.
+func (b *Bridge) noteInboundActivity() {
+	b.resetSendRecoveryNudges()
+	b.resetHintNudges()
+	b.markActive()
+	b.markIdle()
+	if !b.streaming() && b.xmpp != nil {
+		b.announceSettledPresence()
+	}
 }
 
 // handleReaction records an inbound XEP-0444 reaction (an ack from a peer or
@@ -1275,6 +1254,7 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	}
 	// Idle: wake the agent so the ack is readable now. It may acknowledge, act,
 	// or stay silent; no owner message is required (issue #27).
+	b.noteInboundActivity()
 	if m.Direct {
 		b.setTurnDest(b.acct.Owner, false)
 	} else {

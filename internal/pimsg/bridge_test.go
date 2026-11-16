@@ -471,22 +471,17 @@ func TestIdleAwayClock(t *testing.T) {
 	}
 }
 
-// TestInboundRearmsIdleClock guards against the "busy-room bot never goes
-// away" regression: an inbound message that never becomes a run previously left
-// idleSince cleared by markActive, and since agent_settled never fires for it,
-// the idle watcher had no way to ever drift the agent back to "away". onInbound
-// must re-arm the clock so a quiet stretch still produces an away transition.
-// The reaction-ack path is the remaining case that reaches onInbound without
-// becoming a run (#106 dropped unaddressed room chatter entirely).
+// An addressed bridge command may complete without an agent run (including an
+// immediate RPC failure). It must re-arm the idle clock: there will be no
+// agent_settled event to do so. Discarded room chatter is not activity.
 func TestInboundRearmsIdleClock(t *testing.T) {
-	b := roomBridge()
-	b.idleSince = time.Time{} // e.g. just cleared by a prior markActive
+	b := newTestBridge(ResolvedAccount{Owner: "zach@x.com"})
+	b.rpc = &RPCClient{pending: make(map[string]chan Event)} // not running: immediate command failure
+	b.idleSince = time.Time{}                                // e.g. just cleared by a prior markActive
 	b.awayAnnounced = false
 
-	// An unaddressed room message: dropped without a turn or a record.
 	b.onInbound(InboundMessage{
-		Nick: "falco", Room: "team@muc.x.com",
-		From: "falco@x.com/falco", Body: "some unrelated chatter",
+		Direct: true, FromOwner: true, From: "zach@x.com/phone", Body: "/think low",
 	})
 
 	if b.idleSince.IsZero() {
