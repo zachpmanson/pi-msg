@@ -194,7 +194,12 @@ const maxPendingMarkers = 64
 // archive reads are available in every account mode; file and reaction tools
 // remain opt-ins here, and lifecycle auto-reactions are gated in the bridge.
 func rpcEnv(acct ResolvedAccount) []string {
-	env := []string{"PI_MSG_TOOLS=" + strings.Join(toolNames(acct), ",")}
+	capabilities, _ := json.Marshal(struct {
+		Owner          string   `json:"owner"`
+		Rooms          []string `json:"rooms"`
+		ArbitraryPeers bool     `json:"arbitraryPeers"`
+	}{bareJid(acct.Owner), append([]string{}, acct.Rooms...), acct.AllowArbitraryJid})
+	env := []string{"PI_MSG_TOOLS=" + strings.Join(toolNames(acct), ","), "PI_MSG_CAPABILITIES=" + string(capabilities)}
 	if acct.BeforeAgentStartText != "" {
 		env = append(env, "PI_MSG_BEFORE_AGENT_START_TEXT="+acct.BeforeAgentStartText)
 	}
@@ -835,10 +840,6 @@ func (b *Bridge) handleReadMessagesRelay(id, target string, limit int, sinceArg,
 		return
 	}
 	isRoom := b.xmpp.isRoomJID(bare)
-	if b.acct.ErrorRoom != "" && bare == bareJid(b.acct.ErrorRoom) {
-		b.rpc.RespondUIRelay(id, fmt.Sprintf("read_messages: %q is not a readable conversation", target))
-		return
-	}
 	if !isRoom {
 		if bare != bareJid(b.acct.Owner) && !b.acct.AllowArbitraryJid {
 			b.rpc.RespondUIRelay(id, fmt.Sprintf("read_messages: %q is not an allowed target (allowed: owner %s and configured rooms)", target, b.acct.Owner))
@@ -2200,11 +2201,7 @@ func compactArgs(args Event) string {
 // Final assistant text is private to the harness; send_message is the explicit
 // agent-authored path for text messages.
 func (b *Bridge) messagingContract() string {
-	allow := "By default, send_message and read_messages allow only the owner and configured rooms. Room members are mention targets within their room, NOT DM destinations."
-	if b.acct.AllowArbitraryJid {
-		allow = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable. Room membership itself never grants DM permission."
-	}
-	return fmt.Sprintf("[pi-msg: messaging: Final assistant responses are INTERNAL to the harness and are never sent to chat. Send every chat message using send_message(to, text, reply_to?, reply_timeout_seconds?). Set reply_timeout_seconds to a finite positive number only when you want one internal reminder if no qualifying reply arrives; omission creates no watch. Choose `to` from the incoming `from:` conversation JID or use owner JID %s to message the owner. To address a room member, send to the room JID and mention the member in text; `sender:` identifies the author, not an authorized DM destination. %s `reply_to` is optional: omit it for ordinary replies; use the complete `stanza-id:` when you explicitly want a threaded reply or threading materially helps associate a follow-up. Omit it for ordinary replies, even when an incoming stanza ID is available. It must belong to the chosen conversation. Send one tool call per message/recipient. If several inbound messages need replies, use one send_message call for each, adding `reply_to` only where useful. `read_messages(target, …)` reads room or 1:1 history and requires an explicit target; its `[id …]` is the archive pagination cursor and `[stanza …]` is the reply_to message ID. In rooms, messages that do not address an agent are not delivered to it, so mention the intended agent by name or `@name`; `@everyone` and `@free` follow the room rules. Full spec: docs/routing.md]", b.acct.Owner, allow)
+	return fmt.Sprintf("[pi-msg: messaging: You run in pi-msg, an XMPP bridge for the pi coding-agent harness. User-facing chat goes through send_message; final responses are internal and never sent automatically. Owner: %s. Reply in the incoming `from:` conversation; `sender:` identifies the author, not permission to DM them. When handling multiple incoming messages, answer each that needs a reply. Protocol reference: docs/routing.md]", b.acct.Owner)
 }
 
 // composePrompt assembles the text sent to pi. A room-triggered prompt is a
@@ -2292,6 +2289,7 @@ func (b *Bridge) contractHash() string {
 	fmt.Fprint(h, b.messagingContract())
 	fmt.Fprint(h, "\n\n")
 	fmt.Fprint(h, b.roomsContract())
+	fmt.Fprint(h, rpcEnv(b.acct))
 	return fmt.Sprintf("%08x", h.Sum32())
 }
 
@@ -2299,7 +2297,7 @@ func (b *Bridge) roomsContract() string {
 	if len(b.acct.Rooms) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("[pi-msg: rooms: you are in %s. A room message that addresses you arrives with a `from:` header naming that room. Final text is internal: use send_message(to=<room jid>, text=..., reply_to=...) to answer there. Messages that do not address you are NOT delivered and are NOT buffered; silence means nobody addressed you, not that nothing was said. Use read_messages(target=<room jid>) to inspect room history.]", strings.Join(b.acct.Rooms, ", "))
+	return fmt.Sprintf("[pi-msg: rooms: Joined rooms: %s. Address agents by bare name or @name; @everyone addresses all, @free idle agents. Mentions in quotations or code do not count. Messages addressed to other agents and unaddressed peer chatter are not delivered or buffered; history remains readable. Unnamed owner messages may reach idle agents or recent room participants; replies to your known stanzas can also address you. Use read_messages to retrieve unseen room context.]", strings.Join(b.acct.Rooms, ", "))
 }
 
 func (b *Bridge) composePrompt(body, origin, sender, reactID, reactTo, replyTo string, notice *roomNotice) string {

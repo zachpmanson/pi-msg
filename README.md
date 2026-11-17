@@ -120,7 +120,7 @@ Per-account fields:
 | `model` | no | Pi's default | model pattern passed to `pi --model` |
 | `workdir` | no | current dir | working directory for the agent (also where Pi discovers `AGENTS.md`/`CLAUDE.md`) |
 | `reconcileSkill` | no | disabled | absolute path to the unattended reconciliation `SKILL.md`, e.g. `/home/beltino/beltino/.pi/skills/reconcile/SKILL.md`; enables `/next` / `&`. Read/copied before reset; sibling learn skill loaded when present. See [operations](docs/next.md). |
-| `rooms` | no | `[]` | group-chat rooms: objects with `jid`, `role`, `trigger`, and `reactions`; legacy `room` and `errorRoom` fields are rejected |
+| `rooms` | no | `[]` | group-chat rooms: objects with `jid`, `trigger`, and `reactions`; legacy `room`, `errorRoom`, and `role: "error"` are rejected |
 | `nick` | no | JID localpart | occupant nickname used in the room(s) |
 | `roomTrigger` | no | `nick` | account-wide address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`); override per room |
 | `uploadService` | no | auto-probed | XEP-0363 upload component JID for file transfer (e.g. `upload.chat.example.com`) |
