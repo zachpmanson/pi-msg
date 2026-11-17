@@ -40,6 +40,8 @@ func TestSendMessageDestinationTransport(t *testing.T) {
 		arbitrary     bool
 	}{
 		{name: "owner", to: "zach@x", typ: "chat"},
+		{name: "self", to: "pi@x", typ: "chat"},
+		{name: "self full JID", to: "pi@x/phone", typ: "chat"},
 		{name: "owner resource", to: "zach@x/phone", typ: "chat"},
 		{name: "joined room", to: "team@muc.x", typ: "groupchat"},
 		{name: "known occupant", to: "alice@x"},
@@ -75,7 +77,7 @@ func TestSendMessageDestinationTransport(t *testing.T) {
 				if tt.arbitrary {
 					policy = "allowArbitraryJid=true: other syntactically valid peer JIDs are also permitted."
 				}
-				for _, hint := range []string{"not an allowed destination", `Allowed 1:1 JIDs: ["zach@x"].`, `Allowed room JIDs: ["team@muc.x"].`, `Room-scoped members/mention names (NOT DM destinations): ["team@muc.x": ["alice"]].`, "Send to the room JID and mention the member in text.", policy, "No message was sent."} {
+				for _, hint := range []string{"not an allowed destination", `Allowed 1:1 JIDs: ["zach@x" "pi@x"].`, `Allowed room JIDs: ["team@muc.x"].`, `Room-scoped members/mention names (NOT DM destinations): ["team@muc.x": ["alice"]].`, "Send to the room JID and mention the member in text.", policy, "No message was sent."} {
 					if !strings.Contains(response.Value, hint) {
 						t.Errorf("rejection missing %q: %s", hint, response.Value)
 					}

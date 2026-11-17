@@ -37,6 +37,7 @@ type reconcileJob struct {
 	Updated     time.Time
 	RunnerPID   int
 	Started     bool
+	Automatic   bool
 }
 
 func reconcileRoot(account string) string {
@@ -361,14 +362,18 @@ func runReconcileFor(dir string, timeout time.Duration) error {
 	case <-ctx.Done():
 		return finish("cancelled", "runner stopped before reset authorization")
 	case line := <-gate:
-		if line != "run" {
+		if (!j.Automatic && line != "run") || (j.Automatic && line != "run-idle") {
 			if line == "cancel" {
 				return finish("cancelled", "session reset failed or was cancelled; no worker started")
 			}
 			return finish("interrupted", "reset authorization lost; no worker started (inspect primary session)")
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "reset-authorized")); err != nil {
+	authority := "reset-authorized"
+	if j.Automatic {
+		authority = "idle-authorized"
+	}
+	if _, err := os.Stat(filepath.Join(dir, authority)); err != nil {
 		return finish("interrupted", "no durable reset authorization; no worker started (inspect primary session)")
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -523,6 +528,9 @@ func (b *Bridge) pollReconciles() {
 			continue
 		}
 		dir := filepath.Join(reconcileRoot(b.acct.Name), entry.Name())
+		if j, e := loadReconcile(dir); e == nil && j.Automatic {
+			continue
+		} // idle executor owns automatic reporting
 		if _, err := os.Stat(filepath.Join(dir, "reported")); err == nil {
 			continue
 		}
