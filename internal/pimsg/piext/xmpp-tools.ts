@@ -728,10 +728,11 @@ ${systemPrompt}`;
 				to: Type.String({ description: `Destination JID: ${permissions} Use noop to send nothing.` }),
 				text: Type.String({ description: "Message body to send" }),
 				reply_to: Type.Optional(Type.String({ description: "Optional threading; normally omit. Use an incoming/history stanza ID from the same conversation, never an archive cursor." })),
+				allow_wake: Type.Optional(Type.Boolean({ description: "Default false. Explicitly allow waking addressed pi-msg peers currently away or xa. Without it the entire send fails; inspect claim/release history or remove unnecessary addressing before deciding to wake. Not a destination-permission override." })),
 				reply_timeout_seconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Positive finite seconds; omit for no watch. One-shot internal reminder, no automatic external follow-up; may be handled silently. DMs qualify from the peer; rooms require direct address or a reply to the watched stanza, not broadcasts/general chatter. One watch per conversation; later watched sends replace it; shutdown discards watches." })),
 			}),
 			async execute(_toolCallId, params) {
-				const p = params as { to?: string; text?: string; reply_to?: string; reply_timeout_seconds?: number };
+				const p = params as { to?: string; text?: string; reply_to?: string; reply_timeout_seconds?: number; allow_wake?: boolean };
 				const to = String(p.to ?? "").trim();
 				const text = String(p.text ?? "").trim();
 				if (!to) throw new Error("to is required");
@@ -740,7 +741,10 @@ ${systemPrompt}`;
 				if (timeout !== undefined && (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0)) {
 					throw new Error("reply_timeout_seconds must be a finite positive number of seconds");
 				}
-				const result = await relay("send_message", { to, text, replyTo: p.reply_to ?? "", replyTimeoutSeconds: timeout });
+				if (p.allow_wake !== undefined && typeof p.allow_wake !== "boolean") {
+					throw new Error("allow_wake must be a boolean");
+				}
+				const result = await relay("send_message", { to, text, replyTo: p.reply_to ?? "", replyTimeoutSeconds: timeout, allowWake: p.allow_wake });
 				if (result === "noop" && to === "noop") {
 					return { content: [{ type: "text", text: "No message sent." }], details: { to, result } };
 				}
@@ -750,7 +754,7 @@ ${systemPrompt}`;
 				const stanzaId = result.slice("sent:".length);
 				return {
 					content: [{ type: "text", text: `Sent to ${to} with stanza-id ${stanzaId}.` + (timeout === undefined ? "" : ` Reply watch active (${timeout} seconds).`) }],
-					details: { to, reply_to: p.reply_to ?? "", stanza_id: stanzaId, reply_timeout_seconds: timeout, reply_watch_active: timeout !== undefined, result },
+					details: { to, reply_to: p.reply_to ?? "", stanza_id: stanzaId, allow_wake: p.allow_wake ?? false, reply_timeout_seconds: timeout, reply_watch_active: timeout !== undefined, result },
 				};
 			},
 		});
