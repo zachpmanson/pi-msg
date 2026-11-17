@@ -15,8 +15,8 @@ history or relevant handoffs as needed.
 
 ## Requirements established with Zach
 
-- Experimental, per-account opt-in; configurable idle timeout and history count.
-- History count defaults to 10.
+- Experimental, per-account opt-in; configurable idle timeout, recent-history
+  count and additional owner-history floor. Both history counts default to 10.
 - `reconcileSkill` is **optional**. If absent, skip reconciliation and continue
   with reset, recap and XA.
 - If configured, use the existing unattended reconcile skill and its existing
@@ -24,10 +24,16 @@ history or relevant handoffs as needed.
 - Report reconciliation results into XMPP, as with `/next`. Do not introduce
   silent-success behavior. An alternative reporting inbox/room/self-message can
   be considered later; that destination has not been selected.
-- The proposed recap scope is **10 total** actual inbound/outbound chat messages
-  across owner DMs, rooms and other permitted conversations, not 10 per chat.
-  Include only messages delivered to this agent or sent by it, not arbitrary
-  unaddressed chatter from joined rooms. Preserve conversation and sender labels.
+- Select the latest **10 eligible messages from anyone**, including the agent's
+  replies, plus the latest **N owner-authored messages** (initially 10), even if
+  older than the recent-message window. Deduplicate and merge chronologically:
+  at most 20 messages with those defaults, not 20 per chat.
+- Eligibility spans owner DMs, rooms and other permitted conversations actually
+  delivered to this agent or sent by it. Include unaddressed room messages admitted
+  through recent outbound participation or other normal routing rules; explicit
+  mentions are not required. Owner messages admitted this way also count toward
+  the owner floor. Exclude only chatter never delivered to the agent, and preserve
+  conversation and sender labels.
 - Tell the fresh agent that more conversation history is available through
   `read_messages(target=...)`, particularly if the user continues an earlier topic.
 - This is a fresh session, not compaction and not deletion of the old transcript.
@@ -42,16 +48,25 @@ Proposed flat account fields, consistent with existing camelCase configuration:
 ```json
 {
   "autoreconcileTimeout": "30m",
-  "autoreconcileHistoryMessages": 10
+  "autoreconcileHistoryMessages": 10,
+  "autoreconcileOwnerHistoryMessages": 10
 }
 ```
 
 - `autoreconcileTimeout`: Go duration string, matching `pingInterval` (`"60s"`,
   `"2m"`, `"1h"`). Missing or `"0"` disables the mode. Thirty minutes is an
   initial opt-in example, not an enabled-by-default setting.
-- `autoreconcileHistoryMessages`: nonnegative integer; omitted means 10, explicit
-  0 disables chat-body recap while retaining the startup guidance. Reject negative
-  values and impose a documented upper bound plus an independent text-size limit.
+- `autoreconcileHistoryMessages`: nonnegative integer; omitted means 10. Select
+  this many recent eligible messages globally, regardless of sender; 0 disables
+  this selection only.
+- `autoreconcileOwnerHistoryMessages`: independent nonnegative integer; omitted
+  means 10. Also select this many latest eligible owner-authored messages globally,
+  regardless of whether they are in the recent selection; 0 disables this floor.
+  Both values must be 0 to disable chat-body recap entirely; retain startup guidance.
+- Reject negative counts and impose documented upper bounds plus an independent
+  text-size limit. Reserve text budget for the owner selection, so peer chatter
+  cannot defeat the owner floor. Oversize bodies may be explicitly truncated;
+  preserve their identity/reference rather than silently dropping owner entries.
 - No `reconcileSkill`: valid configuration; skip the worker.
 - Configured but invalid/unreadable skill: configuration/preparation failure, not
   equivalent to an absent skill. Never silently skip a requested reconciliation.
@@ -101,10 +116,19 @@ messages, preserving the routing decision made at delivery time. Room delivery
 may currently surface only a tagged-message pointer: obtain its actual body using
 normal authorized archive access, rather than treating that pointer as the full
 message or importing unrelated room traffic. Archive reads alone must not make a
-message eligible for future recaps.
+message eligible for future recaps. Retain an independent bounded owner-history
+selection so a burst of peer traffic cannot evict the older owner messages needed
+for the floor. Determine owner authorship from the verified originating identity,
+not a display name, mention, quoted text or the agent's own replies.
 
-Capture the newest N eligible messages globally and render them oldest first.
-Each entry includes:
+Select the newest `autoreconcileHistoryMessages` eligible messages globally, plus
+the newest `autoreconcileOwnerHistoryMessages` eligible owner-authored messages.
+Deduplicate their union, then render oldest first across both selections. If fewer
+owner messages are available, include those available and disclose any known
+history gaps; do not invent messages. For example, 10 recent peer/agent messages
+plus 10 older owner messages yields 20 entries; 4 owner messages shared by the two
+10-message selections yields 16. Old owner messages remain historical context,
+not proof of outstanding work. Each entry includes:
 
 - Conversation JID and DM/room classification.
 - Sender identity, direction, timestamp and stanza ID where available.
@@ -165,7 +189,7 @@ DM material through automatic room replies just because it appears in the recap.
 
 ## Implementation breakdown
 
-1. Add parsing/validation/docs for the two account fields and disabled defaults.
+1. Add parsing/validation/docs for the three account fields and disabled defaults.
 2. Extract reusable idle/transition eligibility checks and add a single durable
    autoreconcile attempt state machine with activity-generation cancellation.
 3. Reuse snapshot/worker/lock/reporting infrastructure. Existing `/next` authorizes
@@ -179,15 +203,19 @@ DM material through automatic room replies just because it appears in the recap.
 ## Validation and rollout gates
 
 - Config: absent/zero timeout, supported units, invalid/negative values, default
-  and explicit-zero history count, bounds, absent/invalid skill and reset conflict.
+  and independent explicit-zero history counts, bounds, absent/invalid skill and
+  reset conflict.
 - Idle guards: active/retrying/compacting work, queued input/acceptance, background
   process/subagent and pending notification/boundary all prevent unsafe reset.
 - Race tests: message before/during worker, completion-vs-input, reset-vs-input,
   manual controls and stale callbacks cannot erase or misroute work.
 - Worker: optional skip, successful result/report, failures, partial blockers,
   lock contention and timeout; no duplicate effects/notices after recovery.
-- Recap: DM/room/peer scope, own echoes, replay deduplication, ordering, quoting,
-  authority labels, truncation, unavailable archive and no binary auto-download.
+- Recap: DM/room/peer scope, implicitly admitted unaddressed room messages,
+  owner identification, independent owner retention during peer-message floods,
+  overlapping selections, fewer available owner messages, chronological ordering,
+  own echoes, replay deduplication, quoting/authority labels, reserved owner text
+  budget and truncation, unavailable archive and no binary auto-download.
 - Session recovery: crashes at every persisted phase, cancelled RPC, identity
   mismatch, exact resume pointer, seed retained before first output and injected
   once without an unsolicited model turn.
