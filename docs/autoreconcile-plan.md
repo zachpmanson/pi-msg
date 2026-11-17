@@ -21,9 +21,19 @@ history or relevant handoffs as needed.
   with reset, recap and XA.
 - If configured, use the existing unattended reconcile skill and its existing
   handoffs/artifacts. Do not mandate a separate generated `handoff.md`.
-- Report reconciliation results into XMPP, as with `/next`. Do not introduce
-  silent-success behavior. An alternative reporting inbox/room/self-message can
-  be considered later; that destination has not been selected.
+- Report automatic reconciliation results into XMPP **to the account's own bare
+  JID**, rather than notifying the owner or agents room. This is an archived
+  self-addressed receipt, not silent success. Manual `/next` reporting stays
+  unchanged.
+- Always allow `send_message` and `read_messages` to target the account's own JID,
+  independently of autoreconcile enablement and `allowArbitraryJid`. This is a
+  narrow permission for self, not arbitrary destinations. No repeated per-turn
+  routing/tool-prompt advertisement is needed; document its reconciliation use in
+  the reconcile skill when implementing.
+- On successful quiet cleanup, order operations as **reconcile → self-report →
+  capture recap → fresh session → XA**. The report is the final chat entry before
+  cleanup and naturally enters the default recent-message selection. Self-message
+  receipt/echo must not wake the primary or invalidate its idle eligibility.
 - Select the latest **10 eligible messages from anyone**, including the agent's
   replies, plus the latest **N owner-authored messages** (initially 10), even if
   older than the recent-message window. Deduplicate and merge chronologically:
@@ -72,7 +82,9 @@ Proposed flat account fields, consistent with existing camelCase configuration:
   equivalent to an absent skill. Never silently skip a requested reconciliation.
 - Reject enabled autoreconcile combined with `resetSessionOnAway: true`; otherwise
   the existing away reset could discard context before reconciliation.
-- Existing accounts with autoreconcile disabled retain their current behavior.
+- Existing accounts with autoreconcile disabled retain their current idle/reset
+  behavior. Self-addressed send/read permission is an unconditional messaging
+  capability, not an autoreconcile configuration option.
 
 ## Idle lifecycle
 
@@ -86,9 +98,12 @@ Proposed flat account fields, consistent with existing camelCase configuration:
 3. If a skill is configured, run the existing restricted unattended reconciliation
    machinery against that snapshot. Keep the original foreground session usable;
    do not hold its transition mutex for the worker's lifetime.
-4. Deliver the worker's result through XMPP and retain its normal private job
-   artifacts. Its output may reference existing task files, branches, worktrees or
-   handoffs; no separate handoff-generation pass is required.
+4. The bridge sends the worker's result to the account's own bare JID and records
+   the accepted outbound receipt in the eligible-chat index before capturing the
+   recap. Retain normal private job artifacts. The result may reference existing
+   task files, branches, worktrees or handoffs; no separate handoff-generation pass
+   is required. This internal receipt and its incoming echo do not count as new
+   foreground activity.
 5. Before reset, recheck the exact session identity, activity generation and every
    busy/input guard. Any intervening eligible chat or new work invalidates this
    attempt's reset. Continue serving that input normally in the old session; the
@@ -130,7 +145,7 @@ plus 10 older owner messages yields 20 entries; 4 owner messages shared by the t
 10-message selections yields 16. Old owner messages remain historical context,
 not proof of outstanding work. Each entry includes:
 
-- Conversation JID and DM/room classification.
+- Conversation JID and DM/room/self classification.
 - Sender identity, direction, timestamp and stanza ID where available.
 - Message text, subject to per-message and total limits with explicit truncation.
 - Attachment references only; do not automatically fetch/reinject binary payloads.
@@ -162,14 +177,45 @@ exists. If history retrieval is incomplete or unavailable, disclose that in the
 seed and retain references; do not invent missing messages. Never expose private
 DM material through automatic room replies just because it appears in the recap.
 
+## Self-addressed messaging
+
+Allow outbound messages and archive reads to the account's own normalized bare
+JID in the ordinary destination classifiers/allowlists, including when
+`allowArbitraryJid` is false and autoreconcile is disabled. Self-targeted full-JID
+messages use normal XMPP resource routing; use the bare JID for reconciliation
+receipts and archive queries. Do not grant access to any other account or confuse
+MUC occupant nicknames with the account's own identity.
+
+Treat incoming self-authored messages as non-waking historical receipts, never as
+new owner instructions, peer summons, control commands, or reasons to re-arm
+cleanup. Deduplicate sent copies, returned echoes, carbons and archive replay so
+one self-report appears once in the recap. Reconnect/backfill must retain these
+semantics. Self-reports must not trigger replies to themselves or notification
+loops.
+
+Verify actual server MAM storage and `read_messages(target=<own-bare-JID>)`
+retrieval with the deployed server configuration. XMPP permits self-addressing,
+but this plan does not assume that archive/echo behavior has already been tested.
+The bridge's durable sent-receipt record provides the recap body without racing
+archive visibility. A report is the newest eligible chat entry at successful
+cleanup; with an explicit zero recent-message count, omit its body as configured
+but retain the existing reconciliation artifact reference in startup guidance.
+
+Document self-addressing in the reconcile skill instead of adding repeated tool
+or routing prompt boilerplate. Preserve its unattended worker contract: workers
+return their result and the caller/bridge sends it; do not add worker messaging
+extensions, require a second model turn, or send duplicate reports from the skill.
+
 ## Results, failures and recovery
 
-- Retain existing XMPP reconciliation reporting. For an initial implementation,
-  propose the last eligible triggering conversation, with an owner-DM fallback;
-  finalize this routing choice before implementation. An alternate inbox is a
-  separate future feature, not required for the first version.
-- Report-delivery failures should retain durable pending notices and normal
-  retry/deduplication behavior, rather than rerunning reconciliation effects.
+- Automatic reconciliation reports go to the account's own bare JID. Retain
+  existing result/artifact content and durable notice tracking; manual `/next`
+  continues reporting to its initiating conversation.
+- Report-send failures retain the original session and durable pending notices;
+  retry sending without rerunning reconciliation effects. Capture recap/reset only
+  after the send is accepted and its text is durably recorded. Server acceptance
+  is not an end-to-end read receipt; do not require the self-echo to authorize
+  cleanup.
 - Worker failure, interruption, timeout or uncertain persistence preserves the
   original session and does not claim successful cleanup/XA. A successful worker
   may still report skipped work: retain that result and define/test a conservative
@@ -196,9 +242,14 @@ DM material through automatic room replies just because it appears in the recap.
    worker execution only after its reset; autoreconcile needs a distinct explicit
    pre-reset execution authorization. Do not fake `reset-authorized` or weaken
    manual `/next` recovery guarantees to accommodate the new order.
-4. Add the bounded eligible-chat index and a persisted one-time startup seed.
-5. Integrate verified session replacement, resume-pointer persistence and XA.
-6. Document operations, artifacts, failure recovery and the experimental rollout.
+4. Allow self-addressed send/read generally, with non-waking self-input handling,
+   without enabling arbitrary destinations or adding repeated prompt boilerplate.
+5. Add the bounded eligible-chat index and a persisted one-time startup seed,
+   capturing the accepted self-report before reset.
+6. Integrate verified session replacement, resume-pointer persistence and XA.
+7. Document operations, artifacts, failure recovery and the experimental rollout;
+   mention self-addressed reporting in the reconcile skill without weakening its
+   caller-delivered unattended result contract.
 
 ## Validation and rollout gates
 
@@ -211,6 +262,10 @@ DM material through automatic room replies just because it appears in the recap.
   manual controls and stale callbacks cannot erase or misroute work.
 - Worker: optional skip, successful result/report, failures, partial blockers,
   lock contention and timeout; no duplicate effects/notices after recovery.
+- Self-messaging: send/read allowed with autoreconcile disabled and arbitrary JIDs
+  forbidden; other destinations remain blocked. Test bare/full-JID routing,
+  actual MAM readback, sent/echo/carbon/replay deduplication, non-waking input and
+  report-before-recap ordering. Report-send failure must not reset or rerun work.
 - Recap: DM/room/peer scope, implicitly admitted unaddressed room messages,
   owner identification, independent owner retention during peer-message floods,
   overlapping selections, fewer available owner messages, chronological ordering,
@@ -222,7 +277,8 @@ DM material through automatic room replies just because it appears in the recap.
 - Presence/routing: XA only on completed cleanup, reconnect restores intended
   state, incoming DM/mention wakes it, and room rules remain intentional.
 - Normal/race/static gates followed by bounded disposable-XMPP/Pi integration
-  tests, including receipt of results and a topic-continuation history lookup.
+  tests, including self-reported results in the fresh recap, no resulting wake
+  loop, unchanged manual `/next` reporting and a topic-continuation history lookup.
 - Ship disabled by default. Any deployment needs separate authorization and the
   managed deployment workflow; then opt in one persona before broader adoption.
 
