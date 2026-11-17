@@ -231,6 +231,10 @@ func TestPrettyDump(t *testing.T) {
 		`{"type":"message","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"on it"},{"type":"toolCall","toolName":"bash"}]}}`,
 		`{"type":"message","timestamp":"2024-12-03T14:00:03.000Z","message":{"role":"toolResult","toolName":"bash","content":[{"type":"text","text":"exit 0"}]}}`,
 		`{"type":"model_change","timestamp":"2024-12-03T14:05:00.000Z","provider":"anthropic","modelId":"claude"}`,
+		`{"type":"custom_message","timestamp":"2024-12-03T14:06:00.000Z","customType":"pi-msg-idle-seed","content":"Historical\nrecap\t雪","display":false}`,
+		`{"type":"custom_message","timestamp":"2024-12-03T14:07:00.000Z","customType":"block-context","content":[{"type":"text","text":"first block"},{"type":"text","text":"second block"},{"type":"image"}],"display":false}`,
+		`{"type":"custom_message","timestamp":"2024-12-03T14:08:00.000Z","customType":"visible-context","content":"visible body","display":true}`,
+		`{"type":"custom","customType":"opaque-state","data":{"content":"not context"}}`,
 	}, "\n")
 	out := prettyDump([]byte(jsonl))
 	for _, want := range []string{
@@ -239,10 +243,16 @@ func TestPrettyDump(t *testing.T) {
 		"assistant", "on it ⚙ bash",
 		"toolResult", "↳ bash: exit 0",
 		"model", "anthropic/claude",
+		"14:06:00\tcustom_message\tpi-msg-idle-seed: Historical recap 雪",
+		"14:07:00\tcustom_message\tblock-context: first block second block [image]",
+		"14:08:00\tcustom_message\tvisible-context: visible body",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("prettyDump missing %q in:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "not context") || len(strings.Split(strings.TrimSpace(out), "\n")) != 10 {
+		t.Fatal("opaque state exposed or existing row behavior changed", out)
 	}
 }
 

@@ -9,6 +9,14 @@ default to 10 and accept 0..100. `resetSessionOnAway` cannot also be enabled.
 preparation failure, not a silent skip. Manual `/next` behavior/reporting remains
 separate.
 
+`awayTimeout` independently sets the idle-to-away presence threshold (a positive
+Go duration, default `"20m"`; zero/negative/malformed values are rejected). For
+example, `"awayTimeout": "5m"` with `"autoreconcileTimeout": "10m"` announces away
+after five idle minutes and starts eligible automatic cleanup after ten idle
+minutes; XA follows successful worker/native-transition completion, not a timer
+alone. Setting awayTimeout does not enable cleanup or change the standard 20m
+room-participation window. Other accounts retain their defaults when unset.
+
 The bridge waits for actual settled Pi state and existing input/background-work
 and notification guards, snapshots the exact source, and runs the existing
 restricted worker when configured. Worker execution has separate pre-reset
@@ -38,7 +46,19 @@ provenance, not today's nickname mapping. Unproven archived/delayed room senders
 remain unverified in the recap; pre-provenance persisted room entries cannot
 establish an owner floor. Direct archive bare-JID origins remain trustworthy. It includes history lookup
 instructions, prior session and private job references; no extra handoff-generator
-turn runs. The self result is durably indexed before seed capture.
+turn runs. Future seeds direct the agent to use the supplied recap first and look
+up history or handoff files only when relevant context is missing or insufficient.
+Existing stored seeds are not rewritten to update guidance. The self result is
+durably indexed before seed capture.
+
+Future seeds are visible native custom messages. New `/export` HTML copies also
+show previously hidden context-participating `custom_message` entries, without
+changing source sessions, live model context, attempts or receipts. Opaque custom
+extension state is unchanged. Unsupported/malformed native export payloads fail
+with a diagnostic, not a hidden upload or inline fallback. Previously uploaded
+HTML is immutable and is not updated. `/dump pretty` and `/dump table` include
+custom message types and bodies regardless of their stored display flag; raw
+JSONL dumps remain unchanged. Exports and dumps retain owner-only file delivery.
 
 Own-JID `send_message` and `read_messages` permission is always available,
 independent of automatic cleanup and arbitrary-peer permission. Full JIDs retain

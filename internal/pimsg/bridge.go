@@ -1895,7 +1895,14 @@ func (b *Bridge) afterNewSession() {
 // beltino `share` skill, not in pi-msg).
 func (b *Bridge) handleExport(_ string) {
 	slug := fmt.Sprintf("%s-session-%s", b.acct.Name, time.Now().Format("20060102-150405"))
-	tmpHTML := filepath.Join(os.TempDir(), slug+".html")
+	// Pi writes into a private directory; remove its artifact on every outcome.
+	dir, err := os.MkdirTemp("", "pi-msg-export-*")
+	if err != nil {
+		b.reply("⚠️ /export failed: " + err.Error())
+		return
+	}
+	defer os.RemoveAll(dir)
+	tmpHTML := filepath.Join(dir, slug+".html")
 	b.reply("📄 exporting session…")
 	res, err := b.rpc.ExportHTML(b.ctx, tmpHTML)
 	if err != nil {
@@ -1906,7 +1913,21 @@ func (b *Bridge) handleExport(_ string) {
 		b.reply("⚠️ /export failed: " + res.errText())
 		return
 	}
-	b.sendRenderedFile(slug+".html", tmpHTML)
+	b.sendSessionExport(slug+".html", tmpHTML)
+}
+
+// Only native session exports receive the rendering-only visibility transform.
+// Generic rendered files and raw session dumps remain byte-for-byte unchanged.
+func (b *Bridge) sendSessionExport(name, path string) {
+	content, err := os.ReadFile(path)
+	if err == nil {
+		content, err = visibleExportContext(content)
+	}
+	if err != nil {
+		b.reply("⚠️ /export failed: " + err.Error())
+		return
+	}
+	b.sendDumpFile(name, content)
 }
 
 // sendRenderedFile uploads a locally-rendered file to the owner via XEP-0363
@@ -2169,6 +2190,8 @@ func recordRow(e Event) (tm, kind, detail string) {
 			return tm, "toolResult", "↳ " + msg.Str("toolName") + ": " + contentText(msg["content"])
 		}
 		return tm, role, contentText(msg["content"])
+	case "custom_message":
+		return tm, typ, e.Str("customType") + ": " + contentText(e["content"])
 	case "model_change":
 		return tm, "model", e.Str("provider") + "/" + e.Str("modelId")
 	case "thinking_level_change":
@@ -2552,7 +2575,7 @@ func (b *Bridge) presenceShow() string {
 //
 // The fresh-bridge half is what makes a deploy summonable. A (re)started bridge
 // announces "awake"/"resumed" with an empty <show>, and the idle watcher needs
-// idleAwayTimeout (20 min) of quiet before it drifts to away — so without this a
+// awayTimeout (20 min by default) of quiet before it drifts to away — so without this a
 // fleet that had just been deployed was dark to @free (and to an untagged owner
 // message) until every agent had sat still for 20 minutes, even though none of
 // them had been asked to do anything. An agent that has worked and has not yet
@@ -2646,7 +2669,7 @@ var broadcastHandles = []string{"everyone", "all", "here"}
 // freeHandles address only the room's FREE agents (#130). "Free" means our
 // presence has drifted to <show>away</show>, or we are a bridge nothing has been
 // asked of since it came up — the state a freshly deployed fleet is in, which
-// would otherwise be unreachable for idleAwayTimeout. A dnd agent is working; a
+// would otherwise be unreachable for its awayTimeout. A dnd agent is working; a
 // listening one that has already run is available but has deliberately not been
 // handed anything for the quiet period. An agent reached this way still answers
 // in the room like any other turn, so it must not talk over work in flight or
@@ -3922,19 +3945,16 @@ func (b *Bridge) settleLocally() {
 	b.takeHintPending() // aborted: no catch-up run is coming
 }
 
-// idleAwayTimeout is how long the agent may sit idle before its presence
-// drifts from available to "away". Any inbound activity resets the clock.
+// idleAwayTimeout is the default idle duration before presence drifts from
+// available to "away". Accounts may override it with awayTimeout.
 const idleAwayTimeout = 20 * time.Minute
 
 // ParticipationHorizon is how long a message we sent to a room keeps that room's
 // untagged owner traffic reaching us (#130 follow-up): if you were part of the
 // conversation, the next turn of it is yours to hear.
 //
-// It deliberately matches idleAwayTimeout. The horizon at which an agent that
-// stops talking has drifted away is the same one at which its participation
-// stops counting, so at any moment a room's untagged owner traffic reaches an
-// agent that either spoke there recently or has been quiet long enough to count
-// as away.
+// It deliberately matches the default idleAwayTimeout. Per-account awayTimeout
+// overrides affect presence only; this room participation window stays 20m.
 const ParticipationHorizon = idleAwayTimeout
 
 // awayActivities are pithy, fictional "what I've been up to" lines shown as
@@ -4072,7 +4092,7 @@ func (b *Bridge) announceSettledPresence() {
 
 // markIdle records that the agent has settled into an idle, available state;
 // the idle clock starts now and the watcher flips presence to "away" after
-// idleAwayTimeout of quiet.
+// the account's awayTimeout of quiet (20m by default).
 func (b *Bridge) markIdle() {
 	now := time.Now()
 	b.mu.Lock()
@@ -4124,7 +4144,7 @@ func (b *Bridge) loadAwayActivities() {
 }
 
 // idleWatcher flips presence to "away" once the agent has been idle (no run in
-// flight, no inbound activity) for idleAwayTimeout, showing a randomized pithy
+// flight, no inbound activity) for its awayTimeout, showing a randomized pithy
 // activity as the status. The away status is announced exactly once per idle
 // period — the transition, not a 30s rotation — and stays put until the next
 // inbound message or run brings the agent back to available (see onInbound /
@@ -4144,7 +4164,7 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 }
 
 // idleTick runs the body of one idleWatcher tick: it announces "away" at most
-// once per idle period, once the agent has been idle past idleAwayTimeout.
+// once per idle period, once the agent has been idle past its awayTimeout.
 // Split out from idleWatcher so it's callable directly from tests.
 func (b *Bridge) idleTick() {
 	b.autoTick()
@@ -4154,10 +4174,14 @@ func (b *Bridge) idleTick() {
 	b.mu.Lock()
 	idle := !b.idleSince.IsZero()
 	elapsed := time.Since(b.idleSince)
+	awayTimeout := b.acct.AwayTimeout
+	if awayTimeout == 0 { // ResolvedAccount fixtures retain the default.
+		awayTimeout = idleAwayTimeout
+	}
 	// Read streamingRun directly rather than via streaming(), which re-locks
 	// b.mu and would deadlock this goroutine against itself.
 	// Background processes keep the bot dnd (never drift to away mid-build).
-	if b.nextTransition || pendingNext || !idle || b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0 || elapsed < idleAwayTimeout || b.xmpp == nil || b.awayAnnounced {
+	if b.nextTransition || pendingNext || !idle || b.streamingRun || b.bgProcesses > 0 || b.bgSubagents > 0 || elapsed < awayTimeout || b.xmpp == nil || b.awayAnnounced {
 		b.mu.Unlock()
 		return
 	}

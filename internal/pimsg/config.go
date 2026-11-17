@@ -135,6 +135,8 @@ type Account struct {
 	// ResetSessionOnAway starts a fresh Pi session when this account transitions
 	// from idle/available to away. Disabled by default.
 	ResetSessionOnAway bool `json:"resetSessionOnAway,omitempty"`
+	// AwayTimeout is the positive idle duration before away; unset defaults to 20m.
+	AwayTimeout string `json:"awayTimeout,omitempty"`
 	// AutoreconcileTimeout opts into idle reconciliation/reset (Go duration).
 	// Missing/zero disables all automatic capture and cleanup.
 	AutoreconcileTimeout              string `json:"autoreconcileTimeout,omitempty"`
@@ -247,6 +249,7 @@ type ResolvedAccount struct {
 	Reactions                         bool
 	RoomReactions                     bool
 	ResetSessionOnAway                bool
+	AwayTimeout                       time.Duration
 	AutoreconcileTimeout              time.Duration
 	AutoreconcileHistoryMessages      int
 	AutoreconcileOwnerHistoryMessages int
@@ -819,6 +822,15 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		pingInterval = d
 	}
 
+	awayTimeout := idleAwayTimeout
+	if s := strings.TrimSpace(acct.AwayTimeout); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil || d <= 0 {
+			return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q has invalid awayTimeout %q: must be a positive Go duration", name, s)
+		}
+		awayTimeout = d
+	}
+
 	autoTimeout := time.Duration(0)
 	if s := strings.TrimSpace(acct.AutoreconcileTimeout); s != "" {
 		d, err := time.ParseDuration(s)
@@ -856,6 +868,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		Reactions:                         acct.Reactions,
 		RoomReactions:                     acct.RoomReactions,
 		ResetSessionOnAway:                acct.ResetSessionOnAway,
+		AwayTimeout:                       awayTimeout,
 		Model:                             acct.Model,
 		Workdir:                           acct.Workdir,
 		ReconcileSkill:                    acct.ReconcileSkill,
