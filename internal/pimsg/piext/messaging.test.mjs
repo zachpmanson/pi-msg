@@ -5,7 +5,7 @@ import { stripTypeScriptTypes } from "node:module";
 import { readFileSync } from "node:fs";
 
 const source = stripTypeScriptTypes(readFileSync(new URL("./xmpp-tools.ts", import.meta.url), "utf8"))
-	.replace('import { Type } from "typebox";', 'const Type = new Proxy({}, { get: () => (value) => value });');
+	.replace('import { Type } from "typebox";', 'const Type = new Proxy({}, { get: (_target, name) => (value) => name === "Boolean" ? { type: "boolean", ...value } : value });');
 const { default: xmppTools } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 
 function fixture(t, result, arbitraryPeers = false) {
@@ -80,6 +80,8 @@ for (const arbitrary of [false, true]) {
 	assert.match(fileTool.description, /do not repost it in the receiving XMPP conversation/);
 	assert.match(tool.parameters.to.description, /noop to send nothing/);
 	assert.match(tool.parameters.reply_to.description, /normally omit.*same conversation.*never an archive cursor/);
+	assert.equal(tool.parameters.allow_wake.type, "boolean");
+	assert.match(tool.parameters.allow_wake.description, /Default false.*away or xa.*entire send fails.*history.*Not a destination-permission override/);
 	assert.match(tool.parameters.reply_timeout_seconds.description, /Positive finite.*omit for no watch.*no automatic external follow-up.*handled silently.*not broadcasts.*replace.*shutdown/);
 	assert.match(read.description, /oldest first.*\[we sent\].*\[id …\].*\[stanza …\]/);
 	t.diagnostic(JSON.stringify(tools.map(({ name, description, parameters }) => ({ name, description, parameters }))));
@@ -96,4 +98,31 @@ test("generic identity is rendered on every turn without fleet membership", asyn
   assert.match(result.systemPrompt, /^You are sample\.\n\nbase/);
   assert.doesNotMatch(result.systemPrompt, /Zach|fleet/);
  }
+});
+
+for (const flag of [undefined, false, true]) {
+ test(`wake override is relayed without coercion (${flag})`, async t => {
+  const { tool, relays } = fixture(t, "sent:wake-1");
+  const params = { to: "team@muc.x", text: "@alice hello", ...(flag === undefined ? {} : { allow_wake: flag }) };
+  const result = await tool.execute("wake", params);
+  assert.deepEqual(relays, [{ action: "send_message", to: "team@muc.x", text: "@alice hello", replyTo: "", ...(flag === undefined ? {} : { allowWake: flag }) }]);
+  assert.equal(result.details.allow_wake, flag ?? false);
+  assert.equal(result.details.stanza_id, "wake-1");
+ });
+}
+
+for (const flag of [null, "true", 1, [], {}]) {
+ test(`malformed wake override fails before relay (${JSON.stringify(flag)})`, async t => {
+  const { tool, relays } = fixture(t, "sent:must-not-send");
+  await assert.rejects(tool.execute("wake", { to: "team@muc.x", text: "@alice hello", allow_wake: flag }), /allow_wake must be a boolean/);
+  assert.deepEqual(relays, []);
+ });
+}
+
+test("wake rejection is an error, not an automatic override retry", async t => {
+ const denial = "send_message: would wake away/xa pi-msg peers: alice (away). Read claim/release history or remove unnecessary addressing; for an intentional wake set allow_wake=true. No message was sent.";
+ const { tool, relays } = fixture(t, denial);
+ await assert.rejects(tool.execute("wake", { to: "team@muc.x", text: "@alice hello" }), { message: "pi-msg could not send the message: " + denial });
+ assert.equal(relays.length, 1);
+ assert.equal(relays[0].allowWake, undefined);
 });

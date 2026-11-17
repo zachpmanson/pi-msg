@@ -10,12 +10,14 @@ Assistant final text is **internal to the harness**. It is never routed or sent
 automatically, in either a 1:1 or room-mode account. To send chat text, call:
 
 ```text
-send_message(to, text, reply_to?, reply_timeout_seconds?)
+send_message(to, text, reply_to?, reply_timeout_seconds?, allow_wake?)
 ```
 
 Each call sends one message to one destination. As streamed `send_message`
 arguments arrive, pi-msg sends a best-effort XEP-0085 `composing` state as soon
-as the complete 1:1 `to` value is known. The delivered message includes `active`
+as the complete owner/self 1:1 `to` value is known. For other direct destinations,
+composing waits until the final call passes validation: a previously unknown
+peer may become known away/xa while arguments are streaming. The delivered message includes `active`
 to clear the typing indicator; if the body cannot be sent, pi-msg best-effort
 sends a standalone `active` state. Indicator failures do not block delivery.
 MUC messages do not get chat states. Multiple messages or recipients require multiple calls. Only a
@@ -23,6 +25,43 @@ successful `send_message` counts as a reply for run accounting. A successful
 `send_file` upload is not a substitute for a chat reply. If a run that should
 answer produces no successful `send_message`, pi-msg issues one bounded internal
 recovery prompt. A final response is not a substitute for `send_message`.
+
+### Intentional peer wakes
+
+`allow_wake` is an optional boolean, default false. Before sending, pi-msg rejects
+an entire message that would address a known pi-msg peer currently **away or xa**.
+The error names affected peers and their observed states. Inspect claim/release
+history or remove unnecessary addressing before deciding whether a wake is
+needed. Set `allow_wake: true` explicitly for an intentional assignment, urgent
+question or maintenance hold; do not reflexively retry every rejection with it.
+The flag never grants destination permission or bypasses reply validation.
+Rejected calls send no body or typing stanza, arm no reply watch and do not
+count as delivery. Text is not rewritten and mixed-recipient room sends are not
+partially delivered. The check is a local preflight snapshot, not a transaction
+with remote presence changes.
+
+Peer recognition uses the advertised `http://pi-msg` XEP-0115 caps node in live
+presence; this is a notification heuristic, not verified identity or an
+authorization boundary. Human clients, the configured owner, self-addressed
+messages, offline peers and unknown presence are exempt. A missing caps child
+may retain identity on the same live endpoint; a changed client/real JID,
+unavailable/error, room departure or reconnect invalidates the relevant state.
+History alone never establishes current presence.
+
+Room checks use current room/nickname presence and the same bare-name,
+`@name`, leading/inline address and quote/code filtering as inbound delivery.
+They also check the current author of a threaded reply and broadcasts
+(`@everyone`, `@all`, `@here`, `@free`). Configured peer trigger aliases that
+differ from the nickname are not advertised/discovered, so only nickname-based
+addressing can be checked. The guard does not change inbound broadcast routing.
+An anonymous occupant can still be recognized through its advertised caps.
+Direct full-JID checks use only that exact observed resource; unknown resources
+do not inherit a sibling's status. Bare-JID checks aggregate observed direct
+resources and room witnesses: any known nonsleeping witness allows the send;
+otherwise a recognized peer with only away/xa witnesses requires the override.
+
+Presence is not proof that a shared resource is free. This feature introduces
+no resource registry and does not replace existing deployment locks or holds.
 
 ### Optional reply watches
 

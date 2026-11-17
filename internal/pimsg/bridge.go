@@ -720,12 +720,20 @@ func (b *Bridge) handleUIRequest(ev Event) {
 	}
 }
 
-func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string, timeoutArg ...json.RawMessage) {
-	var raw json.RawMessage
-	if len(timeoutArg) > 0 {
-		raw = timeoutArg[0]
+func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string, options ...json.RawMessage) {
+	var timeoutRaw, wakeRaw json.RawMessage
+	if len(options) > 0 {
+		timeoutRaw = options[0]
 	}
-	timeout, seconds, err := parseReplyTimeout(raw)
+	if len(options) > 1 {
+		wakeRaw = options[1]
+	}
+	allowWake, err := parseAllowWake(wakeRaw)
+	if err != nil {
+		b.rpc.RespondUIRelay(id, "send_message: "+err.Error())
+		return
+	}
+	timeout, seconds, err := parseReplyTimeout(timeoutRaw)
 	if err != nil {
 		b.rpc.RespondUIRelay(id, "send_message: "+err.Error())
 		return
@@ -770,6 +778,12 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string, timeoutA
 			return
 		}
 		reply = &replyTarget{author: entry.FromJID, id: replyToID}
+	}
+	if !allowWake {
+		if targets := b.xmpp.sleepingMessageTargets(to, text, reply, kind == destRoom); len(targets) > 0 {
+			b.rpc.RespondUIRelay(id, "send_message: would wake away/xa pi-msg peers: "+strings.Join(targets, ", ")+". Read claim/release history or remove unnecessary addressing; for an intentional wake set allow_wake=true. No message was sent.")
+			return
+		}
 	}
 	// Serialize send + registration with fresh inbound observation. A reply
 	// received while the send is completing waits for registration, not lost.
@@ -1034,6 +1048,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 		Text         string             `json:"text"`
 		ReplyTo      string             `json:"replyTo"`
 		ReplyTimeout json.RawMessage    `json:"replyTimeoutSeconds"`
+		AllowWake    json.RawMessage    `json:"allowWake"`
 		Target       string             `json:"target"`
 		MessageID    string             `json:"messageId"`
 		From         string             `json:"from"`
@@ -1118,7 +1133,7 @@ func (b *Bridge) handleToolRelay(id, payload string) {
 			b.rpc.RespondUIRelay(id, url)
 		}()
 	case "send_message":
-		b.handleSendMessageRelay(id, cmd.To, cmd.Text, cmd.ReplyTo, cmd.ReplyTimeout)
+		b.handleSendMessageRelay(id, cmd.To, cmd.Text, cmd.ReplyTo, cmd.ReplyTimeout, cmd.AllowWake)
 	case "read_messages":
 		b.handleReadMessagesRelay(id, cmd.Target, cmd.Limit, cmd.Since, cmd.Before)
 	case "process_count":
@@ -2470,7 +2485,11 @@ func (b *Bridge) matchTrigger(room, body string) (bool, string) {
 // are gated differently (#130): a name is aimed, so it is delivered whatever our
 // presence says, while @free reaches an away agent only.
 func (b *Bridge) matchTriggerExplicit(room, body string) (bool, string) {
-	trig := b.acct.TriggerFor(room)
+	return matchTriggerName(body, b.acct.TriggerFor(room))
+}
+
+// matchTriggerName is shared by inbound addressing and the outbound wake guard.
+func matchTriggerName(body, trig string) (bool, string) {
 	if trig == "" {
 		return false, ""
 	}
@@ -3740,7 +3759,9 @@ func (b *Bridge) handleStreamToolCall(ame Event) {
 				dest, ok = finalArgs.Str("to"), finalArgs.Str("to") != ""
 			}
 		}
-		if ok && b.xmpp != nil && b.xmpp.classifyMessageDest(dest, b.acct.AllowArbitraryJid) == destUser {
+		// A peer can become known sleeping after `to` streams. Defer all peer
+		// composing until final validation, even if its presence is unknown now.
+		if ok && b.xmpp != nil && b.xmpp.wakeExemptJID(dest) && b.xmpp.classifyMessageDest(dest, b.acct.AllowArbitraryJid) == destUser {
 			b.streamToolMu.Lock()
 			state = b.streamToolCalls[index]
 			shouldSend := state != nil && !state.started

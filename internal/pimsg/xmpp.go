@@ -381,8 +381,9 @@ type XMPPBridge struct {
 	seenOrder []string
 
 	// MUC occupant tracking (room mode), keyed by room bare JID.
-	occupants map[string]map[string]string // roomBare -> nick -> bare real JID (empty for anonymous occupants)
-	selfNick  map[string]string            // roomBare -> our nick (per status code 110)
+	occupants    map[string]map[string]string // roomBare -> nick -> bare real JID (empty for anonymous occupants)
+	selfNick     map[string]string            // roomBare -> our nick (per status code 110)
+	peerPresence map[string]peerPresence      // exact live presence sender -> peer identity/show
 
 	uploadMu  sync.Mutex
 	uploadSvc string // resolved XEP-0363 upload component JID (cached)
@@ -434,20 +435,21 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		roomBares[bareJid(room)] = true
 	}
 	b := &XMPPBridge{
-		acct:        acct,
-		ownerBare:   bareJid(acct.Owner),
-		roomBares:   roomBares,
-		onMsg:       onMsg,
-		logf:        logf,
-		presence:    "awake",
-		startStatus: "awake",
-		seen:        make(map[string]struct{}),
-		occupants:   make(map[string]map[string]string),
-		selfNick:    make(map[string]string),
-		msgHistory:  make(map[string]msgHistoryEntry),
-		readHistory: make(map[string]msgHistoryEntry),
-		spokeAt:     make(map[string]time.Time),
-		mamPending:  make(map[string]*mamCollector),
+		acct:         acct,
+		ownerBare:    bareJid(acct.Owner),
+		roomBares:    roomBares,
+		onMsg:        onMsg,
+		logf:         logf,
+		presence:     "awake",
+		startStatus:  "awake",
+		seen:         make(map[string]struct{}),
+		occupants:    make(map[string]map[string]string),
+		selfNick:     make(map[string]string),
+		peerPresence: make(map[string]peerPresence),
+		msgHistory:   make(map[string]msgHistoryEntry),
+		readHistory:  make(map[string]msgHistoryEntry),
+		spokeAt:      make(map[string]time.Time),
+		mamPending:   make(map[string]*mamCollector),
 	}
 	b.loadAvatar()
 	return b
@@ -532,6 +534,7 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
 	b.occupants = make(map[string]map[string]string)
 	b.selfNick = make(map[string]string)
+	b.peerPresence = make(map[string]peerPresence)
 	b.mu.Unlock()
 
 	// Announce presence so the server routes messages to this resource and the
@@ -598,6 +601,7 @@ func (b *XMPPBridge) setOffline() {
 	b.mu.Lock()
 	b.online = false
 	b.session = nil
+	b.peerPresence = make(map[string]peerPresence)
 	b.mu.Unlock()
 }
 
@@ -1311,6 +1315,11 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 		// Only available/unavailable presence describes room membership. Join
 		// errors and subscription/probe traffic must not invent mention targets.
 		if ptype != "" && ptype != string(stanza.UnavailablePresence) {
+			if ptype == "error" {
+				b.mu.Lock()
+				b.forgetPeerPresenceLocked(from)
+				b.mu.Unlock()
+			}
 			return nil
 		}
 		nick := resourcepart(from)
@@ -1333,11 +1342,35 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 		}
 		if ptype == "unavailable" {
 			delete(b.occupants[room], nick)
+			b.forgetPeerPresenceLocked(from)
+			ownNick := b.selfNick[room]
+			if ownNick == "" {
+				ownNick = b.acct.Nick
+			}
+			if nick == ownNick {
+				// Once we leave a room, its other occupants are no longer live
+				// evidence, even if their unavailable stanzas never reach us.
+				b.forgetPeerPresenceLocked(room)
+			}
 		} else {
 			b.occupants[room][nick] = real
+			b.recordPeerPresenceLocked(from, real, toks)
 		}
 		b.mu.Unlock()
 		return nil
+	}
+
+	// Available direct presence is resource-scoped; unrelated subscription
+	// traffic must not overwrite a known peer's current show/identity.
+	if from != "" {
+		b.mu.Lock()
+		switch ptype {
+		case "":
+			b.recordPeerPresenceLocked(from, bareJid(from), toks)
+		case "unavailable", "error":
+			b.forgetPeerPresenceLocked(from)
+		}
+		b.mu.Unlock()
 	}
 
 	// 1:1: auto-approve subscription requests so the owner sees accurate
