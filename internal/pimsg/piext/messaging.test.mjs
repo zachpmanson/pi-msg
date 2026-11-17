@@ -11,7 +11,7 @@ const { default: xmppTools } = await import(`data:text/javascript;base64,${Buffe
 function fixture(t, result, arbitraryPeers = false) {
 	const previous = { ...process.env };
 	process.env.PI_MSG_TOOLS = "messaging,file,messages,reaction";
-	process.env.PI_MSG_CAPABILITIES = JSON.stringify({ owner: "owner@x", rooms: ["team@muc.x"], arbitraryPeers });
+	process.env.PI_MSG_CAPABILITIES = JSON.stringify({ owner: "owner@x", rooms: ["team@muc.x"], self: "self-account@x", arbitraryPeers });
 	delete process.env.PI_MSG_PROCESS_EXTENSION;
 	t.after(() => {
 		for (const name of ["PI_MSG_TOOLS", "PI_MSG_PROCESS_EXTENSION", "PI_MSG_CAPABILITIES"]) {
@@ -67,11 +67,13 @@ for (const arbitrary of [false, true]) {
 	for (const description of [tool.parameters.to.description, read.parameters.target.description]) {
 		assert.match(description, /owner@x/);
 		assert.match(description, /team@muc.x/);
-		assert.match(description, arbitrary ? /also other valid peer JIDs, not unconfigured rooms/ : /only; room membership does not authorize DMs/);
+		assert.match(description, /Normally owner owner@x/);
+		assert.match(description, arbitrary ? /also other valid peer JIDs, not unconfigured rooms/ : /room membership does not authorize DMs/);
+		assert.doesNotMatch(description, /self-account@x|only;/);
 	}
 	for (const tool of tools) {
 		assert.equal(tool.promptGuidelines, undefined);
-		assert.doesNotMatch(JSON.stringify(tool), /allowArbitraryJid/);
+		assert.doesNotMatch(JSON.stringify(tool), /allowArbitraryJid|self-account@x/);
 	}
 	assert.match(fileTool.parameters.to.description, /Configured owner or configured room JID only/);
 	assert.match(fileTool.parameters.to.description, /arbitrary peers are not file destinations/);

@@ -55,6 +55,12 @@ func (b *Bridge) loadNextQueue() error {
 		if first.NextBoundaryID == "" || first.TargetSessionID == "" || !sessionFileUsable(prev) || b.initialPrompt != "" {
 			return fmt.Errorf("orphan protected inbox requires assigned exact target and usable resume pointer")
 		}
+		// This extra proof belongs only to the retired automatic boundary.
+		// A later manual /next has its own exact-target orphan authority; a
+		// historical blocked auto attempt must not override that newer boundary.
+		if a := b.auto.state.Attempt; a != nil && a.Error == autoRetiredFenceRecovered && first.NextBoundaryID == a.Token && (first.TargetSessionID != a.TargetID || prev != a.TargetFile) {
+			return fmt.Errorf("retired automatic fence orphan does not match proven exact target")
+		}
 		for _, e := range entries {
 			if e.NextBoundaryID != first.NextBoundaryID || e.TargetSessionID != first.TargetSessionID {
 				return fmt.Errorf("mixed orphan protected targets/boundaries; refusing recovery")
@@ -243,6 +249,10 @@ func (b *Bridge) admitNextResult(m InboundMessage) nextAdmission {
 			go b.shutdown("requested over chat; pending /next retained")
 			return nextControlConsumed
 		case "new":
+			if r.Command == "automatic-idle-recovery" && r.FreshSessionID == "" {
+				b.sendReconcileNotice(dest, "/new: automatic native switch outcome is unknown; input remains protected until exact session recovery; no reset replay")
+				return nextControlConsumed
+			}
 			targeted := r.FreshSessionID != ""
 			for _, e := range b.inbox.protectedPending() {
 				targeted = targeted || e.TargetSessionID != ""

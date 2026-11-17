@@ -127,6 +127,9 @@ Per-account fields:
 | `pingInterval` | no | `60s` | keepalive cadence (Go duration): XEP-0199 server ping + XEP-0410 MUC self-ping; `0` disables |
 | `reactions` | no | `false` | XEP-0444 reactions and lifecycle acknowledgements; override per room |
 | `allowArbitraryJid` | no | `false` | Allow `send_message` and `read_messages` to target valid peer JIDs outside the owner/configured-room default allowlist; configured rooms must still be configured |
+| `autoreconcileTimeout` | no | disabled | Experimental Go duration (e.g. `"30m"`); absent/`"0"` is inert. Idle optional reconcile → self receipt → bounded recap → exact native fresh session → XA. Cannot combine with `resetSessionOnAway`. See [operations](docs/autoreconcile.md). |
+| `autoreconcileHistoryMessages` | no | `10` | Recent eligible sent/admitted messages globally, `0..100`; counts alone never enable automatic cleanup. |
+| `autoreconcileOwnerHistoryMessages` | no | `10` | Independent owner-authored history floor, `0..100`; retained separately from peer traffic. Both counts zero omit chat bodies, not startup guidance. |
 | `resetSessionOnAway` | no | `false` | Start a fresh Pi session when the account becomes idle/away; prior session files are retained |
 | `beforeAgentStartText` | no | — | literal text added to the system prompt before every turn; empty or whitespace means unset |
 | `avatar` | no | — | path to a local image (PNG/JPEG/GIF) published as the bot's XEP-0153 vCard profile picture on connect |

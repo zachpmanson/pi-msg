@@ -84,6 +84,7 @@ type Bridge struct {
 	streamingRun         bool
 	settlingRun          bool // settle-time prompts still belong to the old session
 	next                 nextQueue
+	auto                 autoReconcile
 	sessionID            string // actual identity, including namespace (id: or file:)
 	nextTransition       bool   // reserved under mu; RPC events must never wait on it
 	syntheticPrompts     int    // submissions reserved before synthetic-turn state changes
@@ -196,10 +197,14 @@ const maxPendingMarkers = 64
 func rpcEnv(acct ResolvedAccount) []string {
 	capabilities, _ := json.Marshal(struct {
 		Owner          string   `json:"owner"`
+		Self           string   `json:"self,omitempty"`
 		Rooms          []string `json:"rooms"`
 		ArbitraryPeers bool     `json:"arbitraryPeers"`
-	}{bareJid(acct.Owner), append([]string{}, acct.Rooms...), acct.AllowArbitraryJid})
+	}{bareJid(acct.Owner), bareJid(acct.JID), append([]string{}, acct.Rooms...), acct.AllowArbitraryJid})
 	env := []string{"PI_MSG_TOOLS=" + strings.Join(toolNames(acct), ","), "PI_MSG_CAPABILITIES=" + string(capabilities)}
+	if acct.AutoreconcileTimeout > 0 {
+		env = append(env, "PI_MSG_IDLE_REQUEST="+strings.TrimSuffix(inboxPath(acct.Name), ".inbox.jsonl")+".auto.json.request")
+	}
 	if acct.BeforeAgentStartText != "" {
 		env = append(env, "PI_MSG_BEFORE_AGENT_START_TEXT="+acct.BeforeAgentStartText)
 	}
@@ -234,6 +239,13 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 	b.xmpp = NewXMPPBridge(b.acct, b.onInbound, b.log)
 	b.xmpp.onReplyMessage = b.observeReplyMessage
+	if b.acct.AutoreconcileTimeout > 0 {
+		if err := b.loadAuto(); err != nil {
+			return fmt.Errorf("autoreconcile recovery: %w", err)
+		}
+		b.xmpp.onAcceptedSent = b.captureAutoSent
+		b.xmpp.roomOrigin = b.autoRoomOrigin
+	}
 	b.inbox = newInbox(inboxPath(b.acct.Name), b.log)
 	if err := b.loadNextQueue(); err != nil {
 		return fmt.Errorf("pending /next recovery: %w", err)
@@ -385,6 +397,11 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// also confirms pi is live and reading stdin — a safe point to inject the
 	// proactive volunteer turn.
 	b.refreshSessionFile()
+	if b.acct.AutoreconcileTimeout > 0 {
+		b.auto.mu.Lock()
+		b.auto.ready = true
+		b.auto.mu.Unlock()
+	}
 	b.startNextQueue()
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -790,7 +807,7 @@ func (b *Bridge) handleSendMessageRelay(id, to, text, replyToID string, timeoutA
 		b.rpc.RespondUIRelay(id, fmt.Sprintf("send_message to %s failed: no stanza was sent", to))
 		return
 	}
-	if timeout > 0 {
+	if timeout > 0 && bareJid(to) != bareJid(b.acct.JID) {
 		b.armReplyWatch(to, stanzaID, text, kind == destRoom, started, timeout, seconds)
 	}
 	b.setReplied(true)
@@ -841,7 +858,7 @@ func (b *Bridge) handleReadMessagesRelay(id, target string, limit int, sinceArg,
 	}
 	isRoom := b.xmpp.isRoomJID(bare)
 	if !isRoom {
-		if bare != bareJid(b.acct.Owner) && !b.acct.AllowArbitraryJid {
+		if bare != bareJid(b.acct.Owner) && bare != bareJid(b.acct.JID) && !b.acct.AllowArbitraryJid {
 			b.rpc.RespondUIRelay(id, fmt.Sprintf("read_messages: %q is not an allowed target (allowed: owner %s and configured rooms)", target, b.acct.Owner))
 			return
 		}
@@ -1156,6 +1173,20 @@ type HeartbeatProcess struct {
 // commands that need a response block only this handler, not pi's event
 // stream.
 func (b *Bridge) onInbound(m InboundMessage) {
+	// Self receipts, carbons and archive copies are passive in every mode.
+	if m.Own || (m.Direct && b.acct.JID != "" && bareJid(m.From) == bareJid(b.acct.JID)) {
+		return
+	}
+	// In enabled mode, admitted-arrival activity can revoke a native command
+	// even while short reset serialization is in progress. Routing still runs
+	// again under the normal admission lock; ignored chatter is not activity.
+	if b.acct.AutoreconcileTimeout > 0 && !(m.Room != "" && m.Nick != "" && b.xmpp != nil && strings.EqualFold(m.Nick, b.xmpp.ownNick(m.Room))) {
+		if m.Direct {
+			b.autoActivity()
+		} else if action, _, _ := b.classify(m); action != actionNotOurs {
+			b.autoActivity()
+		}
+	}
 	b.sessionTransitionMu.Lock()
 	defer b.sessionTransitionMu.Unlock()
 	// Advance the persistent inbound cursor after routing, including ignored
@@ -1183,6 +1214,8 @@ func (b *Bridge) onInbound(m InboundMessage) {
 		}
 		m.Addressed = true
 	}
+	b.captureAutoInbound(m)
+	b.autoActivity() // includes input held by /next
 	// A queued boundary admits input before ANY old-turn state mutation.
 	if b.admitNext(m) {
 		return
@@ -2482,7 +2515,7 @@ func freeOnlyBroadcast(body string) bool {
 // sees rather than a local idle flag, so "I am away" and "the roster shows me
 // away" cannot disagree. Reconnecting no longer clears the away state (see
 // reconnectPresence), which is what makes it safe to key delivery on.
-func (b *Bridge) isAway() bool { return b.presenceShow() == "away" }
+func (b *Bridge) isAway() bool { return b.presenceShow() == "away" || b.presenceShow() == "xa" }
 
 // presenceShow is our own current <show> ("" = available), or "" when there is
 // no connection to ask.
@@ -4035,6 +4068,7 @@ func (b *Bridge) markIdle() {
 // awayAnnounced is cleared so the next idle period announces its away status
 // afresh.
 func (b *Bridge) markActive() {
+	b.autoActivity()
 	b.mu.Lock()
 	b.idleSince = time.Time{}
 	b.awayAnnounced = false
@@ -4092,6 +4126,7 @@ func (b *Bridge) idleWatcher(ctx context.Context) {
 // once per idle period, once the agent has been idle past idleAwayTimeout.
 // Split out from idleWatcher so it's callable directly from tests.
 func (b *Bridge) idleTick() {
+	b.autoTick()
 	b.sessionTransitionMu.Lock()
 	defer b.sessionTransitionMu.Unlock()
 	pendingNext := b.nextPending() || (b.inbox != nil && len(b.inbox.protectedPending()) > 0)
@@ -4725,6 +4760,15 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
 		b.reply(banner)
 	}
 	for _, m := range fresh {
+		if m.Own || (m.Direct && b.acct.JID != "" && bareJid(m.From) == bareJid(b.acct.JID)) {
+			continue
+		}
+		if m.Direct {
+			b.captureAutoInbound(m)
+		} else if action, _, _ := b.classify(m); action != actionNotOurs {
+			b.captureAutoInbound(m)
+		}
+		b.autoActivity()
 		b.xmpp.markSeen(m.ID)
 		b.noteInboundHandled()
 		b.sessionTransitionMu.Lock()
@@ -4789,6 +4833,9 @@ func (b *Bridge) deliverInbox(e inboxEntry) {
 		return
 	}
 	m := e.message()
+	if m.Own || (m.Direct && b.acct.JID != "" && bareJid(m.From) == bareJid(b.acct.JID)) {
+		return
+	}
 	// Ordinary durable input predates any reconstructed admission provenance.
 	// Never migrate it into a later boundary (which can fail the encoded bound),
 	// and never execute historical destructive controls against today's session.

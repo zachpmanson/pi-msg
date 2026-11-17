@@ -23,9 +23,10 @@
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, openSync, closeSync, fsyncSync, writeFileSync, renameSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 // Marks a confirm as a pi-msg action relay rather than a real user dialog.
 // Kept in sync with relayPrefix in extension.go.
@@ -46,11 +47,78 @@ function conversationPermissions(): string {
 	const rooms = Array.isArray(config.rooms)
 		? (config.rooms.length ? ` or configured rooms (${config.rooms.join(", ")})` : "")
 		: " or configured rooms";
-	return `${owner}${rooms}${config.arbitraryPeers === true ? "; also other valid peer JIDs, not unconfigured rooms" : " only; room membership does not authorize DMs"}.`;
+	return `Normally ${owner}${rooms}${config.arbitraryPeers === true ? "; also other valid peer JIDs, not unconfigured rooms" : "; room membership does not authorize DMs"}.`;
 }
 
 export default function xmppTools(pi: ExtensionAPI) {
 	const permissions = conversationPermissions();
+	// Private bridge command: materialize with public native APIs, then switch
+	// exactly once. Building before switch leaves the old runtime usable on
+	// preparation failure and prevents an Agent/SessionManager UUID split.
+	const idleRequest = process.env.PI_MSG_IDLE_REQUEST;
+	if (idleRequest && isAbsolute(idleRequest)) {
+		pi.registerCommand("pi-msg-idle-reset", {
+			handler: async (token, ctx) => {
+				const sync = (path: string) => { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } };
+				const request = JSON.parse(readFileSync(idleRequest, "utf8"));
+				const outcome = (value: object) => {
+					const receipt = idleRequest + ".receipt";
+					writeFileSync(receipt + ".tmp", JSON.stringify({ token, sourceID: request.sourceID, ...value }), { mode: 0o600 });
+					sync(receipt + ".tmp"); renameSync(receipt + ".tmp", receipt); sync(dirname(receipt));
+				};
+				const check = () => {
+					const current = JSON.parse(readFileSync(idleRequest, "utf8"));
+					const state = JSON.parse(readFileSync(idleRequest.slice(0, -".request".length), "utf8"));
+					if (!token || token !== request.token || current.token !== token || current.hash !== request.hash || current.seed !== request.seed || String(state.Generation) !== request.generation || state.Attempt?.Token !== token || state.Attempt?.Phase !== "resetting")
+						throw new Error("idle reset authority changed");
+				};
+				let switchStarted = false, switched = false;
+				let target: {id:string;file:string;seedHash:string} | undefined;
+				try {
+					const source = () => {
+						check();
+						if (!ctx.isIdle() || ctx.hasPendingMessages() || "id:" + ctx.sessionManager.getSessionId() !== request.sourceID || ctx.sessionManager.getSessionFile() !== request.sourceFile)
+							throw new Error("idle reset source is not exact and idle");
+						if (createHash("sha256").update(readFileSync(request.sourceFile)).digest("hex") !== request.hash)
+							throw new Error("idle reset snapshot changed");
+					};
+					source();
+					const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+					source();
+					if (!ctx.model || !request.thinking || ctx.model.provider !== request.provider || ctx.model.id !== request.model || ctx.thinkingLevel !== request.thinking) throw new Error("idle reset model/thinking missing");
+					const sm = SessionManager.create(ctx.cwd, ctx.sessionManager.getSessionDir());
+					const file = sm.getSessionFile();
+					if (!file || !isAbsolute(file) || file === request.sourceFile) throw new Error("no distinct native session path");
+					// Pi 0.84.4 defers persistence until assistant output. Native
+					// existing-empty-file initialization writes its own header/new
+					// UUID. No JSONL edits, fabricated assistant or provider call.
+					const fd = openSync(file, "wx", 0o600); closeSync(fd);
+					sm.setSessionFile(file);
+					sm.appendModelChange(ctx.model.provider, ctx.model.id);
+					sm.appendThinkingLevelChange(request.thinking);
+					sm.appendCustomMessageEntry("pi-msg-idle-seed", request.seed, false, { token, sourceID: request.sourceID, sourceFile: request.sourceFile });
+					sync(file); sync(dirname(file));
+					const id = "id:" + sm.getSessionId();
+					source();
+					target={id,file,seedHash:createHash("sha256").update(request.seed).digest("hex")};
+					switchStarted=true;
+					const result = await ctx.switchSession(file, {
+						withSession(fresh) {
+							switched=true;
+							let stale=false;try{check()}catch{stale=true}
+							if ("id:" + fresh.sessionManager.getSessionId() !== id || fresh.sessionManager.getSessionFile() !== file || id === request.sourceID || !fresh.isIdle() || fresh.hasPendingMessages() || fresh.model?.provider !== request.provider || fresh.model?.id !== request.model || fresh.thinkingLevel !== request.thinking)
+								throw new Error("idle reset final identity/idle mismatch");
+							outcome({ status: "success", cancelled: false, stale, id, file, seedHash: createHash("sha256").update(request.seed).digest("hex") });
+						},
+					});
+					if (result.cancelled) outcome({ status: "cancelled", cancelled: true, sourceAuthoritative:true });
+				} catch (error) {
+					outcome({ status: switched ? "switched-failed" : "failed", sourceAuthoritative:!switchStarted, ...(switched ? target : {}), error: String(error) });
+					throw error;
+				}
+			},
+		});
+	}
 	// Captured on session_start; used by tool handlers to reach pi-msg.
 	let ui: RelayUI | undefined;
 	let sessionIdentity = "";

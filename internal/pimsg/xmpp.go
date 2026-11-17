@@ -290,9 +290,14 @@ type InboundMessage struct {
 	Nick      string // occupant nick (room mode), or "" for 1:1
 	RealJID   string // sender's bare real JID if known, else ""
 	FromOwner bool   // sender is the configured owner
-	Direct    bool   // arrived as a 1:1 chat, not groupchat (reply goes back 1:1)
-	Room      string // source room bare JID (room mode); "" for 1:1
-	ID        string // stanza id (used as the XEP-0444 reaction target)
+	// Historical separates archived/delayed origin evidence from legacy routing
+	// identity, which may use today's occupant map. OriginJID is trusted only
+	// when matched to previously verified delivery/accepted-send provenance.
+	Historical bool
+	OriginJID  string
+	Direct     bool   // arrived as a 1:1 chat, not groupchat (reply goes back 1:1)
+	Room       string // source room bare JID (room mode); "" for 1:1
+	ID         string // stanza id (used as the XEP-0444 reaction target)
 	// ArchiveID is the XEP-0313 MAM result id: the id the server archived the
 	// stanza under, which is what RSM <before>/<after> cursors address. It is NOT
 	// the message's own id — measured live 2026-09-28 in testing-2: the archive id
@@ -344,6 +349,8 @@ type InboundMessage struct {
 // goroutines.
 type XMPPBridge struct {
 	acct           ResolvedAccount
+	onAcceptedSent func(to, id, body string)
+	roomOrigin     func(room, from, id, body string) string
 	ownerBare      string
 	roomBares      map[string]bool // bare JIDs of the joined rooms
 	onMsg          func(InboundMessage)
@@ -1155,7 +1162,7 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if m.typ != "" && m.typ != "chat" && m.typ != "normal" {
 		return
 	}
-	if bareJid(m.from) == bareJid(b.acct.JID) {
+	if b.acct.JID != "" && bareJid(m.from) == bareJid(b.acct.JID) {
 		return
 	}
 	if m.delay && bareJid(m.from) != b.ownerBare {
@@ -1228,8 +1235,18 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	// in principle, so a server echoing a differently-cased resource must not
 	// defeat the filter (a miss lets our own message re-enter classify and
 	// prompt ourselves).
-	if strings.EqualFold(nick, b.ownNick(room)) {
-		return // our own echo
+	if real := b.occupantRealJID(room, nick); !m.delay && real != "" && real == bareJid(b.acct.JID) {
+		return // verified self, including another resource/nickname; no reply observation
+	}
+	origin := ""
+	if m.delay && b.roomOrigin != nil {
+		origin = b.roomOrigin(room, m.from, m.id, m.body)
+		if origin != "" && origin == bareJid(b.acct.JID) {
+			return // accepted outbound under an old nickname
+		}
+	}
+	if (!m.delay || b.roomOrigin == nil) && strings.EqualFold(nick, b.ownNick(room)) {
+		return // live echo (legacy historical heuristic only outside automatic mode)
 	}
 	if m.delay {
 		// Replayed MUC history: buffer only what falls inside the restart swap
@@ -1238,14 +1255,16 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
 			real := b.occupantRealJID(room, nick)
 			b.bufferReplay(InboundMessage{
-				Body:      m.body,
-				Nick:      nick,
-				RealJID:   real,
-				FromOwner: real != "" && real == b.ownerBare,
-				Room:      room,
-				ID:        m.id,
-				From:      m.from,
-				Stamp:     m.delayStamp,
+				Body:       m.body,
+				Nick:       nick,
+				RealJID:    real,
+				FromOwner:  real != "" && real == b.ownerBare,
+				Room:       room,
+				ID:         m.id,
+				From:       m.from,
+				Stamp:      m.delayStamp,
+				Historical: true,
+				OriginJID:  origin,
 			})
 		} else {
 			b.log("notice", fmt.Sprintf("dropped delayed room message outside the replay window (room=%s nick=%s id=%s stamp=%s)", room, nick, m.id, stampLabel(m.delayStamp)))
@@ -1543,6 +1562,9 @@ func (b *XMPPBridge) classifyDest(dest string) destKind {
 // send_message tool. Room membership remains mandatory even when arbitrary
 // peer JIDs are enabled.
 func (b *XMPPBridge) classifyMessageDest(dest string, allowArbitrary bool) destKind {
+	if self := bareJid(b.acct.JID); self != "" && bareJid(dest) == self {
+		return destUser
+	}
 	kind := b.classifyDest(dest)
 	if kind != destBlocked || !allowArbitrary {
 		return kind
@@ -1563,6 +1585,9 @@ func (b *XMPPBridge) messageDestinationGuidance() string {
 	users := []string{}
 	if b.ownerBare != "" {
 		users = append(users, b.ownerBare)
+	}
+	if self := bareJid(b.acct.JID); self != "" && self != b.ownerBare {
+		users = append(users, self)
 	}
 	rooms := []string{}
 	for room, joined := range b.roomBares {
@@ -1730,7 +1755,11 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, reply *
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	b.recordSelfMessage(id, to, body)
-	return id, b.encode(ctx, session, msg)
+	err = b.encode(ctx, session, msg)
+	if err == nil && b.onAcceptedSent != nil {
+		b.onAcceptedSent(to, id, body)
+	}
+	return id, err
 }
 
 // SendDisplayedMarker acknowledges a 1:1 owner message with a single XEP-0333
@@ -2571,4 +2600,28 @@ func reactionEmojis(toks []xml.Token) []string {
 		}
 	}
 	return out
+}
+
+// sendRecordedChat uses a durable caller-owned stanza ID for retryable internal
+// receipts. An encode error is never reset authority. Incoming copies are passive.
+func (b *XMPPBridge) sendRecordedChat(to, id, body string) error {
+	session := b.currentSession()
+	if session == nil {
+		return fmt.Errorf("not online")
+	}
+	dest, err := jid.Parse(to)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	b.recordSelfMessage(id, to, body)
+	if err = b.encode(ctx, session, chatStanza(id, dest, stanza.ChatMessage, body, nil)); err != nil {
+		return err
+	}
+	b.markOutbound()
+	if b.onAcceptedSent != nil {
+		b.onAcceptedSent(to, id, body)
+	}
+	return nil
 }

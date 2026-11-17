@@ -374,12 +374,18 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	// unaddressed XEP-0461 reply to it still resolves), never as a plain inbound
 	// stanza that would clear that flag (#106 review).
 	ownLine := false
-	nick := ""
+	nick, origin := "", ""
 	if col.room == "" {
-		ownLine = bareJid(from) == bareJid(b.acct.JID)
+		ownLine = b.acct.JID != "" && bareJid(from) == bareJid(b.acct.JID)
 	} else {
 		nick = resourcepart(from)
-		if self := b.ownNick(col.room); self != "" && strings.EqualFold(nick, self) {
+		if b.roomOrigin != nil {
+			origin = b.roomOrigin(col.room, from, id, body)
+		}
+		if origin != "" && origin == bareJid(b.acct.JID) {
+			ownLine = true
+		}
+		if self := b.ownNick(col.room); b.roomOrigin == nil && self != "" && strings.EqualFold(nick, self) {
 			ownLine = true
 		}
 	}
@@ -416,7 +422,7 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	// the message's id attribute is the sender's. Keeping both lets read_messages
 	// print a usable cursor without changing routing, which keys off the message
 	// id (#117).
-	m := InboundMessage{Body: body, ID: id, ArchiveID: attr(res.Attr, "id"), From: from, Stamp: stamp, Own: ownLine}
+	m := InboundMessage{Body: body, ID: id, ArchiveID: attr(res.Attr, "id"), From: from, Stamp: stamp, Own: ownLine, Historical: true, OriginJID: origin}
 	// A recovered message can itself be a XEP-0461 reply; keep the stamp so the
 	// prompt names what it answers (#95).
 	if re, ok := element(rest, replyNS, "reply"); ok {
