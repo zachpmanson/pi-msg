@@ -135,6 +135,11 @@ type Account struct {
 	// ResetSessionOnAway starts a fresh Pi session when this account transitions
 	// from idle/available to away. Disabled by default.
 	ResetSessionOnAway bool `json:"resetSessionOnAway,omitempty"`
+	// AutoreconcileTimeout opts into idle reconciliation/reset (Go duration).
+	// Missing/zero disables all automatic capture and cleanup.
+	AutoreconcileTimeout string `json:"autoreconcileTimeout,omitempty"`
+	AutoreconcileHistoryMessages *int `json:"autoreconcileHistoryMessages,omitempty"`
+	AutoreconcileOwnerHistoryMessages *int `json:"autoreconcileOwnerHistoryMessages,omitempty"`
 	// BeforeAgentStartText, when set, is injected into the agent's system prompt
 	// at the start of every turn (via the companion extension's
 	// before_agent_start hook). Re-applying it each turn is the point: a steer
@@ -242,6 +247,9 @@ type ResolvedAccount struct {
 	Reactions          bool
 	RoomReactions      bool
 	ResetSessionOnAway bool
+	AutoreconcileTimeout time.Duration
+	AutoreconcileHistoryMessages int
+	AutoreconcileOwnerHistoryMessages int
 	Model              string
 	Workdir            string
 	ReconcileSkill     string
@@ -811,7 +819,28 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		pingInterval = d
 	}
 
+	autoTimeout := time.Duration(0)
+	if s := strings.TrimSpace(acct.AutoreconcileTimeout); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil || d < 0 {
+			return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q has invalid autoreconcileTimeout %q", name, s)
+		}
+		autoTimeout = d
+	}
+	recent, owner := 10, 10
+	if acct.AutoreconcileHistoryMessages != nil { recent = *acct.AutoreconcileHistoryMessages }
+	if acct.AutoreconcileOwnerHistoryMessages != nil { owner = *acct.AutoreconcileOwnerHistoryMessages }
+	if recent < 0 || recent > 100 || owner < 0 || owner > 100 {
+		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q autoreconcile history counts must be between 0 and 100", name)
+	}
+	if autoTimeout > 0 && acct.ResetSessionOnAway {
+		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q cannot combine autoreconcileTimeout with resetSessionOnAway", name)
+	}
+
 	return ResolvedAccount{
+		AutoreconcileTimeout: autoTimeout,
+		AutoreconcileHistoryMessages: recent,
+		AutoreconcileOwnerHistoryMessages: owner,
 		Name:               name,
 		JID:                acct.JID,
 		Password:           acct.Password,
