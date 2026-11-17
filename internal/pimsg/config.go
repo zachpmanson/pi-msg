@@ -17,8 +17,7 @@ import (
 //
 //	"rooms": [
 //	  {"jid": "team@muc.example.com"},
-//	  {"jid": "chatter@muc.example.com", "trigger": "pi"},
-//	  {"jid": "errors@muc.example.com", "role": "error"}
+//	  {"jid": "chatter@muc.example.com", "trigger": "pi"}
 //	]
 //
 // Only this form is accepted — the older single-JID string and array-of-strings
@@ -38,8 +37,7 @@ type roomList []roomSpec
 type roomSpec struct {
 	// JID is the bare MUC JID to join.
 	JID string `json:"jid"`
-	// Role is "error" for the write-only error room, or empty for a normal room.
-	// At most one entry may be the error room (see ErrorRoom).
+	// Role accepts only empty or "normal"; retired roles are rejected.
 	Role string `json:"role,omitempty"`
 	// Trigger overrides the account-level roomTrigger for this room. A pointer so
 	// that an explicit empty string is distinguishable from an absent key (and
@@ -53,7 +51,6 @@ type roomSpec struct {
 // roomRoles are the accepted values of roomSpec.Role.
 const (
 	roomRoleNormal = ""
-	roomRoleError  = "error"
 )
 
 func (r *roomList) UnmarshalJSON(b []byte) error {
@@ -156,7 +153,7 @@ type Account struct {
 
 	// Rooms, when set, additionally joins these bare MUC JIDs (e.g.
 	// "team@muc.chat.example.com") and relays group chat. An array of objects,
-	// each {"jid": …, "trigger": …, "reactions": …, "role": "error"}. The owner
+	// each {"jid": …, "trigger": …, "reactions": …}. The owner
 	// can still DM the bot 1:1 in either mode; each reply goes back to whichever
 	// channel the message arrived on.
 	Rooms roomList `json:"rooms,omitempty"`
@@ -180,11 +177,6 @@ type Account struct {
 	// detect silent disconnects. A Go duration string ("60s", "2m"). Defaults
 	// to "60s"; "0" disables keepalive.
 	PingInterval string `json:"pingInterval,omitempty"`
-	// ErrorRoom is the RETIRED singular spelling. It is parsed only so that
-	// resolveAccount can reject it by name: the error room is now a "rooms" entry
-	// with "role": "error", and quietly ignoring the old key would leave dropped
-	// agent replies with nowhere to go. A non-empty value here is a load error.
-	ErrorRoom string `json:"errorRoom,omitempty"`
 	// Avatar is a path to a local image (PNG/JPEG/GIF) published as the bot's
 	// XEP-0153 vCard avatar on connect. Optional; a missing/invalid file is a
 	// logged warning, not fatal.
@@ -205,6 +197,19 @@ type Account struct {
 	// LastActivity controls XEP-0012 idle-time responses from this resource.
 	// Enabled by default; false returns service-unavailable without idle data.
 	LastActivity *bool `json:"lastActivity,omitempty"`
+}
+
+// UnmarshalJSON rejects retired configuration rather than silently enabling it.
+func (a *Account) UnmarshalJSON(data []byte) error {
+	type plain Account
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	if _, ok := keys["errorRoom"]; ok {
+		return errors.New("errorRoom is retired; remove the key and any rooms entry with role error (do not convert it to a normal room)")
+	}
+	return json.Unmarshal(data, (*plain)(a))
 }
 
 // CreditWatch configures the on-\/new OpenRouter credit report.
@@ -240,8 +245,7 @@ type ResolvedAccount struct {
 	Model              string
 	Workdir            string
 	ReconcileSkill     string
-	// Rooms is the joined room JIDs (normal rooms only — the error room is not
-	// in here, and must never be). It is derived from RoomSpecs at resolve time.
+	// Rooms is the joined room JIDs, derived from RoomSpecs at resolve time.
 	Rooms []string
 	// RoomSpecs is the per-room addressing rules, in config order. A room absent
 	// from here falls back to the account-level values below.
@@ -255,7 +259,6 @@ type ResolvedAccount struct {
 	// means no injection.
 	BeforeAgentStartText string
 	Avatar               string
-	ErrorRoom            string
 	MinCreditUsd         float64
 	MAM                  bool
 	LastActivity         bool
@@ -265,8 +268,7 @@ type ResolvedAccount struct {
 func (a ResolvedAccount) RoomMode() bool { return len(a.Rooms) > 0 }
 
 // TriggerFor returns the address prefix in force in room, falling back to the
-// account-level trigger when the room carries no override (which includes the
-// error room and any account built directly in tests).
+// account-level trigger when the room carries no override (including accounts built directly in tests).
 func (a ResolvedAccount) TriggerFor(room string) string {
 	bare := bareJid(room)
 	for _, s := range a.RoomSpecs {
@@ -768,11 +770,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 	if len(acct.Room) > 0 {
 		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q: \"room\" was replaced by \"rooms\", an array of objects — use \"rooms\": [{\"jid\": %s}]", name, string(acct.Room))
 	}
-	if len(acct.ErrorRoom) > 0 {
-		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q: \"errorRoom\" (%q) was replaced by a \"rooms\" entry with \"role\": \"error\" — use \"rooms\": [{\"jid\": %q, \"role\": \"error\"}]", name, acct.ErrorRoom, acct.ErrorRoom)
-	}
-
-	rooms, specs, errorRoom, err := resolveRooms(acct)
+	rooms, specs, err := resolveRooms(acct)
 	if err != nil {
 		return ResolvedAccount{}, fmt.Errorf("pi-msg: account %q: %w", name, err)
 	}
@@ -838,27 +836,22 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		BeforeAgentStartText: strings.TrimSpace(acct.BeforeAgentStartText),
 		PingInterval:         pingInterval,
 		Avatar:               strings.TrimSpace(acct.Avatar),
-		ErrorRoom:            errorRoom,
 		MinCreditUsd:         maxCreditUsd(acct.CreditWatch),
 		MAM:                  acct.MAM == nil || *acct.MAM,
 		LastActivity:         acct.LastActivity == nil || *acct.LastActivity,
 	}, nil
 }
 
-// resolveRooms turns the configured "rooms" entries into the joined room list
-// (normal rooms only), their resolved per-room rules, and the error room JID.
-// Validation is strict because each of these failures takes an account out of a
-// room it believes it is in: a missing jid, an unknown role, two error rooms, or
-// the same JID listed twice.
-func resolveRooms(acct Account) (rooms []string, specs []RoomSpec, errorRoom string, err error) {
+// resolveRooms validates configured rooms and resolves their per-room rules.
+func resolveRooms(acct Account) (rooms []string, specs []RoomSpec, err error) {
 	seen := make(map[string]bool, len(acct.Rooms))
 	for i, spec := range acct.Rooms {
 		jid := strings.TrimSpace(spec.JID)
 		if jid == "" {
-			return nil, nil, "", fmt.Errorf("rooms[%d] has no \"jid\"", i)
+			return nil, nil, fmt.Errorf("rooms[%d] has no \"jid\"", i)
 		}
 		if seen[jid] {
-			return nil, nil, "", fmt.Errorf("rooms[%d]: %q is listed twice", i, jid)
+			return nil, nil, fmt.Errorf("rooms[%d]: %q is listed twice", i, jid)
 		}
 		seen[jid] = true
 		switch spec.Role {
@@ -868,7 +861,7 @@ func resolveRooms(acct Account) (rooms []string, specs []RoomSpec, errorRoom str
 				// agent but the owner and broadcasts — almost certainly a mistake, and
 				// silent if inherited, so say so. Omit the key to inherit the account
 				// trigger instead.
-				return nil, nil, "", fmt.Errorf("rooms[%d]: \"trigger\" is empty; omit it to inherit the account trigger, or give the word that addresses this agent in %q", i, jid)
+				return nil, nil, fmt.Errorf("rooms[%d]: \"trigger\" is empty; omit it to inherit the account trigger, or give the word that addresses this agent in %q", i, jid)
 			}
 			rooms = append(rooms, jid)
 			rs := RoomSpec{JID: jid}
@@ -879,16 +872,13 @@ func resolveRooms(acct Account) (rooms []string, specs []RoomSpec, errorRoom str
 				rs.Reactions, rs.reactionsSet = *spec.Reactions, true
 			}
 			specs = append(specs, rs)
-		case roomRoleError:
-			if errorRoom != "" {
-				return nil, nil, "", fmt.Errorf("rooms[%d]: %q is a second error room; at most one entry may have \"role\": \"error\"", i, jid)
-			}
-			errorRoom = jid
+		case "error":
+			return nil, nil, fmt.Errorf("rooms[%d]: role error is retired; remove this room entry (do not convert it to a normal room)", i)
 		default:
-			return nil, nil, "", fmt.Errorf("rooms[%d]: unknown role %q (allowed: \"normal\", \"error\")", i, spec.Role)
+			return nil, nil, fmt.Errorf("rooms[%d]: unknown role %q (allowed: \"normal\")", i, spec.Role)
 		}
 	}
-	return rooms, specs, errorRoom, nil
+	return rooms, specs, nil
 }
 
 // maxCreditUsd extracts the remaining-credit floor from a CreditWatch config

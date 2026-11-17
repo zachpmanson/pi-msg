@@ -309,14 +309,12 @@ func TestLoadConfigRoundTrip(t *testing.T) {
 // TestRoomConfigParsing covers the #106 format: an array of objects, strictly
 // validated, with the retired spellings rejected rather than ignored.
 func TestRoomConfigParsing(t *testing.T) {
-	// Per-room trigger and reactions overrides, plus the error room folded in as
-	// a typed entry.
+	// Per-room trigger and reactions overrides on two normal rooms.
 	var cfg Config
 	body := `{"accounts":{"default":{"jid":"pi@x","password":"p","owner":"o@x",
 		"rooms":[
 		  {"jid":"a@muc.x"},
-		  {"jid":"b@muc.x","trigger":"bob","reactions":true},
-		  {"jid":"errors@muc.x","role":"error"}
+		  {"jid":"b@muc.x","trigger":"bob","reactions":true}
 		]}}}`
 	if err := json.Unmarshal([]byte(body), &cfg); err != nil {
 		t.Fatalf("object form: %v", err)
@@ -327,9 +325,6 @@ func TestRoomConfigParsing(t *testing.T) {
 	}
 	if len(got.Rooms) != 2 || got.Rooms[0] != "a@muc.x" || got.Rooms[1] != "b@muc.x" {
 		t.Errorf("Rooms = %v, want [a@muc.x b@muc.x]", got.Rooms)
-	}
-	if got.ErrorRoom != "errors@muc.x" {
-		t.Errorf("ErrorRoom = %q, want errors@muc.x", got.ErrorRoom)
 	}
 	// The default trigger (the nick, here the JID localpart) applies only to the
 	// room that did not override it.
@@ -412,25 +407,13 @@ func TestRoomConfigValidation(t *testing.T) {
 	}
 }
 
-func TestResolveAccountErrorRoom(t *testing.T) {
-	got, err := resolveAccount(&Config{Accounts: map[string]Account{
+func TestRetiredErrorRoleRejected(t *testing.T) {
+	_, err := resolveAccount(&Config{Accounts: map[string]Account{
 		"default": {JID: "pi@x", Password: "p", Owner: "o@x",
-			Rooms: roomList{{JID: " errors@muc.x ", Role: "error"}}},
+			Rooms: roomList{{JID: "errors@muc.x", Role: "error"}}},
 	}}, "")
-	if err != nil {
-		t.Fatalf("resolveAccount: %v", err)
-	}
-	if got.ErrorRoom != "errors@muc.x" {
-		t.Errorf("ErrorRoom = %q, want %q", got.ErrorRoom, "errors@muc.x")
-	}
-	// The error room is write-only: it must not appear in the joined/readable set.
-	if got.RoomMode() {
-		t.Error("an error room must not put the account in room mode")
-	}
-	for _, r := range got.Rooms {
-		if r == got.ErrorRoom {
-			t.Fatal("error room leaked into Rooms")
-		}
+	if err == nil || !strings.Contains(err.Error(), "retired") || !strings.Contains(err.Error(), "remove this room entry") {
+		t.Fatalf("expected actionable retirement diagnostic, got %v", err)
 	}
 }
 

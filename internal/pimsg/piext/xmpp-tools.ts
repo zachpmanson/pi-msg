@@ -38,7 +38,19 @@ type RelayUI = {
 	select(title: string, options: string[], config?: { timeout: number }): Promise<string | undefined>;
 };
 
+// Bridge-supplied runtime facts, captured at normal extension registration time.
+// This describes capabilities only; all enforcement remains in the Go bridge.
+function conversationPermissions(): string {
+	const config = JSON.parse(process.env.PI_MSG_CAPABILITIES ?? "{}");
+	const owner = config.owner ? `owner ${config.owner}` : "configured owner";
+	const rooms = Array.isArray(config.rooms)
+		? (config.rooms.length ? ` or configured rooms (${config.rooms.join(", ")})` : "")
+		: " or configured rooms";
+	return `${owner}${rooms}${config.arbitraryPeers === true ? "; also other valid peer JIDs, not unconfigured rooms" : " only; room membership does not authorize DMs"}.`;
+}
+
 export default function xmppTools(pi: ExtensionAPI) {
+	const permissions = conversationPermissions();
 	// Captured on session_start; used by tool handlers to reach pi-msg.
 	let ui: RelayUI | undefined;
 	let sessionIdentity = "";
@@ -577,7 +589,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 		if (!account && !text) return;
 		let systemPrompt = event.systemPrompt;
 		if (account) {
-			systemPrompt = `You are **${account}**. This is your identity in Zach\'s fleet.
+			systemPrompt = `You are ${account}.
 
 ${systemPrompt}`;
 		}
@@ -606,17 +618,12 @@ ${systemPrompt}`;
 		pi.registerTool({
 			name: "send_reaction",
 			label: "React (XMPP)",
-			description:
-				"React to a chat message with a single emoji over XMPP (XEP-0444). By default reacts to the most recent incoming message; pass messageId to target an arbitrary message by its stanza ID.",
+			description: "Add an emoji reaction to an XMPP message.",
 			promptSnippet: "React to a chat message with an emoji",
-			promptGuidelines: [
-				"Use send_reaction to acknowledge a message with one emoji (e.g. 👀 for seen, ✅ for done).",
-				"To react to a specific message, include its stanza ID as messageId. The from-JID is resolved from the message history cache; if that fails you may also supply the from-JID explicitly.",
-			],
 			parameters: Type.Object({
 				emoji: Type.String({ description: "A single emoji, e.g. 👀 or ✅" }),
 				messageId: Type.Optional(Type.String({ description: "Optional XMPP stanza ID of the target message; omitting targets the most recent incoming message" })),
-				from: Type.Optional(Type.String({ description: "Optional full JID of the target message's author; resolved automatically from message history cache when messageId is provided" })),
+				from: Type.Optional(Type.String({ description: "Optional author JID fallback when automatic resolution from message history fails" })),
 			}),
 			async execute(_toolCallId, params) {
 				const p = params as { emoji?: string; messageId?: string; from?: string };
@@ -647,21 +654,13 @@ ${systemPrompt}`;
 		pi.registerTool({
 			name: "send_message",
 			label: "Send chat message (XMPP)",
-			description:
-				"Send a message explicitly to the configured owner (1:1) or a configured room (groupchat). Room members are only mention targets within their room, NOT DM destinations. Send to the room JID and mention the member in text. Other valid peer JIDs are allowed only when account config `allowArbitraryJid` is true. Final assistant text is internal to the harness and is never sent automatically. `reply_to` is optional: omit it for ordinary replies; use a `[stanza …]` message ID when explicitly threading or when it materially helps associate a follow-up. Never use an archive `[id …]` cursor. Set `reply_timeout_seconds` only to opt into a one-shot internal reminder when no qualifying reply arrives; omission creates no watch.",
+			description: "Send one XMPP chat message to one destination. Multiple messages or recipients require separate calls.",
 			promptSnippet: "Send a message to an XMPP conversation",
-			promptGuidelines: [
-				"Use send_message for every outbound chat message; a final assistant response is not delivered to chat.",
-				"Choose `to` from the conversation JID (`from:`) or use the owner JID to message the owner. `sender:` identifies the author, not an authorized DM destination. To address a room member, send to the room JID and mention the member in text.",
-				"Use `reply_to` when you want to thread a reply to a specific stanza or threading materially helps associate a follow-up; otherwise omit it. A message ID from read_messages is valid. Multiple recipients require multiple calls.",
-				"An optional positive finite `reply_timeout_seconds` arms a non-blocking bridge watch after sending. DMs from the peer satisfy it; rooms require a direct ping to you or a threaded reply to this stanza, not general chatter or broadcasts. The reminder may be handled silently. One watch per conversation; a later watched send replaces it. Watches are process-local and cleared on shutdown.",
-				"Only the configured owner and configured rooms are allowed by default. Room membership never grants DM permission. `allowArbitraryJid: true` permits other valid peer JIDs.",
-			],
 			parameters: Type.Object({
-				to: Type.String({ description: "Destination JID: configured owner (1:1) or configured room (groupchat); room members are mention targets, NOT DM destinations; other peer JIDs require allowArbitraryJid=true" }),
-				text: Type.String({ description: "Message body to send; when addressing a room member, send to the room JID and mention the member here" }),
-				reply_to: Type.Optional(Type.String({ description: "Optional stanza ID from an incoming message or read_messages result to thread this reply under" })),
-				reply_timeout_seconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Opt-in one-shot internal reminder if no qualifying reply arrives after this many seconds; omit for no watch" })),
+				to: Type.String({ description: `Destination JID: ${permissions} Use noop to send nothing.` }),
+				text: Type.String({ description: "Message body to send" }),
+				reply_to: Type.Optional(Type.String({ description: "Optional threading; normally omit. Use an incoming/history stanza ID from the same conversation, never an archive cursor." })),
+				reply_timeout_seconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Positive finite seconds; omit for no watch. One-shot internal reminder, no automatic external follow-up; may be handled silently. DMs qualify from the peer; rooms require direct address or a reply to the watched stanza, not broadcasts/general chatter. One watch per conversation; later watched sends replace it; shutdown discards watches." })),
 			}),
 			async execute(_toolCallId, params) {
 				const p = params as { to?: string; text?: string; reply_to?: string; reply_timeout_seconds?: number };
@@ -693,19 +692,10 @@ ${systemPrompt}`;
 		pi.registerTool({
 			name: "read_messages",
 			label: "Read conversation history (XMPP)",
-			description:
-				"Read an XMPP room or 1:1 chat from its XEP-0313 archive. `target` is required: pass the owner JID, a configured room JID, or an allowed peer JID. Defaults to the newest 30 (max 100) messages; `since` and `before` narrow/page the window. By default, only the owner JID and configured rooms are readable; account config `allowArbitraryJid` can permit other peers. Returns messages oldest first with `[id …]` as the archive pagination cursor and `[stanza …]` as the message ID for send_message's `reply_to`. Includes sent lines marked `[we sent]`. Reading does not send a message.",
+			description: "Read XMPP history without sending anything. Results are oldest first; sent lines are marked [we sent]. [id …] is an archive cursor; [stanza …] is a message ID.",
 			promptSnippet: "Read room or 1:1 conversation history",
-			promptGuidelines: [
-				"Use read_messages when you need earlier context or a room conversation you were not addressed in.",
-				"Pass the conversation JID as the required `target` on every call. Use the owner JID for 1:1 history or a configured room JID for room history; other peers require `allowArbitraryJid: true`.",
-				"By default, only the owner and configured rooms are readable. Other peers require `allowArbitraryJid: true` in account config.",
-				"Pass `since` (RFC 3339 timestamp or relative age like 2h) to bound the read, and `before` using an archive `[id …]` cursor to page older.",
-				"To thread a reply when useful, call send_message with `[stanza …]` as its optional `reply_to`; otherwise omit it. Never use `[id …]` for `reply_to`.",
-				"read_messages only reads. Use send_message to send a chat message; final assistant text is internal to the harness.",
-			],
 			parameters: Type.Object({
-				target: Type.String({ description: "Required conversation JID: owner, configured room, or allowed peer JID" }),
+				target: Type.String({ description: `Required conversation JID: ${permissions}` }),
 
 				limit: Type.Optional(Type.Number({ description: "How many messages to fetch (default 30, max 100)" })),
 				since: Type.Optional(
@@ -745,15 +735,10 @@ ${systemPrompt}`;
 		pi.registerTool({
 			name: "send_file",
 			label: "Send file (XMPP)",
-			description:
-				"Upload a local file and deliver it to the human over XMPP (XEP-0363 HTTP Upload). The path must be absolute and readable on this host. Defaults to the current conversation; only the configured owner or configured rooms are allowed, even when `allowArbitraryJid` is true. Room membership does not authorize a direct file transfer. Sending a file does not count as a chat reply; use send_message if a response is needed. Returns the share URL of the uploaded file, but DO NOT repeat the URL in the XMPP chat itself — the recipient can already see the file there. The URL is only for reuse in other places (e.g. a GitHub PR description).",
+			description: "Upload and deliver a file; not a substitute for a required chat reply. The returned URL can be reused elsewhere, but do not repost it in the receiving XMPP conversation.",
 			promptSnippet: "Send a local file (log, diff, image) to the human over chat",
-			promptGuidelines: [
-				"Use send_file to deliver a real local file to the human; give an absolute path. It is for files, not for pasting text, and it does not replace send_message when a chat reply is required.",
-				"The tool result includes the share URL — reuse it (e.g. in a PR description or follow-up message) instead of describing the file.",
-			],
 			parameters: Type.Object({
-				path: Type.String({ description: "Absolute path to a local file on this host" }),
+				path: Type.String({ description: "Absolute readable path to a local file on this host" }),
 				to: Type.Optional(Type.String({ description: "Configured owner or configured room JID only; defaults to the current conversation; room members and arbitrary peers are not file destinations" })),
 			}),
 			async execute(_toolCallId, params) {

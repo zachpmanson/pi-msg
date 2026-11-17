@@ -87,8 +87,8 @@ func TestMatchTriggerPerRoom(t *testing.T) {
 	if addressed, _ := b.matchTrigger("other@muc.x.com", "pi: go"); addressed {
 		t.Error("the account trigger must not apply where the room overrides it")
 	}
-	// An unknown room (e.g. the error room) falls back to the account trigger.
-	if got := b.acct.TriggerFor("errors@muc.x.com"); got != "pi" {
+	// An unknown room falls back to the account trigger.
+	if got := b.acct.TriggerFor("unconfigured@muc.x.com"); got != "pi" {
 		t.Errorf("TriggerFor(unknown room) = %q, want the account default pi", got)
 	}
 }
@@ -716,16 +716,15 @@ func TestPeerHandoffsHaveNoTurnCap(t *testing.T) {
 // (#106), so its failure modes matter: an unjoined room must be refused, and a
 // readable one must render something the model can act on.
 func TestReadRoomRelayRejectsUnjoinedRoom(t *testing.T) {
-	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", RoomTrigger: "pi"}
+	acct := ResolvedAccount{Owner: "zach@x", Name: "t", Rooms: []string{"team@muc.x"}, RoomTrigger: "pi"}
 	b := newTestBridge(acct)
 	var buf bytes.Buffer
 	b.rpc = &RPCClient{stdin: &nopClose{buf: &buf}, mu: sync.Mutex{}}
 
-	// The error room is the interesting case: joined at the XMPP layer, but
-	// write-only by construction, so it must not be readable.
-	b.handleToolRelay("r1", `{"action":"read_messages","target":"errors@muc.x"}`)
+	// An unconfigured room must not be readable in restricted mode.
+	b.handleToolRelay("r1", `{"action":"read_messages","target":"unconfigured@muc.x"}`)
 	out := buf.String()
-	if !strings.Contains(out, "not a readable conversation") {
+	if !strings.Contains(out, "not an allowed target") {
 		t.Errorf("unjoined room not refused: %q", out)
 	}
 	if strings.Contains(out, "team@muc.x") && strings.Contains(out, "archived message") {
@@ -982,16 +981,13 @@ func TestBareMentionCounter(t *testing.T) {
 	}
 }
 
-// The seeded messaging contract must state the new rule. It is the only place the
-// false-positive cost of bare mentions is disclosed to the agents living with
-// it, and the old wording said the opposite (#106).
+// Room mechanics belong only in the room seed.
 func TestRoutingContractStatesBareMentions(t *testing.T) {
 	b := roomBridge()
-	got := b.messagingContract()
-	if strings.Contains(got, "a name without @ does not reach") {
-		t.Errorf("messaging contract still denies bare mentions: %q", got)
-	}
-	if !strings.Contains(got, "mention the intended agent by name or `@name`") {
-		t.Errorf("messaging contract does not state the room mention rule: %q", got)
+	got := b.roomsContract()
+	for _, want := range []string{"bare name or @name", "@everyone", "@free", "quotations or code", "Unnamed owner", "known stanzas", "not delivered or buffered", "read_messages"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("room contract missing %q: %s", want, got)
+		}
 	}
 }

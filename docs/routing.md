@@ -65,8 +65,7 @@ stably sorted categories:
   grouped by room JID, including anonymous members without a known real JID.
 
 Room departures and reconnects change only the live mention names, never the
-owner/room permissions. The write-only error room, unconfigured rooms, and
-archived senders do not contribute destinations or mention names.
+owner/room permissions. Unconfigured rooms and archived senders do not contribute destinations or mention names.
 
 Choose the destination from the incoming `from:` conversation JID, or use the
 configured owner JID to message the owner. `sender:` identifies the author;
@@ -150,7 +149,14 @@ text does not count as a delivery. Heartbeat and reaction-ack runs may remain
 silent by design.
 
 Bridge-injected prompts and tool results use `[pi-msg: <topic>: …]` wrappers;
-they are not XMPP messages. The initial session seed names the explicit tools
-and the account's allowlist. On upgrade, a changed contract hash causes a
+they are not XMPP messages. The initial session seed names transport and routing rules; tool parameters
+describe effective permissions. On upgrade, a changed contract hash causes a
 resumed session to receive the current seed rather than retaining the old
 `to:`-routing instructions.
+
+## Retired error rooms
+
+The dedicated error-MUC feature is retired. Remove `errorRoom` and any
+`rooms` entry with `role: "error"`; both are rejected. Do not convert an old
+error-role entry into a normal room. Normal rooms, owner/model-failure alerts,
+and message permissions are unchanged.

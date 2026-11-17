@@ -466,10 +466,9 @@ func TestReplayDrainNotArmed(t *testing.T) {
 // every change.
 func TestPresenceTargets(t *testing.T) {
 	b := NewXMPPBridge(ResolvedAccount{
-		Owner:     "zach@x.com",
-		Nick:      "pi",
-		Rooms:     []string{"team@muc.x.com", "Ops@MUC.x.com"},
-		ErrorRoom: "errors@muc.x.com",
+		Owner: "zach@x.com",
+		Nick:  "pi",
+		Rooms: []string{"team@muc.x.com", "Ops@MUC.x.com"},
 	}, func(InboundMessage) {}, func(_, _ string) {})
 
 	// Before any join is confirmed there must be NO targets. Run announces
@@ -500,14 +499,14 @@ func TestPresenceTargets(t *testing.T) {
 		}
 	}
 
-	// The error room is write-only and out of the agent-visible set; nothing
-	// reads presence there, so it must not be targeted even once joined.
+	// An unconfigured room must not become a presence target from a stale
+	// self-nick entry.
 	b.mu.Lock()
-	b.selfNick["errors@muc.x.com"] = "pi"
+	b.selfNick["unconfigured@muc.x.com"] = "pi"
 	b.mu.Unlock()
 	for _, tgt := range b.presenceTargets() {
-		if strings.HasPrefix(tgt, "errors@") {
-			t.Errorf("error room was targeted: %q", tgt)
+		if strings.HasPrefix(tgt, "unconfigured@") {
+			t.Errorf("unconfigured room was targeted: %q", tgt)
 		}
 	}
 

@@ -133,8 +133,6 @@ func printAccountSummary(a ResolvedAccount) {
 			fmt.Fprintf(out, "  %s  trigger=%q reactions=%t\n", r, a.TriggerFor(r), a.ReactionsFor(r))
 		}
 	}
-	if a.ErrorRoom != "" {
-		fmt.Fprintf(out, "error room (write-only): %s\n", a.ErrorRoom)
-	}
+
 	fmt.Fprintf(out, "tools: %s\n", strings.Join(toolNames(a), ", "))
 }
