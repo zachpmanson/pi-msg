@@ -282,7 +282,13 @@ func TestNextAndAmpersandBackgroundTransport(t *testing.T) {
 			f.command("new question", f.b.acct.Owner)
 			touchNext(t, filepath.Join(f.dir, "release"))
 			awaitNext(t, "worker terminal", func() bool { j, e := loadReconcile(dir); return e == nil && j.State == "completed" })
-			f.b.pollReconciles()
+			// Terminal metadata precedes runner.lock release; observe delivery,
+			// not just publication of the worker's terminal state.
+			awaitNext(t, "completion reported", func() bool {
+				f.b.pollReconciles()
+				_, err := os.Stat(filepath.Join(dir, "reported"))
+				return err == nil
+			})
 			wire := f.wire.String()
 			if strings.Contains(wire, `to="zach@x"`) || !strings.Contains(wire, "issues reconciled; wiki unchanged") || !strings.Contains(wire, `type="groupchat"`) {
 				t.Fatalf("completion destination changed: %s", wire)
@@ -602,7 +608,11 @@ func TestNextCustomSkillAndFastCompletion(t *testing.T) {
 	f.command("&", f.b.acct.Owner)
 	dir := f.jobs(t)[0]
 	awaitNext(t, "fast completion", func() bool { j, _ := loadReconcile(dir); return j != nil && j.State == "completed" })
-	f.b.pollReconciles()
+	awaitNext(t, "fast completion reported", func() bool {
+		f.b.pollReconciles()
+		_, err := os.Stat(filepath.Join(dir, "reported"))
+		return err == nil
+	})
 	if !strings.Contains(f.wire.String(), "reconciliation ran in background") || !strings.Contains(f.wire.String(), "completed") {
 		t.Fatalf("missing real fast worker notices: %s", f.wire.String())
 	}

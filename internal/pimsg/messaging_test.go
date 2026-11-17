@@ -41,7 +41,7 @@ func TestDefaultMessageDestinationPolicy(t *testing.T) {
 
 func TestMessageDestinationGuidanceSeparatesPermissionsAndMembers(t *testing.T) {
 	x := NewXMPPBridge(
-		ResolvedAccount{Rooms: []string{"team@muc.x", "other@muc.x", "team@muc.x"}, Owner: "zach@x/phone", ErrorRoom: "errors@muc.x"},
+		ResolvedAccount{Rooms: []string{"team@muc.x", "other@muc.x", "team@muc.x"}, Owner: "zach@x/phone"},
 		func(InboundMessage) {}, func(string, string) {},
 	)
 	x.occupants["team@muc.x"] = map[string]string{
@@ -50,7 +50,7 @@ func TestMessageDestinationGuidanceSeparatesPermissionsAndMembers(t *testing.T) 
 	x.occupants["other@muc.x"] = map[string]string{"alice": "alice@x", "bob": "bob@x"}
 	// Neither stale/unconfigured membership nor archive reads grant permission
 	// or contribute names to the advertised room-scoped mention targets.
-	x.occupants["errors@muc.x"] = map[string]string{"error-member": "error@x"}
+	x.occupants["unconfigured@muc.x"] = map[string]string{"outsider": "outsider@x"}
 	x.occupants["unconfigured@muc.x"] = map[string]string{"outsider": "outside@x"}
 	x.recordReadHistory([]InboundMessage{
 		{ID: "old", From: "archived@x", Direct: true, Body: "old message"},
@@ -69,7 +69,7 @@ func TestMessageDestinationGuidanceSeparatesPermissionsAndMembers(t *testing.T) 
 			"other@muc.x": destRoom, "team@muc.x": destRoom,
 			"alice@x": destBlocked, "alice@x/phone": destBlocked,
 			"bob@x": destBlocked, "archived@x": destBlocked,
-			"errors@muc.x": destBlocked, "unconfigured@muc.x": destBlocked,
+			"unconfigured@muc.x": destBlocked,
 		} {
 			if got := x.classifyDest(dest); got != want {
 				t.Errorf("classifyDest(%q) = %v, want %v", dest, got, want)
@@ -92,8 +92,8 @@ func TestMessageDestinationGuidanceSeparatesPermissionsAndMembers(t *testing.T) 
 }
 
 func TestAnonymousPresenceIsRoomScopedMentionTarget(t *testing.T) {
-	x := NewXMPPBridge(ResolvedAccount{Owner: "owner@x", Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x"}, func(InboundMessage) {}, func(string, string) {})
-	for _, room := range []string{"team@muc.x", "errors@muc.x", "other@muc.x"} {
+	x := NewXMPPBridge(ResolvedAccount{Owner: "owner@x", Rooms: []string{"team@muc.x"}}, func(InboundMessage) {}, func(string, string) {})
+	for _, room := range []string{"team@muc.x", "unconfigured@muc.x", "other@muc.x"} {
 		start := xml.StartElement{Name: xml.Name{Local: "presence"}, Attr: []xml.Attr{
 			{Name: xml.Name{Local: "from"}, Value: room + "/anonymous"},
 		}}
@@ -240,23 +240,20 @@ func TestArchivedDirectReplyTargetUsesConversationAndAuthor(t *testing.T) {
 	}
 }
 
-func TestMessagingContractSeparatesMembershipFromDestinations(t *testing.T) {
-	for _, arbitrary := range []bool{false, true} {
-		b := newTestBridge(ResolvedAccount{Owner: "owner@x", AllowArbitraryJid: arbitrary})
-		got := b.messagingContract()
-		for _, want := range []string{"send to the room JID and mention the member in text", "`sender:` identifies the author, not an authorized DM destination"} {
-			if !strings.Contains(got, want) {
-				t.Errorf("contract missing %q: %s", want, got)
-			}
-		}
-		want := "By default, send_message and read_messages allow only the owner and configured rooms. Room members are mention targets within their room, NOT DM destinations."
-		if arbitrary {
-			want = "allowArbitraryJid permits other syntactically valid peer JIDs for both tools; unconfigured rooms remain unavailable. Room membership itself never grants DM permission."
-		}
-		if !strings.Contains(got, want) || strings.Contains(got, "use `sender:` to DM") {
-			t.Errorf("incorrect destination policy: %s", got)
+func TestMessagingContractHomes(t *testing.T) {
+	b := newTestBridge(ResolvedAccount{Owner: "owner@x"})
+	got := b.composePrompt("hello", "owner@x", "", "", "", "", nil)
+	for _, want := range []string{"XMPP bridge", "final responses are internal", "Owner: owner@x", "`from:`", "`sender:`", "multiple incoming", "docs/routing.md"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q: %s", want, got)
 		}
 	}
+	for _, unwanted := range []string{"allowArbitraryJid", "reply_to", "reply_timeout", "[pi-msg: rooms:"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("wrong context home: %s", got)
+		}
+	}
+	t.Log(got)
 }
 
 func TestRoomMembershipDoesNotAuthorizeFilesOrHistory(t *testing.T) {

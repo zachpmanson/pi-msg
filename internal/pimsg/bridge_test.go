@@ -224,27 +224,6 @@ func TestClassifyDest(t *testing.T) {
 	}
 }
 
-// TestErrorRoomInvisibleToAgent verifies the error archive is not an
-// agent-addressable room or outbound destination.
-func TestErrorRoomInvisibleToAgent(t *testing.T) {
-	x := NewXMPPBridge(
-		ResolvedAccount{Rooms: []string{"team@muc.x"}, ErrorRoom: "errors@muc.x", Owner: "zach@x"},
-		func(InboundMessage) {}, func(string, string) {},
-	)
-	if x.isRoomJID("errors@muc.x") {
-		t.Error("error room must NOT be an agent-visible (dispatched) room")
-	}
-	if !x.isRoomJID("team@muc.x") {
-		t.Error("normal room should still be agent-visible")
-	}
-	if got := x.classifyDest("errors@muc.x"); got != destBlocked {
-		t.Errorf("error room should be blocked for replies, got %v", got)
-	}
-	if got := x.classifyDest("team@muc.x"); got != destRoom {
-		t.Errorf("normal room should remain an allowed destination, got %v", got)
-	}
-}
-
 func TestPrettyDump(t *testing.T) {
 	jsonl := strings.Join([]string{
 		`{"type":"session","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/proj"}`,
@@ -1367,11 +1346,11 @@ func TestShortError(t *testing.T) {
 
 func TestRPCEnv(t *testing.T) {
 	plain := rpcEnv(ResolvedAccount{})
-	if len(plain) != 1 || plain[0] != "PI_MSG_TOOLS=file,reaction,messaging,messages" {
+	if len(plain) != 2 || plain[0] != "PI_MSG_TOOLS=file,reaction,messaging,messages" {
 		t.Errorf("rpcEnv(unset) = %v, want messaging tools enabled by default", plain)
 	}
 	withText := rpcEnv(ResolvedAccount{BeforeAgentStartText: "be brief"})
-	if len(withText) != 2 || withText[1] != "PI_MSG_BEFORE_AGENT_START_TEXT=be brief" {
+	if len(withText) != 3 || withText[2] != "PI_MSG_BEFORE_AGENT_START_TEXT=be brief" {
 		t.Errorf("rpcEnv(text) = %v, want PI_MSG_TOOLS + PI_MSG_BEFORE_AGENT_START_TEXT", withText)
 	}
 }

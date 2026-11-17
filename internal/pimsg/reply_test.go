@@ -163,8 +163,10 @@ func TestStanzaIDSurfacedWithoutRoomReactions(t *testing.T) {
 	if strings.Contains(prompt, "react-to:") {
 		t.Errorf("reactions are off, so react-to must not appear:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "reply_to") {
-		t.Errorf("the messaging contract must document reply_to:\n%s", prompt)
+	// Optional threading guidance lives in send_message's reply_to schema,
+	// not in the per-session transport seed.
+	if strings.Contains(b.messagingContract(), "reply_to") {
+		t.Error("threading guidance duplicated into messaging seed")
 	}
 }
 
