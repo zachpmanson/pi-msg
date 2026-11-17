@@ -2216,8 +2216,8 @@ func (b *XMPPBridge) currentPresence() (show, status string) {
 // reconnectPresence decides what presence a (re)connect announces, given the
 // presence we already hold and the startup label. Normally the startup label
 // wins, so the roster shows "awake"/"resumed" rather than a stale idle label
-// from a previous session. An agent that is already away keeps its away
-// presence: away describes the agent, not the socket, and the idle watcher
+// from a previous session. An agent that is already away/xa keeps its idle
+// presence: it describes the agent, not the socket, and the idle watcher
 // announces an away period once (awayAnnounced), so a reconnect that cleared it
 // would leave the room reading "listening" until the agent next worked. That is
 // not cosmetic — @free addresses only away agents (#130), so a cleared away
@@ -2225,7 +2225,7 @@ func (b *XMPPBridge) currentPresence() (show, status string) {
 // runtime work (parent turn, process, or subagent), not socket state: preserve
 // it until the corresponding lifecycle update clears it.
 func reconnectPresence(show, status, startStatus string) (string, string) {
-	if show == "away" || show == "dnd" {
+	if show == "away" || show == "xa" || show == "dnd" {
 		return show, status
 	}
 	return "", startStatus

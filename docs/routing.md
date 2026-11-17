@@ -37,8 +37,11 @@ question or maintenance hold; do not reflexively retry every rejection with it.
 The flag never grants destination permission or bypasses reply validation.
 Rejected calls send no body or typing stanza, arm no reply watch and do not
 count as delivery. Text is not rewritten and mixed-recipient room sends are not
-partially delivered. The check is a local preflight snapshot, not a transaction
-with remote presence changes.
+partially delivered. All actual transport chunks are checked before the first
+stanza is sent, including mentions or broadcasts exposed when a long quoted
+line is split. Reply-author checks follow the first-chunk-only reply stamp.
+The check is a local preflight snapshot, not a transaction with remote presence
+changes.
 
 Peer recognition uses the advertised `http://pi-msg` XEP-0115 caps node in live
 presence; this is a notification heuristic, not verified identity or an
@@ -46,7 +49,8 @@ authorization boundary. Human clients, the configured owner, self-addressed
 messages, offline peers and unknown presence are exempt. A missing caps child
 may retain identity on the same live endpoint; a changed client/real JID,
 unavailable/error, room departure or reconnect invalidates the relevant state.
-History alone never establishes current presence.
+History alone never establishes current presence. A reconnect preserves our
+own away/xa show and status rather than resetting the published idle state.
 
 Room checks use current room/nickname presence and the same bare-name,
 `@name`, leading/inline address and quote/code filtering as inbound delivery.
@@ -55,9 +59,10 @@ They also check the current author of a threaded reply and broadcasts
 differ from the nickname are not advertised/discovered, so only nickname-based
 addressing can be checked. The guard does not change inbound broadcast routing.
 An anonymous occupant can still be recognized through its advertised caps.
-Direct full-JID checks use only that exact observed resource; unknown resources
-do not inherit a sibling's status. Bare-JID checks aggregate observed direct
-resources and room witnesses: any known nonsleeping witness allows the send;
+JIDs are normalized with the same parser used for stanza delivery, preserving
+resource case. Direct full-JID checks use only that exact observed resource;
+unknown resources do not inherit a sibling's status. Bare-JID checks aggregate
+observed direct resources and room witnesses: any known nonsleeping witness allows the send;
 otherwise a recognized peer with only away/xa witnesses requires the override.
 
 Presence is not proof that a shared resource is free. This feature introduces

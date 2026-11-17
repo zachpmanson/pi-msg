@@ -7,10 +7,12 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"mellium.im/xmpp/jid"
 )
 
 // peerPresence is live notification evidence, not an authenticated identity or
-// resource lock. Keys are exact presence senders (room/nick or a direct JID).
+// resource lock. Keys are canonical presence senders (room/nick or a direct JID).
 // An advertised pi-msg caps node identifies peers without treating humans as bots.
 type peerPresence struct {
 	jid   string // real bare JID, if disclosed by the room
@@ -34,10 +36,25 @@ func parseAllowWake(raw json.RawMessage) (bool, error) {
 	}
 }
 
+// canonicalPeerJID uses the same normalization as stanza delivery. In
+// particular the bare JID is case-mapped but resource case remains significant.
+func canonicalPeerJID(raw string) string {
+	parsed, err := jid.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.String()
+}
+
 // recordPeerPresenceLocked records only available presence. A missing caps
 // element may retain identity on the same live endpoint; an explicit different
 // client or a changed real JID replaces it. Unavailable/error clears it instead.
 func (b *XMPPBridge) recordPeerPresenceLocked(from, real string, toks []xml.Token) {
+	from = canonicalPeerJID(from)
+	if from == "" {
+		return
+	}
+	real = bareJid(canonicalPeerJID(real))
 	old := b.peerPresence[from]
 	node, hasCaps := peerCapsNode(toks)
 	agent := old.agent && old.jid == real
@@ -68,6 +85,10 @@ func peerCapsNode(toks []xml.Token) (string, bool) {
 }
 
 func (b *XMPPBridge) forgetPeerPresenceLocked(from string) {
+	from = canonicalPeerJID(from)
+	if from == "" {
+		return
+	}
 	delete(b.peerPresence, from)
 	// A bare unavailable/error invalidates every resource of that direct JID.
 	if resourcepart(from) == "" {
@@ -82,8 +103,8 @@ func (b *XMPPBridge) forgetPeerPresenceLocked(from string) {
 func sleepingShow(show string) bool { return show == "away" || show == "xa" }
 
 func (b *XMPPBridge) wakeExemptJID(to string) bool {
-	bare := bareJid(to)
-	return bare != "" && (bare == b.ownerBare || bare == bareJid(b.acct.JID))
+	bare := bareJid(canonicalPeerJID(to))
+	return bare != "" && (bare == bareJid(canonicalPeerJID(b.ownerBare)) || bare == bareJid(canonicalPeerJID(b.acct.JID)))
 }
 
 // sleepingMessageTargets snapshots all relevant live evidence under one lock.
@@ -91,6 +112,16 @@ func (b *XMPPBridge) wakeExemptJID(to string) bool {
 // observed resources/room witnesses, allowing any known nonsleeping witness.
 // An unknown full resource never inherits a sibling resource's sleeping state.
 func (b *XMPPBridge) sleepingMessageTargets(to, text string, reply *replyTarget, room bool) []string {
+	to = canonicalPeerJID(to)
+	if to == "" {
+		return nil
+	}
+	// Preflight exactly what SendRoomReply will deliver, since splitting a
+	// quoted line can expose a mention in a later, now-unquoted stanza.
+	var parts []string
+	if room {
+		parts = chunk(text, maxBody)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !room {
@@ -124,28 +155,32 @@ func (b *XMPPBridge) sleepingMessageTargets(to, text string, reply *replyTarget,
 	}
 
 	roomJID := bareJid(to)
-	scan := stripUnquoted(strings.TrimSpace(text))
-	broadcast := containsBroadcast(scan) || containsFreeBroadcast(scan)
-	var targets []string
-	for endpoint, p := range b.peerPresence {
-		if bareJid(endpoint) != roomJID || !p.agent || !sleepingShow(p.show) || b.wakeExemptJID(p.jid) {
-			continue
+	ownNick := b.selfNick[roomJID]
+	if ownNick == "" {
+		ownNick = b.acct.Nick
+	}
+	targetSet := make(map[string]bool)
+	for i, part := range parts {
+		scan := stripUnquoted(strings.TrimSpace(part))
+		broadcast := containsBroadcast(scan) || containsFreeBroadcast(scan)
+		partReply := replyForChunk(i, reply)
+		for endpoint, p := range b.peerPresence {
+			if bareJid(endpoint) != roomJID || !p.agent || !sleepingShow(p.show) || b.wakeExemptJID(p.jid) {
+				continue
+			}
+			nick := resourcepart(endpoint)
+			if nick == "" || nick == ownNick {
+				continue
+			}
+			addressed, _ := matchTriggerName(part, nick)
+			if broadcast || addressed || (partReply != nil && canonicalPeerJID(partReply.author) == endpoint) {
+				targetSet[nick+" ("+p.show+")"] = true
+			}
 		}
-		nick := resourcepart(endpoint)
-		ownNick := b.selfNick[roomJID]
-		if ownNick == "" {
-			ownNick = b.acct.Nick
-		}
-		if nick == "" || nick == ownNick {
-			continue
-		}
-		if broadcast || (reply != nil && reply.author == endpoint) {
-			targets = append(targets, nick+" ("+p.show+")")
-			continue
-		}
-		if addressed, _ := matchTriggerName(text, nick); addressed {
-			targets = append(targets, nick+" ("+p.show+")")
-		}
+	}
+	targets := make([]string, 0, len(targetSet))
+	for target := range targetSet {
+		targets = append(targets, target)
 	}
 	sort.Strings(targets)
 	return targets
