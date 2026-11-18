@@ -13,10 +13,10 @@
         "aarch64-linux"
       ];
       # The pi-coding-agent version this bridge requires at runtime (spawned as
-      # `pi --mode rpc`). pi-msg targets pi 0.84.0+ (see README); /abort needs
-      # `clear_queue`, added in 0.84.4. Single source of truth — deployments
-      # read it via passthru instead of pinning their own copy.
-      piAgentVersion = "0.84.4";
+      # `pi --mode rpc`). Pi 1.5.2 supplies the native GPT-6.2 Sol catalog;
+      # runtime/extension/XMPP compatibility is gated before fleet activation.
+      # Single source of truth — deployments read this via passthru.
+      piAgentVersion = "1.5.2";
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
     in
     {
