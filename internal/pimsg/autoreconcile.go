@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,21 +38,48 @@ func (b *Bridge) autoPath() string {
 	return strings.TrimSuffix(inboxPath(b.acct.Name), ".inbox.jsonl") + ".auto.json"
 }
 func (b *Bridge) autoRequestPath() string { return b.autoPath() + ".request" }
+
+const autoOverflowDiagnostic = "autoreconcile state exceeds private 2 MiB byte cap; automatic cleanup disabled until explicit history reconciliation and repair"
+
+var errAutoOverflow = errors.New(autoOverflowDiagnostic)
+
+func (b *Bridge) autoDisabledPath() string { return b.autoPath() + ".disabled" }
 func (b *Bridge) saveAutoLocked() error {
+	if b.acct.AutoreconcileTimeout <= 0 {
+		return nil
+	}
 	b.auto.state.Version = 1
 	raw, err := json.Marshal(b.auto.state)
 	if err != nil {
 		return err
 	}
 	if len(raw) > 2<<20 {
-		return fmt.Errorf("autoreconcile state exceeds private 2 MiB byte cap; cleanup disabled until repair")
+		if err := durableWritePrivate(b.autoDisabledPath(), []byte(autoOverflowDiagnostic+"\n")); err != nil {
+			return fmt.Errorf("%s; cannot persist disable marker: %w", autoOverflowDiagnostic, err)
+		}
+		return errAutoOverflow
 	}
 	return durableWritePrivate(b.autoPath(), raw)
 }
-func (b *Bridge) loadAuto() error {
+func (b *Bridge) loadAuto() (loadErr error) {
 	if b.acct.AutoreconcileTimeout <= 0 {
 		return nil
 	}
+	// A sticky overflow marker disables only automatic cleanup, not foreground
+	// startup or the existing exact-target recovery below.
+	if _, err := os.Stat(b.autoDisabledPath()); err == nil {
+		b.auto.err = errAutoOverflow
+		b.log("warning", autoOverflowDiagnostic)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("autoreconcile disable marker: %w", err)
+	}
+	defer func() {
+		if errors.Is(loadErr, errAutoOverflow) {
+			b.auto.err = loadErr
+			b.log("warning", loadErr.Error())
+			loadErr = nil
+		}
+	}()
 	raw, err := os.ReadFile(b.autoPath())
 	if os.IsNotExist(err) {
 		return nil
@@ -71,15 +99,18 @@ func (b *Bridge) loadAuto() error {
 	// Reapply independent current quotas before any future selection. The
 	// attempt's immutable seed remains untouched: its receipt proves those bytes.
 	b.auto.state.History.retireUnprovenRoomOrigins()
-	b.auto.state.History.Recent = autoTail(b.auto.state.History.Recent, b.acct.AutoreconcileHistoryMessages)
-	b.auto.state.History.Owner = autoTail(b.auto.state.History.Owner, b.acct.AutoreconcileOwnerHistoryMessages)
+	b.auto.state.History.normalize(b.acct.AutoreconcileHistoryMessages, b.acct.AutoreconcileOwnerHistoryMessages, b.acct.Owner, b.acct.JID)
 	trimmed, err := json.Marshal(b.auto.state)
 	if err != nil {
 		return err
 	}
 	if string(trimmed) != string(raw) {
 		if err = b.saveAutoLocked(); err != nil {
-			return err
+			if !errors.Is(err, errAutoOverflow) {
+				return err
+			}
+			b.auto.err = err
+			b.log("warning", err.Error())
 		}
 	}
 	a := b.auto.state.Attempt

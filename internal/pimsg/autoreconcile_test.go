@@ -107,13 +107,13 @@ func TestAutoreconcileHistoryFloorUnionChronologyAndBounds(t *testing.T) {
 	// Overlap is deduplicated and independent explicit zero windows work.
 	var h autoHistory
 	for n := 0; n < 4; n++ {
-		h.add(autoChat{Key: fmt.Sprint(n), Owner: true, At: at.Add(time.Duration(n))}, 10, 10)
+		h.add(autoChat{Key: fmt.Sprint(n), Owner: true, Direction: "in", At: at.Add(time.Duration(n))}, 10, 10)
 	}
 	if len(h.selected()) != 4 {
 		t.Fatal("union duplicated overlap")
 	}
 	var empty autoHistory
-	empty.add(autoChat{Key: "x", Owner: true}, 0, 0)
+	empty.add(autoChat{Key: "x", Owner: true, Direction: "in"}, 0, 0)
 	if len(empty.selected()) != 0 || !strings.Contains(empty.seed("old", ""), "read_messages") {
 		t.Fatal("zero counts lost guidance")
 	}
@@ -121,6 +121,8 @@ func TestAutoreconcileHistoryFloorUnionChronologyAndBounds(t *testing.T) {
 func TestAutoreconcileSeedRecapFirstGuidance(t *testing.T) {
 	seed := (autoHistory{}).seed("fixture-source", "fixture-job")
 	for _, want := range []string{
+		"fresh context window", "existing XMPP inbox conversations and recent exchanges",
+		"may continue where the conversation left off or be unrelated",
 		"Use the supplied historical recap first",
 		"Only if relevant context is missing or insufficient, use read_messages(target=...)",
 		"or read relevant referenced task/handoff files",
