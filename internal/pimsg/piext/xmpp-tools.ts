@@ -96,7 +96,7 @@ export default function xmppTools(pi: ExtensionAPI) {
 					sm.setSessionFile(file);
 					sm.appendModelChange(ctx.model.provider, ctx.model.id);
 					sm.appendThinkingLevelChange(request.thinking);
-					sm.appendCustomMessageEntry("pi-msg-idle-seed", request.seed, false, { token, sourceID: request.sourceID, sourceFile: request.sourceFile });
+					sm.appendCustomMessageEntry("pi-msg-idle-seed", request.seed, true, { token, sourceID: request.sourceID, sourceFile: request.sourceFile });
 					sync(file); sync(dirname(file));
 					const id = "id:" + sm.getSessionId();
 					source();

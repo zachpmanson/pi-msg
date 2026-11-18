@@ -127,6 +127,7 @@ Per-account fields:
 | `pingInterval` | no | `60s` | keepalive cadence (Go duration): XEP-0199 server ping + XEP-0410 MUC self-ping; `0` disables |
 | `reactions` | no | `false` | XEP-0444 reactions and lifecycle acknowledgements; override per room |
 | `allowArbitraryJid` | no | `false` | Allow `send_message` and `read_messages` to target valid peer JIDs outside the owner/configured-room default allowlist; configured rooms must still be configured |
+| `awayTimeout` | no | `20m` | Positive Go duration (e.g. `"5m"`) before idle presence becomes away; `0`, negative and malformed values are rejected. Does not change the standard 20m room-participation window or enable automatic cleanup. |
 | `autoreconcileTimeout` | no | disabled | Experimental Go duration (e.g. `"30m"`); absent/`"0"` is inert. Idle optional reconcile → self receipt → bounded recap → exact native fresh session → XA. Cannot combine with `resetSessionOnAway`. See [operations](docs/autoreconcile.md). |
 | `autoreconcileHistoryMessages` | no | `10` | Recent eligible sent/admitted messages globally, `0..100`; counts alone never enable automatic cleanup. |
 | `autoreconcileOwnerHistoryMessages` | no | `10` | Independent owner-authored history floor, `0..100`; retained separately from peer traffic. Both counts zero omit chat bodies, not startup guidance. |

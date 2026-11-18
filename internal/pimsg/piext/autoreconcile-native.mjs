@@ -58,7 +58,12 @@ try {
  assert.notEqual(outcome.id,oldID);assert.notEqual(outcome.file,source);assert.equal(statSync(outcome.file).mode&0o777,0o600);
  const fresh=(await p.request({type:'get_state'})).data;assert.equal('id:'+fresh.sessionId,outcome.id);assert.equal(fresh.sessionFile,outcome.file);assert.equal(fresh.thinkingLevel,'high');assert.equal(fresh.model.id,'probe');assert.equal(fresh.isStreaming,false);
  const entries=(await p.request({type:'get_entries'})).data.entries;
- assert.equal(entries.filter(e=>e.type==='custom_message' && e.customType==='pi-msg-idle-seed' && e.content===seed).length,1);
+ const seeds=entries.filter(e=>e.type==='custom_message' && e.customType==='pi-msg-idle-seed' && e.content===seed);
+ assert.equal(seeds.length,1);assert.equal(seeds[0].display,true);
+ assert.deepEqual(seeds[0].details,{token:nonce,sourceID:oldID,sourceFile:source});
+ const persisted=readFileSync(outcome.file,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+ assert.equal('id:'+persisted[0].id,outcome.id);assert.equal(persisted.filter(e=>e.type==='custom_message').length,1);
+ assert.equal(persisted.find(e=>e.type==='custom_message').display,true);
  assert(!entries.some(e=>e.type==='message'));assert(!p.events.some(e=>e.type==='agent_start'));
  await p.stop();
  const restarted=launch(outcome.file,{enabled:false});
@@ -81,5 +86,5 @@ try {
  await runtime.dispose();
  const cancelled=launch(source,{cancel:true});const cancelNonce=authorize();await cancelled.request({type:'prompt',message:'/pi-msg-idle-reset '+cancelNonce});
  const cancelResult=JSON.parse(readFileSync(requestPath+'.receipt','utf8'));assert.equal(cancelResult.status,'cancelled');assert.equal(cancelResult.cancelled,true);assert.equal((await cancelled.request({type:'get_state'})).data.sessionId,oldID.slice(3));await cancelled.stop();
- console.log(JSON.stringify({pi:JSON.parse(readFileSync(join(pkg,'package.json'))).version,materialization:'native standalone SessionManager + exact native switchSession',finalUUID:outcome.id,finalPath:outcome.file,seedOnce:true,restart:true,agentCacheIdentity:true,preservedModelThinking:true,cancelled:true,staleGenerationRejected:true,noModelTurn:true,disabledCommandAbsent:true}));
+ console.log(JSON.stringify({pi:JSON.parse(readFileSync(join(pkg,'package.json'))).version,materialization:'native standalone SessionManager + exact native switchSession',finalUUID:outcome.id,finalPath:outcome.file,seedOnce:true,seedVisible:true,restart:true,agentCacheIdentity:true,preservedModelThinking:true,cancelled:true,staleGenerationRejected:true,noModelTurn:true,disabledCommandAbsent:true}));
 } finally {for(const c of children)c.kill('SIGKILL');rmSync(root,{recursive:true,force:true});}
