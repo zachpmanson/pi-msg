@@ -203,6 +203,10 @@ describe effective permissions. On upgrade, a changed contract hash causes a
 resumed session to receive the current seed rather than retaining the old
 `to:`-routing instructions.
 
+Pi `extension_error` events are logged to stderr (the system journal when
+running as a service), with the extension path and event when provided. They
+are not sent to XMPP. This does not change reply recovery or provider alerts.
+
 ## Retired error rooms
 
 The dedicated error-MUC feature is retired. Remove `errorRoom` and any

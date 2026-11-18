@@ -38,32 +38,44 @@ func TestDescribeExtensionError(t *testing.T) {
 	}
 }
 
-// The relay and the journal must both carry the name. The journal half is the
-// one that survives: the owner may only see the chat line, and the error is
-// recurring, so without a log line a later investigation has nothing to read.
-func TestExtensionErrorNamesTheExtension(t *testing.T) {
+// Extension errors retain their diagnostics in stderr (the service journal)
+// without attempting to send an XMPP message.
+func TestExtensionErrorIsLogOnly(t *testing.T) {
 	b := roomBridge()
-	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, _ string) {})
+	var xmppLogs []string
+	// With no live session, an attempted send is observable as an XMPP warning.
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, func(_, msg string) {
+		xmppLogs = append(xmppLogs, msg)
+	})
 
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	old := os.Stderr
-	os.Stderr = w
-	b.handleRPCEvent(Event{
-		"type":          "extension_error",
-		"extensionPath": "/home/beltino/.pi/personas/fox/npm/node_modules/pi-subagents/ext.ts",
-		"event":         "agent_settled",
-		"error":         "Agent is already processing a prompt.",
-	})
-	os.Stderr = old
-	w.Close()
-	logged, _ := io.ReadAll(r)
+	defer r.Close()
+	func() {
+		old := os.Stderr
+		defer func() { os.Stderr = old }()
+		defer w.Close()
+		os.Stderr = w
+		b.handleRPCEvent(Event{
+			"type":          "extension_error",
+			"extensionPath": "/extensions/example.ts",
+			"event":         "agent_settled",
+			"error":         "Agent is already processing a prompt.",
+		})
+	}()
+	logged, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
 
-	want := "extension error in /home/beltino/.pi/personas/fox/npm/node_modules/pi-subagents/ext.ts (on agent_settled): Agent is already processing a prompt."
+	want := "warning: extension error in /extensions/example.ts (on agent_settled): Agent is already processing a prompt."
 	if !strings.Contains(string(logged), want) {
-		t.Errorf("journal line missing the thrower:\n got %q\n want it to contain %q", string(logged), want)
+		t.Errorf("journal line: got %q, want it to contain %q", logged, want)
+	}
+	if len(xmppLogs) != 0 {
+		t.Errorf("extension error unexpectedly attempted an XMPP send: %v", xmppLogs)
 	}
 }
 
