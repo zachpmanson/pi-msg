@@ -680,13 +680,10 @@ func (b *Bridge) handleRPCEvent(ev Event) {
 		// send_message for an outbound stanza; settle-time recovery handles a
 		// requested reply that never used the tool.
 	case "extension_error":
-		// Name the thrower. pi attaches the offending extension's path and the
-		// event it was handling, and the relay used to drop both — leaving the
-		// owner with a recurring error whose author could not be identified from
-		// the message or from the journal (#135).
+		// Keep the extension path and event for operators (#135), but do not
+		// notify chat: an extension error does not imply a reply was lost.
 		where := describeExtensionError(ev)
 		b.log("warning", "extension error"+where+": "+orUnknown(ev.Str("error")))
-		b.reply("⚠️ extension error" + where + ": " + orUnknown(ev.Str("error")))
 	case "extension_ui_request":
 		b.handleUIRequest(ev)
 	}
