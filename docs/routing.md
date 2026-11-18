@@ -55,7 +55,7 @@ own away/xa show and status rather than resetting the published idle state.
 Room checks use current room/nickname presence and the same bare-name,
 `@name`, leading/inline address and quote/code filtering as inbound delivery.
 They also check the current author of a threaded reply and broadcasts
-(`@everyone`, `@all`, `@here`, `@free`). Configured peer trigger aliases that
+(e.g. `@all`, `@here`, `@free`). Configured peer trigger aliases that
 differ from the nickname are not advertised/discovered, so only nickname-based
 addressing can be checked. The guard does not change inbound broadcast routing.
 An anonymous occupant can still be recognized through its advertised caps.
@@ -78,7 +78,7 @@ Failed sends and `to: noop` do not arm watches.
 
 A fresh body-bearing DM from the destination peer satisfies its watch. In a
 room, only a direct address to this agent or a threaded reply to the watched
-stanza qualifies. General chatter, `@everyone` / `@free` broadcasts, participation
+stanza qualifies. General chatter, `@all` / `@free` broadcasts, participation
 window traffic, own echoes, typing, presence, receipts, delayed history, archive
 reads, and replay do not satisfy watches merely by being routed or observed.
 
@@ -155,7 +155,7 @@ and marked `[we sent]`. Reading is on demand and never sends a message.
 
 Room messages are delivered as prompts only when they address this agent.
 `@name` and an unprefixed agent name both address that agent; quoted, fenced,
-and inline-code text is ignored. `@everyone` addresses the room. `@free`
+and inline-code text is ignored. `@all` addresses the room. `@free`
 addresses idle agents (presence away or not yet asked to work), not agents
 currently working. A mistyped name matches nobody. Unaddressed messages are not
 queued for later; they remain available through `read_messages`.
@@ -166,8 +166,8 @@ in that room within the 20-minute participation window. Set the per-account
 agents (away/XA, or not yet asked to work and not currently working). This is an
 independent decision on each bridge, not a fallback that picks one idle agent;
 if nobody qualifies, no agent receives the message. Explicit `@free` and
-`@everyone` summons do not depend on this option. A message naming one agent or
-replying to that agent's known stanza is routed only to that account; `@everyone`
+`@all` summons do not depend on this option. A message naming one agent or
+replying to that agent's known stanza is routed only to that account; `@all`
 reaches the whole room. Peer messages that do not address an agent are not
 visible to it. The durable inbox preserves the original addressed verdict across
 restarts. Addressed peer handoffs have no consecutive-turn limit and do not

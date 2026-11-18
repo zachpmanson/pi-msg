@@ -2370,7 +2370,7 @@ func (b *Bridge) roomsContract() string {
 	if b.acct.UntaggedOwnerToFree {
 		ownerRouting = "Unnamed owner messages may reach idle agents or recent room participants"
 	}
-	return fmt.Sprintf("[pi-msg: rooms: Joined rooms: %s. Address agents by bare name or @name; @everyone addresses all, @free idle agents. Mentions in quotations or code do not count. Messages addressed to other agents and unaddressed peer chatter are not delivered or buffered; history remains readable. %s; replies to your known stanzas can also address you. Use read_messages to retrieve unseen room context.]", strings.Join(b.acct.Rooms, ", "), ownerRouting)
+	return fmt.Sprintf("[pi-msg: rooms: Joined rooms: %s. Address agents by bare name or @name; @all addresses all, @free idle agents. Mentions in quotations or code do not count. Messages addressed to other agents and unaddressed peer chatter are not delivered or buffered; history remains readable. %s; replies to your known stanzas can also address you. Use read_messages to retrieve unseen room context.]", strings.Join(b.acct.Rooms, ", "), ownerRouting)
 }
 
 func (b *Bridge) composePrompt(body, origin, sender, reactID, reactTo, replyTo string, notice *roomNotice) string {
@@ -2992,7 +2992,7 @@ func (b *Bridge) warnHandleProblems(room, body string) {
 	}
 	sb.WriteString(" NOBODY WAS WOKEN BY THAT MESSAGE.")
 	if len(valid) > 0 {
-		fmt.Fprintf(&sb, " The handles that work here right now are: @%s — or @everyone to address the whole room.", strings.Join(valid, ", @"))
+		fmt.Fprintf(&sb, " The handles that work here right now are: @%s — or @all to address the whole room.", strings.Join(valid, ", @"))
 	} else {
 		sb.WriteString(" No other handle is addressable in this room right now.")
 	}
@@ -3084,7 +3084,7 @@ func untaggedRoomNotice(addressable []string) string {
 	var sb strings.Builder
 	sb.WriteString("[pi-msg: routing: your last message to the room tagged nobody — it named no @handle and no agent by name, so pi-msg delivered it to no agent at all. It sits in the room for the owner, who reads the untagged traffic, and for nobody else.")
 	if len(addressable) > 0 {
-		fmt.Fprintf(&sb, " The handles that work here right now are: @%s — or @everyone to address the whole room.", strings.Join(addressable, ", @"))
+		fmt.Fprintf(&sb, " The handles that work here right now are: @%s — or @all to address the whole room.", strings.Join(addressable, ", @"))
 	} else {
 		sb.WriteString(" No other handle is addressable in this room right now.")
 	}

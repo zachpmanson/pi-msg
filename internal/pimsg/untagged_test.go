@@ -136,7 +136,7 @@ func TestUntaggedWarningGates(t *testing.T) {
 // out, and this message has already reached the room.
 func TestUntaggedRoomNotice(t *testing.T) {
 	got := untaggedRoomNotice([]string{"peppy", "slippy"})
-	for _, want := range []string{"tagged nobody", "@peppy", "@slippy", "@everyone"} {
+	for _, want := range []string{"tagged nobody", "@peppy", "@slippy", "@all"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("notice %q missing %q", got, want)
 		}

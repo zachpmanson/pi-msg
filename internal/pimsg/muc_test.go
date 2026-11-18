@@ -984,7 +984,7 @@ func TestBareMentionCounter(t *testing.T) {
 func TestRoutingContractStatesBareMentions(t *testing.T) {
 	b := roomBridge()
 	got := b.roomsContract()
-	for _, want := range []string{"bare name or @name", "@everyone", "@free", "quotations or code", "Unnamed owner", "known stanzas", "not delivered or buffered", "read_messages"} {
+	for _, want := range []string{"bare name or @name", "@all", "@free", "quotations or code", "Unnamed owner", "known stanzas", "not delivered or buffered", "read_messages"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("room contract missing %q: %s", want, got)
 		}
