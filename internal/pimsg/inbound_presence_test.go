@@ -30,6 +30,7 @@ func TestDiscardedInboundPreservesPresence(t *testing.T) {
 		message InboundMessage
 	}{
 		{"peer chatter", InboundMessage{Body: "unrelated chatter"}},
+		{"unnamed owner without opt-in", InboundMessage{Body: "do this", FromOwner: true}},
 		{"owner names someone else", InboundMessage{Body: "@peer do this", FromOwner: true}},
 		{"owner replies to someone else", InboundMessage{Body: "do this", FromOwner: true, ReplyToID: "other"}},
 		{"unknown peer reaction", InboundMessage{Reactions: []string{"OK"}, ReactionID: "unknown"}},
@@ -96,6 +97,7 @@ func TestAddressedInboundActivityAndPreActivityVerdict(t *testing.T) {
 	cases := []struct {
 		name, body, show                              string
 		owner, alreadyAddressed, participating, fresh bool
+		untaggedOwnerToFree                           bool
 	}{
 		{name: "bare mention", body: "ask pi for this", show: "away"},
 		{name: "explicit mention", body: "@pi do this", show: "away"},
@@ -103,9 +105,9 @@ func TestAddressedInboundActivityAndPreActivityVerdict(t *testing.T) {
 		{name: "all broadcast", body: "@all do this", show: "away"},
 		{name: "peer free", body: "@free do this", show: "away"},
 		{name: "owner free", body: "@free do this", show: "away", owner: true},
-		{name: "owner untagged away", body: "do this", show: "away", owner: true},
+		{name: "owner untagged away opted in", body: "do this", show: "away", owner: true, untaggedOwnerToFree: true},
 		{name: "owner recent participant", body: "do this", owner: true, participating: true},
-		{name: "owner fresh", body: "do this", owner: true, fresh: true},
+		{name: "owner fresh opted in", body: "do this", owner: true, fresh: true, untaggedOwnerToFree: true},
 		{name: "peer admitted replay", body: "do this", alreadyAddressed: true},
 		{name: "owner admitted replay", body: "do this", owner: true, alreadyAddressed: true},
 	}
@@ -113,6 +115,7 @@ func TestAddressedInboundActivityAndPreActivityVerdict(t *testing.T) {
 		for _, c := range cases {
 			t.Run(room+"/"+c.name, func(t *testing.T) {
 				b, rpc := inboundPresenceBridge(t)
+				b.acct.UntaggedOwnerToFree = c.untaggedOwnerToFree
 				setShow(b, c.show, !c.fresh)
 				if c.participating {
 					spokeAgo(b, room, time.Minute)

@@ -90,9 +90,8 @@ func TestFreeForSummons(t *testing.T) {
 	}
 }
 
-// The gate, in one table: @free and an untagged owner message reach a free agent
-// and nobody else, while every aimed form — a name, @everyone — is delivered
-// whatever the state says.
+// With the legacy fan-out enabled, @free and an untagged owner message reach
+// free agents, while aimed forms are delivered regardless of presence.
 func TestFreeBroadcastGating(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -124,6 +123,7 @@ func TestFreeBroadcastGating(t *testing.T) {
 	}
 	for _, c := range cases {
 		b, room := roomWith("peppy")
+		b.acct.UntaggedOwnerToFree = true
 		setShow(b, c.show, c.ran)
 		action, _, _ := b.classify(InboundMessage{
 			Room: room, Nick: "peppy", Body: c.body,
@@ -140,10 +140,8 @@ func TestFreeBroadcastGating(t *testing.T) {
 // asked of it, so @free must reach it again rather than leaving it in the settled
 // window for idleAwayTimeout. The dnd guard still holds — /new does not kill
 // background processes.
-// An owner room message that names nobody is the room continuing, so it reaches
-// the free agents and also anyone who spoke in that room recently (#130
-// follow-up): if you were part of the conversation, the next turn of it is yours
-// to hear, without the owner having to re-tag anyone.
+// An unnamed owner message still reaches recent participants with the default
+// configuration, without the owner having to re-tag them.
 func TestUntaggedOwnerReachesRecentParticipants(t *testing.T) {
 	settled := func() (*Bridge, string) {
 		b, r := roomWith("peppy")
@@ -232,15 +230,18 @@ func TestNewMakesAnAgentFree(t *testing.T) {
 		t.Fatal("a settled bridge must not be free")
 	}
 
-	// /new drops the agent back to the fresh state, so an untagged owner
-	// message reaches it again immediately.
+	// /new restores free status, but does not enable unnamed owner fan-out.
 	b.markFresh()
 	if !b.freeForSummons() {
 		t.Error("a /new bridge must be free again")
 	}
-	action, _, _ := b.classify(InboundMessage{Room: "team@muc.x.com", Nick: "zach", Body: "status please", FromOwner: true})
-	if action != actionCanonical {
-		t.Errorf("untagged owner message after /new = %d, want actionCanonical", action)
+	m := InboundMessage{Room: "team@muc.x.com", Nick: "zach", Body: "status please", FromOwner: true}
+	if action, _, _ := b.classify(m); action != actionNotOurs {
+		t.Errorf("untagged owner message after /new by default = %d, want actionNotOurs", action)
+	}
+	b.acct.UntaggedOwnerToFree = true
+	if action, _, _ := b.classify(m); action != actionCanonical {
+		t.Errorf("untagged owner message after /new with opt-in = %d, want actionCanonical", action)
 	}
 
 	// Work started after the /new puts it back out of reach.

@@ -160,8 +160,13 @@ addresses idle agents (presence away or not yet asked to work), not agents
 currently working. A mistyped name matches nobody. Unaddressed messages are not
 queued for later; they remain available through `read_messages`.
 
-An owner message naming nobody reaches free agents and agents who have spoken
-in that room within the participation window. A message naming one agent or
+By default, an owner message naming nobody reaches only agents who have spoken
+in that room within the 20-minute participation window. Set the per-account
+`"untaggedOwnerToFree": true` option to also deliver these messages to free
+agents (away/XA, or not yet asked to work and not currently working). This is an
+independent decision on each bridge, not a fallback that picks one idle agent;
+if nobody qualifies, no agent receives the message. Explicit `@free` and
+`@everyone` summons do not depend on this option. A message naming one agent or
 replying to that agent's known stanza is routed only to that account; `@everyone`
 reaches the whole room. Peer messages that do not address an agent are not
 visible to it. The durable inbox preserves the original addressed verdict across

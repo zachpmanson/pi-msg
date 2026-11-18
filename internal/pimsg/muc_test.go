@@ -95,8 +95,8 @@ func TestMatchTriggerPerRoom(t *testing.T) {
 
 func TestClassify(t *testing.T) {
 	b, room := roomWith("alice")
-	// The untagged owner case below is an @free summons (#130): it reaches an
-	// agent that is away, so put this one in that state.
+	// Exercise the opt-in fan-out to away agents.
+	b.acct.UntaggedOwnerToFree = true
 	b.xmpp.SetPresence("away", "reading obscure RFCs")
 	cases := []struct {
 		m      InboundMessage
@@ -144,13 +144,11 @@ func TestClassifyReplyToOwnMessage(t *testing.T) {
 	}
 }
 
-// An owner room message is trusted traffic. Naming nobody makes it an @free
-// summons (#130): it reaches the room's away agents, not every agent — the owner
-// writes @everyone to reach a working fleet. A tag or a stanza reply picks out
-// one account, and the message belongs to that account alone (#106) — without
-// this, every agent answers a note the owner wrote to one of them.
+// With the optional idle fan-out enabled, unnamed owner messages reach free
+// agents. Tags and stanza replies still select their intended account alone.
 func TestOwnerMessageRouting(t *testing.T) {
 	b := roomBridge() // owner zach@x.com, nick pi, trigger pi, room team@muc.x.com
+	b.acct.UntaggedOwnerToFree = true
 	x := NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
 	x.occupants["team@muc.x.com"] = map[string]string{
 		"pi":      "pi@x.com",
@@ -207,6 +205,7 @@ func TestOwnerMessageRouting(t *testing.T) {
 	// message stays a broadcast rather than silently reaching nobody — still
 	// through the @free gate, since it names nobody.
 	empty := roomBridge()
+	empty.acct.UntaggedOwnerToFree = true
 	empty.xmpp = NewXMPPBridge(empty.acct, func(InboundMessage) {}, empty.log)
 	setShow(empty, "away", true)
 	if action, _, _ := empty.classify(InboundMessage{Body: "@peppy look", Room: room, FromOwner: true}); action != actionCanonical {

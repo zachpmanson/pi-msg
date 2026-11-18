@@ -1373,9 +1373,8 @@ type roomNotice struct {
 // @free, A otherwise. It returns nil for a non-room turn, which keeps the
 // header+body form (owner DMs, initial prompts).
 //
-// The owner's C block covers both an untagged message and an @free one (#130) —
-// they are the same thing now — but not @everyone, which is an aimed broadcast
-// and still reads as a tag. C is deliberately not selectable by a peer: only the
+// The owner's C block covers both an admitted untagged message and an @free
+// summons, but not @everyone, which is an aimed broadcast and reads as a tag. C is deliberately not selectable by a peer: only the
 // owner can speak to the room without naming anyone.
 func (b *Bridge) roomNoticeFor(m InboundMessage) *roomNotice {
 	if m.Room == "" {
@@ -1456,13 +1455,12 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 			b.log("notice", fmt.Sprintf("owner message in %s is directed at %s (%s), not us — not delivering", m.Room, who, why))
 			return actionNotOurs, m.Body, ""
 		}
-		// The owner named nobody, so the message is the room continuing: it
-		// reaches the free agents (#130) and anyone who spoke here recently
-		// (#130 follow-up) — if you were part of the conversation, the next turn
-		// of it is yours to hear. An owner who wants the whole room writes
-		// @everyone.
-		if !m.Addressed && !b.freeForSummons() && !b.participated(m.Room) {
-			b.log("info", fmt.Sprintf("owner broadcast in %s skipped: we are not free and have not spoken here recently", m.Room))
+		// Unnamed owner messages continue the conversation for recent room
+		// participants. Waking other free agents is opt-in; explicit @free and
+		// @everyone summons were handled above. Preserve prior admission when
+		// replaying the durable inbox, even if the setting has since changed.
+		if !m.Addressed && !b.participated(m.Room) && !(b.acct.UntaggedOwnerToFree && b.freeForSummons()) {
+			b.log("info", fmt.Sprintf("owner broadcast in %s skipped: no recent participation or enabled free-agent delivery", m.Room))
 			return actionNotOurs, m.Body, ""
 		}
 		return actionCanonical, m.Body, ""
@@ -2368,7 +2366,11 @@ func (b *Bridge) roomsContract() string {
 	if len(b.acct.Rooms) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("[pi-msg: rooms: Joined rooms: %s. Address agents by bare name or @name; @everyone addresses all, @free idle agents. Mentions in quotations or code do not count. Messages addressed to other agents and unaddressed peer chatter are not delivered or buffered; history remains readable. Unnamed owner messages may reach idle agents or recent room participants; replies to your known stanzas can also address you. Use read_messages to retrieve unseen room context.]", strings.Join(b.acct.Rooms, ", "))
+	ownerRouting := "Unnamed owner messages reach recent room participants, not other idle agents"
+	if b.acct.UntaggedOwnerToFree {
+		ownerRouting = "Unnamed owner messages may reach idle agents or recent room participants"
+	}
+	return fmt.Sprintf("[pi-msg: rooms: Joined rooms: %s. Address agents by bare name or @name; @everyone addresses all, @free idle agents. Mentions in quotations or code do not count. Messages addressed to other agents and unaddressed peer chatter are not delivered or buffered; history remains readable. %s; replies to your known stanzas can also address you. Use read_messages to retrieve unseen room context.]", strings.Join(b.acct.Rooms, ", "), ownerRouting)
 }
 
 func (b *Bridge) composePrompt(body, origin, sender, reactID, reactTo, replyTo string, notice *roomNotice) string {
@@ -2576,8 +2578,8 @@ func (b *Bridge) presenceShow() string {
 // The fresh-bridge half is what makes a deploy summonable. A (re)started bridge
 // announces "awake"/"resumed" with an empty <show>, and the idle watcher needs
 // awayTimeout (20 min by default) of quiet before it drifts to away — so without this a
-// fleet that had just been deployed was dark to @free (and to an untagged owner
-// message) until every agent had sat still for 20 minutes, even though none of
+// fleet that had just been deployed was dark to @free (and opted-in untagged
+// owner messages) until every agent had sat still for 20 minutes, even though none of
 // them had been asked to do anything. An agent that has worked and has not yet
 // drifted away stays out of reach: waking it is a deliberate act, so tag it or
 // write @everyone.

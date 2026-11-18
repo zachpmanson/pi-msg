@@ -123,6 +123,7 @@ Per-account fields:
 | `rooms` | no | `[]` | group-chat rooms: objects with `jid`, `trigger`, and `reactions`; legacy `room`, `errorRoom`, and `role: "error"` are rejected |
 | `nick` | no | JID localpart | occupant nickname used in the room(s) |
 | `roomTrigger` | no | `nick` | account-wide address prefix that makes a room message a prompt (e.g. `pi` → `pi: …`); override per room |
+| `untaggedOwnerToFree` | no | `false` | Also deliver unnamed owner room messages to free agents; by default only recent room participants receive them. Explicit `@free` / `@everyone` summons are unchanged. |
 | `uploadService` | no | auto-probed | XEP-0363 upload component JID for file transfer (e.g. `upload.chat.example.com`) |
 | `pingInterval` | no | `60s` | keepalive cadence (Go duration): XEP-0199 server ping + XEP-0410 MUC self-ping; `0` disables |
 | `reactions` | no | `false` | XEP-0444 reactions and lifecycle acknowledgements; override per room |

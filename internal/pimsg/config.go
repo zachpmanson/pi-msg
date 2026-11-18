@@ -132,6 +132,10 @@ type Account struct {
 	// messages (both owner and addressed non-owner commentary). Independent of
 	// the 1:1 reactions flag — you can opt into one, both, or neither.
 	RoomReactions bool `json:"roomReactions,omitempty"`
+	// UntaggedOwnerToFree also delivers unnamed owner room messages to free
+	// agents. Off by default; recent room participants still receive them.
+	// Explicit @free and @everyone summons are independent of this option.
+	UntaggedOwnerToFree bool `json:"untaggedOwnerToFree,omitempty"`
 	// ResetSessionOnAway starts a fresh Pi session when this account transitions
 	// from idle/available to away. Disabled by default.
 	ResetSessionOnAway bool `json:"resetSessionOnAway,omitempty"`
@@ -248,6 +252,7 @@ type ResolvedAccount struct {
 	AllowArbitraryJid                 bool
 	Reactions                         bool
 	RoomReactions                     bool
+	UntaggedOwnerToFree               bool
 	ResetSessionOnAway                bool
 	AwayTimeout                       time.Duration
 	AutoreconcileTimeout              time.Duration
@@ -867,6 +872,7 @@ func resolveAccount(cfg *Config, requested string) (ResolvedAccount, error) {
 		AllowArbitraryJid:                 acct.AllowArbitraryJid,
 		Reactions:                         acct.Reactions,
 		RoomReactions:                     acct.RoomReactions,
+		UntaggedOwnerToFree:               acct.UntaggedOwnerToFree,
 		ResetSessionOnAway:                acct.ResetSessionOnAway,
 		AwayTimeout:                       awayTimeout,
 		Model:                             acct.Model,
