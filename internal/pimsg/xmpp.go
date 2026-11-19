@@ -306,6 +306,9 @@ type InboundMessage struct {
 	// cursor built from the message id is an archive id the server does not know,
 	// so it pages to nothing.
 	ArchiveID string
+	// RoomStanzaID is the XEP-0359 ID assigned by the room, when present.
+	RoomStanzaID string
+	OccupantID   string // server-assigned XEP-0421 identity, when archived
 	// Own marks an archived line this account sent itself. A read reports the
 	// room as it happened, so our own lines appear too — marked, because the
 	// reader is the sender and must not read its own words as a peer's.
@@ -383,6 +386,7 @@ type XMPPBridge struct {
 	// MUC occupant tracking (room mode), keyed by room bare JID.
 	occupants    map[string]map[string]string // roomBare -> nick -> bare real JID (empty for anonymous occupants)
 	selfNick     map[string]string            // roomBare -> our nick (per status code 110)
+	selfOccupant map[string]string            // roomBare -> our XEP-0421 ID from self presence
 	peerPresence map[string]peerPresence      // exact live presence sender -> peer identity/show
 
 	uploadMu  sync.Mutex
@@ -413,6 +417,13 @@ type XMPPBridge struct {
 	// once the terminating IQ result arrives.
 	mamMu      sync.Mutex
 	mamPending map[string]*mamCollector
+
+	// Ingress is normally synchronous. While a parent lookup is active, the
+	// reader queues later input in wire order so it can still drain IQ results.
+	ingressMu     sync.Mutex
+	ingressSpace  *sync.Cond
+	ingressCancel context.CancelFunc
+	ingressQueue  []InboundMessage
 
 	// Restart-gap replay state. replayStart is the swap-window start (when the
 	// account went offline); replayArmed is set once at startup when a window
@@ -445,6 +456,7 @@ func NewXMPPBridge(acct ResolvedAccount, onMsg func(InboundMessage), logf func(l
 		seen:         make(map[string]struct{}),
 		occupants:    make(map[string]map[string]string),
 		selfNick:     make(map[string]string),
+		selfOccupant: make(map[string]string),
 		peerPresence: make(map[string]peerPresence),
 		msgHistory:   make(map[string]msgHistoryEntry),
 		readHistory:  make(map[string]msgHistoryEntry),
@@ -534,6 +546,7 @@ func (b *XMPPBridge) serve(ctx context.Context, onConnected func()) error {
 	// Reset occupant state for this fresh connection; a re-join repopulates it.
 	b.occupants = make(map[string]map[string]string)
 	b.selfNick = make(map[string]string)
+	b.selfOccupant = make(map[string]string)
 	b.peerPresence = make(map[string]peerPresence)
 	b.mu.Unlock()
 
@@ -1017,7 +1030,9 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 		// A XEP-0313 archived-message result is backfill, never live input:
 		// consume it into the in-flight collector and never let it dispatch.
 		if res, ok := element(toks, mamNS, "result"); ok {
-			b.collectMAMResult(toks, res)
+			if b.mamResultSourceOK(m.from, res) {
+				b.collectMAMResult(toks, res)
+			}
 			return nil
 		}
 		if re, ok := element(toks, reactionsNS, "reactions"); ok {
@@ -1241,7 +1256,7 @@ func (b *XMPPBridge) dispatchDirect(m incomingMsg) {
 	if m.markable && m.id != "" {
 		b.log("info", fmt.Sprintf("chat marker: inbound stanza dispatched to bridge stanza_id=%q", m.id))
 	}
-	b.onMsg(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp, Reactions: m.reactions, ReactionID: m.reactionFor,
+	b.dispatchReplyAware(InboundMessage{Body: m.body, RealJID: b.ownerBare, FromOwner: true, Direct: true, ID: m.id, From: m.from, Stamp: m.delayStamp, Reactions: m.reactions, ReactionID: m.reactionFor,
 		ReplyToID: m.replyToID, ReplyToJID: m.replyToJID, Markable: m.markable})
 }
 
@@ -1320,7 +1335,7 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	owner := real != "" && real == b.ownerBare
 	b.recordInboundMessage(m.id, m.from, m.body, owner)
 	b.recordRoomReply(room, m.id, m.roomStanzaID, m.from, m.body, false, owner)
-	b.onMsg(InboundMessage{
+	message := InboundMessage{
 		Body:       m.body,
 		Nick:       nick,
 		RealJID:    real,
@@ -1332,7 +1347,8 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 		From:       m.from,
 		Reactions:  m.reactions,
 		ReactionID: m.reactionFor,
-	})
+	}
+	b.dispatchReplyAware(message)
 }
 
 // handlePresence maintains the MUC occupant map (room mode) and auto-approves
@@ -1360,6 +1376,14 @@ func (b *XMPPBridge) handlePresence(start *xml.StartElement, toks []xml.Token) e
 		if hasStatusCode(toks, "110") {
 			b.mu.Lock()
 			b.selfNick[room] = nick
+			if ptype == "unavailable" {
+				delete(b.selfOccupant, room)
+			} else if id := roomOccupantID(toks); id != "" {
+				if b.selfOccupant == nil {
+					b.selfOccupant = make(map[string]string)
+				}
+				b.selfOccupant[room] = id
+			}
 			b.mu.Unlock()
 		}
 		real := ""

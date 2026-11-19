@@ -95,6 +95,7 @@ func TestCollectMAMResultRoom(t *testing.T) {
 	b := newMAMTestBridge()
 	col := &mamCollector{record: true, room: "testing@muc.chat.zachmanson.com"}
 	b.mamPending["q2"] = col
+	b.selfOccupant = map[string]string{col.room: "occupant-slippy"}
 
 	for _, from := range []string{
 		"testing@muc.chat.zachmanson.com/slippy",
@@ -103,7 +104,8 @@ func TestCollectMAMResultRoom(t *testing.T) {
 		toks := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q2'>`+
 			`<forwarded xmlns='urn:xmpp:forward:0'><delay xmlns='urn:xmpp:delay' stamp='2026-09-15T01:00:00Z'/>`+
 			`<message xmlns='jabber:client' from='`+from+`' id='r-`+from+`' type='groupchat'>`+
-			`<body>tick</body><stanza-id xmlns='urn:xmpp:sid:0' by='`+col.room+`' id='sid-`+resourcepart(from)+`'/></message></forwarded></result>`)
+			`<body>tick</body><stanza-id xmlns='urn:xmpp:sid:0' by='`+col.room+`' id='sid-`+resourcepart(from)+`'/>`+
+			`<occupant-id xmlns='urn:xmpp:occupant-id:0' id='occupant-`+resourcepart(from)+`'/></message></forwarded></result>`)
 		res, _ := element(toks, mamNS, "result")
 		b.collectMAMResult(toks, res)
 	}

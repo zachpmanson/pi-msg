@@ -171,8 +171,13 @@ known stanza counts as a direct tag of that agent, including replies to
 `send_file` messages. The sender's stanza ID or a room-assigned XEP-0359 ID
 can identify the parent in the same room. No recent participation or idle
 state is needed; extra mentions or broadcasts in the reply still work as
-usual. Unknown reply IDs follow ordinary room routing. Peer messages that do
-not address an agent are not visible to it. The durable inbox preserves the
+usual. On a live cache miss, with MAM enabled, pi-msg looks for the parent in
+up to 500 recent entries in the same room’s archive, within a short deadline.
+It verifies the parent against the bridge’s room-scoped XEP-0421 occupant ID
+or retained author evidence, not the author’s current nickname. An unresolved
+threaded reply does not notify recent
+participants merely because the owner sent it. Explicit mentions still work.
+Peer messages that do not address an agent are not visible to it. The durable inbox preserves the
 original addressed verdict across restarts. Addressed peer handoffs have no
 consecutive-turn limit and do not
 require an intervening owner message. Own-echo filtering still applies.

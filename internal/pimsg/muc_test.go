@@ -278,9 +278,10 @@ func TestOwnerMessageRouting(t *testing.T) {
 		{"a fenced name is not a tag", "```\npeppy: do it\n```", "", true, "away", true, actionCanonical},
 		{"a quoted name is not a tag", "> peppy: do it", "", true, "away", true, actionCanonical},
 		{"owner reply to a peer belongs to the peer", "", "peppy-id", true, "away", true, actionNotOurs},
-		{"owner reply to the owner's own names nobody, so it is @free", "", "owner-id", true, "away", true, actionCanonical},
+		{"owner reply to owner's own stanza does not address us", "", "owner-id", true, "away", true, actionNotOurs},
 		{"owner reply to us is ours", "", "our-id", true, "", true, actionCanonical},
-		{"an unresolvable reply follows the same rule", "", "unknown-id", true, "away", true, actionCanonical},
+		{"an unresolvable reply does not notify bystanders", "", "unknown-id", true, "away", true, actionNotOurs},
+		{"explicit tag still works with an unresolvable reply", "@pi look", "unknown-id", true, "away", true, actionCanonical},
 		{"a peer naming another peer is still not ours", "@beltino yours", "", false, "away", true, actionNotOurs},
 		{"a peer naming nobody is still dropped", "no name here", "", false, "away", true, actionNotOurs},
 	}
