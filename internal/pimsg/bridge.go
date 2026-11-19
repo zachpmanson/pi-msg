@@ -1449,6 +1449,12 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 		if replyToOwn {
 			return actionCanonical, m.Body, ""
 		}
+		// A threaded reply is never an unnamed owner broadcast. If its parent
+		// is unknown or belongs to anyone else (including the owner), don't
+		// notify recent participants. Explicit body addressing still works.
+		if m.ReplyToID != "" && !m.Addressed {
+			return actionNotOurs, m.Body, ""
+		}
 		if who, why := b.ownerDirectedElsewhere(m); who != "" {
 			b.log("notice", fmt.Sprintf("owner message in %s is directed at %s (%s), not us — not delivering", m.Room, who, why))
 			return actionNotOurs, m.Body, ""
@@ -1501,22 +1507,11 @@ func (b *Bridge) replyToOwnMessage(m InboundMessage) bool {
 // either way, so the extra work only exists where silence would otherwise mean
 // every agent answering a message written for one of them.
 //
-// Two forms count as directed, in this order:
-//
-//   - a XEP-0461 reply to a stanza we have seen from a peer — the reply answers
-//     that peer. A reply to the owner's own message, or to an id we do not know
-//     (it may be ours, from before a restart), is not evidence of a handoff and
-//     falls through to the untagged broadcast case, so an unresolvable reply is
-//     delivered rather than lost.
-//   - a name: an @handle, a leading "nick:" / "nick,", or a bare nick of
-//     another occupant. Occupants come from presence, so with a roster that has
-//     not populated yet there is no evidence and the message stays a broadcast.
+// Replies are classified separately above. Here we look for an @handle, a
+// leading "nick:" / "nick,", or a bare nick of another live occupant.
 func (b *Bridge) ownerDirectedElsewhere(m InboundMessage) (who, why string) {
 	if b.xmpp == nil {
 		return "", ""
-	}
-	if e, ok := b.xmpp.lookupRoomReply(m.Room, m.ReplyToID); ok && !e.Self && !e.Owner {
-		return "another agent", fmt.Sprintf("reply to stanza %s", m.ReplyToID)
 	}
 	if who := b.addressesOtherOccupant(m.Room, m.Body); who != "" {
 		return who, "named in the body"
@@ -4826,6 +4821,9 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
 			continue
 		}
 		m = b.recoveredRoomAuthor(m)
+		if m.Room != "" && m.ReplyToID != "" && b.acct.MAM {
+			b.xmpp.resolveArchivedRoomReply(b.ctx, m.Room, m.ReplyToID, m.ReplyToJID)
+		}
 		if m.Direct {
 			b.captureAutoInbound(m)
 		} else if action, _, _ := b.classify(m); action != actionNotOurs {

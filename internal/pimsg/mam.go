@@ -331,6 +331,15 @@ func reconnectSince(lastIn time.Time, lastInOK bool, seen time.Time, seenOK bool
 	return cursor, true
 }
 
+// A room archive result is trusted only if the envelope comes from the
+// room service itself, not from a room occupant or a direct chat peer.
+func (b *XMPPBridge) mamResultSourceOK(from string, res xml.StartElement) bool {
+	b.mamMu.Lock()
+	defer b.mamMu.Unlock()
+	col := b.mamPending[attr(res.Attr, "queryid")]
+	return col != nil && (col.room == "" || from == col.room)
+}
+
 // collectMAMResult consumes a XEP-0313 archived-message <result> from the read
 // loop, appending it to the matching in-flight collector. Unknown query ids are
 // dropped: a MAM result must never fall through to live dispatch, or an old
@@ -395,6 +404,11 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	} else if real := b.occupantRealJID(col.room, nick); real != "" {
 		owner = real == b.ownerBare
 	}
+	var scopedID, occupantID string
+	if col.room != "" {
+		scopedID = mucStanzaID(rest, col.room)
+		occupantID = roomOccupantID(rest)
+	}
 	if col.record {
 		if ownLine {
 			b.recordSelfMessage(id, from, body)
@@ -402,7 +416,13 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 			b.recordInboundMessage(id, from, body, owner)
 		}
 		if col.room != "" {
-			b.recordRoomReply(col.room, id, mucStanzaID(rest, col.room), from, body, ownLine, owner)
+			// Keep legacy replay filtering separate from routing decisions:
+			// a historical nickname match does not prove reply ownership.
+			self := b.archivedParentIsSelf(col.room, InboundMessage{OriginJID: origin, OccupantID: occupantID})
+			if e, known := b.lookupRoomReply(col.room, scopedID); known && e.Self {
+				self = true // preserve an already-verified room-assigned ID
+			}
+			b.recordRoomReply(col.room, id, scopedID, from, body, self, owner)
 		}
 	}
 	if ownLine && col.record {
@@ -426,6 +446,7 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	// print a usable cursor without changing routing, which keys off the message
 	// id (#117).
 	m := InboundMessage{Body: body, ID: id, ArchiveID: attr(res.Attr, "id"), From: from, Stamp: stamp, Own: ownLine, Historical: true, OriginJID: origin}
+	m.RoomStanzaID, m.OccupantID = scopedID, occupantID
 	// A recovered message can itself be a XEP-0461 reply; keep the stamp so the
 	// prompt names what it answers (#95).
 	if re, ok := element(rest, replyNS, "reply"); ok {
