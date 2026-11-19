@@ -985,18 +985,19 @@ func (b *XMPPBridge) connect(ctx context.Context) (*xmpp.Session, error) {
 // incomingMsg is a received message stanza reduced to the fields the bridge
 // cares about.
 type incomingMsg struct {
-	from        string
-	typ         string
-	body        string
-	id          string
-	delay       bool      // carried a XEP-0203 <delay/> (server-replayed history)
-	delayStamp  time.Time // the <delay stamp> attr, zero if absent/unparsable
-	wantReceipt bool      // carried a XEP-0184 <request/> (delivery receipt)
-	markable    bool      // carried a XEP-0333 <markable/> (chat marker)
-	reactions   []string  // XEP-0444 reactions: the emoji set, if this is a reaction
-	reactionFor string    // XEP-0444 reactions id: stanza id of the message being reacted to
-	replyToID   string    // XEP-0461 <reply id>: stanza id of the message this one answers
-	replyToJID  string    // XEP-0461 <reply to>: author of the message this one answers
+	from         string
+	typ          string
+	body         string
+	id           string
+	delay        bool      // carried a XEP-0203 <delay/> (server-replayed history)
+	delayStamp   time.Time // the <delay stamp> attr, zero if absent/unparsable
+	wantReceipt  bool      // carried a XEP-0184 <request/> (delivery receipt)
+	markable     bool      // carried a XEP-0333 <markable/> (chat marker)
+	reactions    []string  // XEP-0444 reactions: the emoji set, if this is a reaction
+	reactionFor  string    // XEP-0444 reactions id: stanza id of the message being reacted to
+	roomStanzaID string    // XEP-0359 <stanza-id> assigned by this MUC
+	replyToID    string    // XEP-0461 <reply id>: stanza id of the message this one answers
+	replyToJID   string    // XEP-0461 <reply to>: author of the message this one answers
 }
 
 // handle is the mellium read-loop callback for one inbound stanza.
@@ -1039,6 +1040,9 @@ func (b *XMPPBridge) handle(t xmlstream.TokenReadEncoder, start *xml.StartElemen
 					m.delayStamp = t
 				}
 			}
+		}
+		if m.typ == "groupchat" {
+			m.roomStanzaID = mucStanzaID(toks, bareJid(m.from))
 		}
 		_, m.wantReceipt = element(toks, receiptsNS, "request")
 		_, m.markable = element(toks, chatMarkersNS, "markable")
@@ -1145,6 +1149,26 @@ func (b *XMPPBridge) encodeDiscoInfo(to, id string) error {
 	return b.encode(ctx, session, resp)
 }
 
+// mucStanzaID returns only a direct XEP-0359 ID assigned by this room.
+func mucStanzaID(toks []xml.Token, room string) string {
+	depth := 0
+	for _, tok := range toks {
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if depth == 0 && t.Name == (xml.Name{Space: "urn:xmpp:sid:0", Local: "stanza-id"}) && attr(t.Attr, "by") == room {
+				return attr(t.Attr, "id")
+			}
+			depth++
+		case xml.EndElement:
+			if depth == 0 {
+				return ""
+			}
+			depth--
+		}
+	}
+	return ""
+}
+
 // dispatch applies delivery policy and forwards a message to onMsg. Routing is
 // by stanza type, not mode: groupchat goes to the room path (room mode only),
 // while 1:1 chat is always handled — so even in room mode the owner can DM the
@@ -1239,8 +1263,14 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	// in principle, so a server echoing a differently-cased resource must not
 	// defeat the filter (a miss lets our own message re-enter classify and
 	// prompt ourselves).
-	if real := b.occupantRealJID(room, nick); !m.delay && real != "" && real == bareJid(b.acct.JID) {
-		return // verified self, including another resource/nickname; no reply observation
+	real := b.occupantRealJID(room, nick)
+	if !m.delay && (strings.EqualFold(nick, b.ownNick(room)) || (real != "" && real == bareJid(b.acct.JID))) {
+		// Clients can reply to the room-assigned ID rather than the ID we sent.
+		// Index the echo without treating it as input or satisfying reply watches.
+		if m.roomStanzaID != "" && strings.TrimSpace(m.body) != "" {
+			b.recordSelfMessage(mucReplyKey(room, m.roomStanzaID), m.from, m.body)
+		}
+		return
 	}
 	origin := ""
 	if m.delay && b.roomOrigin != nil {
@@ -1249,16 +1279,17 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 			return // accepted outbound under an old nickname
 		}
 	}
-	if (!m.delay || b.roomOrigin == nil) && strings.EqualFold(nick, b.ownNick(room)) {
-		return // live echo (legacy historical heuristic only outside automatic mode)
+	if m.delay && b.roomOrigin == nil && strings.EqualFold(nick, b.ownNick(room)) {
+		return // legacy historical heuristic outside automatic mode
 	}
 	if m.delay {
 		// Replayed MUC history: buffer only what falls inside the restart swap
 		// window for the resumed session; drop the rest as stale backfill (logged,
 		// so a dropped owner message in a reconnect gap is visible — #94).
 		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
-			real := b.occupantRealJID(room, nick)
 			b.bufferReplay(InboundMessage{
+				ReplyToID:  m.replyToID,
+				ReplyToJID: m.replyToJID,
 				Body:       m.body,
 				Nick:       nick,
 				RealJID:    real,
@@ -1286,15 +1317,16 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	}
 	// Record the inbound room message in history so send_reaction can target it
 	// by ID, and so a later reply to it can be resolved and quoted (#95).
-	real := b.occupantRealJID(room, nick)
-	if m.id != "" {
-		b.recordInboundMessage(m.id, m.from, m.body, real != "" && real == b.ownerBare)
+	owner := real != "" && real == b.ownerBare
+	b.recordInboundMessage(m.id, m.from, m.body, owner)
+	if m.roomStanzaID != "" {
+		b.recordInboundMessage(mucReplyKey(room, m.roomStanzaID), m.from, m.body, owner)
 	}
 	b.onMsg(InboundMessage{
 		Body:       m.body,
 		Nick:       nick,
 		RealJID:    real,
-		FromOwner:  real != "" && real == b.ownerBare,
+		FromOwner:  owner,
 		Room:       room,
 		ReplyToID:  m.replyToID,
 		ReplyToJID: m.replyToJID,
@@ -1787,12 +1819,20 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, reply *
 	msg := chatStanza(id, toJID, typ, body, reply)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	return id, b.encodeMessage(ctx, session, msg, to, id, body)
+}
+
+// encodeMessage gives text and file messages the same outbound identity. Record
+// before writing so the room can echo or receive a reply as soon as it arrives.
+func (b *XMPPBridge) encodeMessage(ctx context.Context, session *xmpp.Session, msg any, to, id, body string) error {
 	b.recordSelfMessage(id, to, body)
-	err = b.encode(ctx, session, msg)
-	if err == nil && b.onAcceptedSent != nil {
+	if err := b.encode(ctx, session, msg); err != nil {
+		return err
+	}
+	if b.onAcceptedSent != nil {
 		b.onAcceptedSent(to, id, body)
 	}
-	return id, err
+	return nil
 }
 
 // SendDisplayedMarker acknowledges a 1:1 owner message with a single XEP-0333
@@ -1992,6 +2032,23 @@ func (b *XMPPBridge) lookupMessageEntry(id string) (msgHistoryEntry, bool) {
 	defer b.mu.Unlock()
 	e, ok := b.msgHistory[id]
 	return e, ok
+}
+
+// Room-assigned IDs are unique only within their assigning room. The prefix
+// separates these keys from the original sender IDs accepted for legacy clients.
+func mucReplyKey(room, id string) string { return room + "\x00" + id }
+
+func (b *XMPPBridge) lookupRoomReply(room, id string) (msgHistoryEntry, bool) {
+	if room == "" || id == "" {
+		return msgHistoryEntry{}, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if e, ok := b.msgHistory[mucReplyKey(room, id)]; ok {
+		return e, true
+	}
+	e, ok := b.msgHistory[id]
+	return e, ok && bareJid(e.FromJID) == room
 }
 
 // recordReadHistory retains targets printed by read_messages so a later
@@ -2487,7 +2544,7 @@ func (b *XMPPBridge) encodeOOB(to, url string, typ stanza.MessageType) error {
 	msg.X.URL = url
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return b.encode(ctx, session, msg)
+	return b.encodeMessage(ctx, session, msg, to, msg.ID, url)
 }
 
 // domainOf returns the domain part of a JID (after '@', before '/').

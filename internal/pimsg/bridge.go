@@ -1428,7 +1428,8 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 	// cleared this gate when it first arrived and is being re-delivered from the
 	// durable queue (a restart empties the presence we would re-derive it from),
 	// so the verdict travels with it rather than being recomputed.
-	if !m.Addressed && !explicit && freeOnlyBroadcast(m.Body) && !b.freeForSummons() {
+	replyToOwn := b.replyToOwnMessage(m)
+	if !m.Addressed && !explicit && !replyToOwn && freeOnlyBroadcast(m.Body) && !b.freeForSummons() {
 		b.log("info", fmt.Sprintf("free broadcast in %s from %q skipped: we are not free", m.Room, m.Nick))
 		return actionNotOurs, m.Body, ""
 	}
@@ -1445,7 +1446,7 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 			// @everyone / @free (and we are away): a broadcast, body intact.
 			return actionCanonical, m.Body, ""
 		}
-		if b.replyToOwnMessage(m) {
+		if replyToOwn {
 			return actionCanonical, m.Body, ""
 		}
 		if who, why := b.ownerDirectedElsewhere(m); who != "" {
@@ -1463,7 +1464,7 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 		return actionCanonical, m.Body, ""
 	case addressed:
 		return actionCommentary, stripped, mention
-	case b.replyToOwnMessage(m):
+	case replyToOwn:
 		// Someone answered something we said, without naming us. Treat it as
 		// addressing us (XEP-0461, #95) rather than dropping it: a reply to our
 		// own message is the one form of non-named traffic that is unambiguously
@@ -1486,10 +1487,11 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 // being inferred from the recorded JID — a room send records the room, which is
 // indistinguishable from someone else's message in the same room.
 func (b *Bridge) replyToOwnMessage(m InboundMessage) bool {
-	if m.ReplyToID == "" || b.xmpp == nil {
+	if b.xmpp == nil {
 		return false
 	}
-	return b.xmpp.isSelfMessage(m.ReplyToID)
+	e, ok := b.xmpp.lookupRoomReply(m.Room, m.ReplyToID)
+	return ok && e.Self
 }
 
 // ownerDirectedElsewhere reports which other account an owner message is meant
@@ -1513,7 +1515,7 @@ func (b *Bridge) ownerDirectedElsewhere(m InboundMessage) (who, why string) {
 	if b.xmpp == nil {
 		return "", ""
 	}
-	if m.ReplyToID != "" && b.xmpp.replyTargetOther(m.ReplyToID) {
+	if e, ok := b.xmpp.lookupRoomReply(m.Room, m.ReplyToID); ok && !e.Self && !e.Owner {
 		return "another agent", fmt.Sprintf("reply to stanza %s", m.ReplyToID)
 	}
 	if who := b.addressesOtherOccupant(m.Room, m.Body); who != "" {

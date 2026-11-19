@@ -166,11 +166,15 @@ in that room within the 20-minute participation window. Set the per-account
 agents (away/XA, or not yet asked to work and not currently working). This is an
 independent decision on each bridge, not a fallback that picks one idle agent;
 if nobody qualifies, no agent receives the message. Explicit `@free` and
-`@all` summons do not depend on this option. A message naming one agent or
-replying to that agent's known stanza is routed only to that account; `@all`
-reaches the whole room. Peer messages that do not address an agent are not
-visible to it. The durable inbox preserves the original addressed verdict across
-restarts. Addressed peer handoffs have no consecutive-turn limit and do not
+`@all` summons do not depend on this option. An XEP-0461 reply to an agent's
+known stanza counts as a direct tag of that agent, including replies to
+`send_file` messages. The sender's stanza ID or a room-assigned XEP-0359 ID
+can identify the parent in the same room. No recent participation or idle
+state is needed; extra mentions or broadcasts in the reply still work as
+usual. Unknown reply IDs follow ordinary room routing. Peer messages that do
+not address an agent are not visible to it. The durable inbox preserves the
+original addressed verdict across restarts. Addressed peer handoffs have no
+consecutive-turn limit and do not
 require an intervening owner message. Own-echo filtering still applies.
 
 An outbound room message intended as a handoff should use an explicit

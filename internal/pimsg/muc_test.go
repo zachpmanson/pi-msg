@@ -2,6 +2,7 @@ package pimsg
 
 import (
 	"bytes"
+	"encoding/xml"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -141,6 +142,54 @@ func TestClassifyReplyToOwnMessage(t *testing.T) {
 	m.FromOwner = true
 	if action, _, _ := b.classify(m); action != actionCanonical {
 		t.Errorf("owner reply to our own stanza = %d, want actionCanonical", action)
+	}
+}
+
+func TestRoomAssignedReplyID(t *testing.T) {
+	const room = "team@muc.x.com"
+	const other = "other@muc.x.com"
+	b := roomBridge()
+	b.acct.Rooms = append(b.acct.Rooms, other)
+	var received int
+	x := NewXMPPBridge(b.acct, func(InboundMessage) { received++ }, b.log)
+	b.xmpp = x
+	x.dispatchRoom(incomingMsg{typ: "groupchat", from: room + "/pi", body: "sent",
+		id: "sender-id", roomStanzaID: "42"})
+	if received != 0 {
+		t.Fatal("own echo was delivered")
+	}
+	x.dispatchRoom(incomingMsg{typ: "groupchat", from: other + "/alice", body: "same id, different room",
+		id: "other-sender-id", roomStanzaID: "42"})
+	setShow(b, "dnd", true)
+	for _, owner := range []bool{true, false} {
+		m := InboundMessage{Room: room, Nick: "alice", Body: "@free follow-up", ReplyToID: "42", FromOwner: owner}
+		action, _, _ := b.classify(m)
+		want := actionCommentary
+		if owner {
+			want = actionCanonical
+		}
+		if action != want || b.roomNoticeFor(m).kind != noticeReplyToOwn {
+			t.Errorf("busy recipient did not get its room-ID reply (owner=%v): action %v", owner, action)
+		}
+		m.Room, m.Body = other, "follow-up"
+		if action, _, _ := b.classify(m); action != actionNotOurs {
+			t.Errorf("unrelated room received reply (owner=%v): action %v", owner, action)
+		}
+	}
+}
+
+func TestMUCStanzaID(t *testing.T) {
+	const room = "team@muc.x.com"
+	d := xml.NewDecoder(strings.NewReader(`<body>hi</body>
+		<forwarded><stanza-id xmlns="urn:xmpp:sid:0" by="team@muc.x.com" id="nested"/></forwarded>
+		<stanza-id xmlns="urn:xmpp:sid:0" by="another@muc.x.com" id="other"/>
+		<stanza-id xmlns="urn:xmpp:sid:0" by="team@muc.x.com" id="room-id"/>`))
+	var toks []xml.Token
+	for tok, err := d.Token(); err == nil; tok, err = d.Token() {
+		toks = append(toks, xml.CopyToken(tok))
+	}
+	if got := mucStanzaID(toks, room); got != "room-id" {
+		t.Errorf("mucStanzaID = %q, want room-id", got)
 	}
 }
 
