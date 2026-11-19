@@ -103,7 +103,7 @@ func TestCollectMAMResultRoom(t *testing.T) {
 		toks := mamTokens(t, `<result xmlns='urn:xmpp:mam:2' queryid='q2'>`+
 			`<forwarded xmlns='urn:xmpp:forward:0'><delay xmlns='urn:xmpp:delay' stamp='2026-09-15T01:00:00Z'/>`+
 			`<message xmlns='jabber:client' from='`+from+`' id='r-`+from+`' type='groupchat'>`+
-			`<body>tick</body></message></forwarded></result>`)
+			`<body>tick</body><stanza-id xmlns='urn:xmpp:sid:0' by='`+col.room+`' id='sid-`+resourcepart(from)+`'/></message></forwarded></result>`)
 		res, _ := element(toks, mamNS, "result")
 		b.collectMAMResult(toks, res)
 	}
@@ -117,6 +117,12 @@ func TestCollectMAMResultRoom(t *testing.T) {
 	}
 	if m.Nick != "peppy" {
 		t.Errorf("nick = %q, want peppy", m.Nick)
+	}
+	for nick, self := range map[string]bool{"slippy": true, "peppy": false} {
+		e, ok := b.lookupRoomReply(col.room, "sid-"+nick)
+		if !ok || e.Self != self {
+			t.Errorf("archive ID sid-%s: found=%v self=%v, want self=%v", nick, ok, e.Self, self)
+		}
 	}
 }
 
@@ -191,6 +197,16 @@ func mustMarshal(t *testing.T, v any) []byte {
 
 // Duplicate stanza ids must not enter the replay buffer twice: the same message
 // can arrive as a server-pushed delayed stanza and again from MAM.
+func TestReplayBufferScopesStanzaIDToRoom(t *testing.T) {
+	b := &XMPPBridge{}
+	for _, room := range []string{"team@muc.x", "other@muc.x", "team@muc.x"} {
+		b.bufferReplay(InboundMessage{Room: room, ID: "shared-id", Body: "message"})
+	}
+	if len(b.replayBuf) != 2 {
+		t.Fatalf("buffered %d messages, want one per room", len(b.replayBuf))
+	}
+}
+
 func TestReplayBufferDedupesStanzaID(t *testing.T) {
 	b := &XMPPBridge{}
 	b.bufferReplay(InboundMessage{Body: "once", ID: "dup"})

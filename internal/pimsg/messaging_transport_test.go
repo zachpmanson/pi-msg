@@ -11,6 +11,7 @@ import (
 
 	"mellium.im/xmpp"
 	"mellium.im/xmpp/jid"
+	"mellium.im/xmpp/stanza"
 )
 
 // Capture real stanza encoding without opening a socket or contacting a server.
@@ -123,6 +124,33 @@ func TestSendMessageDestinationTransport(t *testing.T) {
 				t.Fatalf("sent %d bodies, want 1; %s", bodies, wire.String())
 			}
 		})
+	}
+}
+
+func TestRoomFileReplyAddressesSender(t *testing.T) {
+	b, wire, rpc := messageTransportBridge(t, false)
+	const room = "team@muc.x"
+	const url = "https://upload.x/test.txt"
+	if err := b.xmpp.encodeOOB(room, url, stanza.GroupChatMessage); err != nil {
+		t.Fatal(err)
+	}
+	var file struct {
+		ID   string `xml:"id,attr"`
+		Body string `xml:"body"`
+	}
+	if err := xml.NewDecoder(wire).Decode(&file); err != nil || file.ID == "" || file.Body != url {
+		t.Fatalf("file stanza = %+v, %v", file, err)
+	}
+	b.xmpp.occupants[room]["Zach"] = b.acct.Owner
+	b.xmpp.onMsg = b.onInbound
+	for _, tc := range []struct{ id, from string }{{"owner-followup", "Zach"}, {"peer-followup", "alice"}} {
+		rpc.Reset()
+		b.xmpp.dispatch(incomingMsg{typ: "groupchat", from: room + "/" + tc.from,
+			id: tc.id, body: "a follow-up", replyToID: file.ID, replyToJID: room})
+		if !strings.Contains(rpc.String(), "Your message was replied to.") ||
+			!strings.Contains(rpc.String(), tc.id) || !strings.Contains(rpc.String(), file.ID) {
+			t.Fatalf("%s reply did not trigger a room reply notice: %s", tc.from, rpc.String())
+		}
 	}
 }
 

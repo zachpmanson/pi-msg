@@ -133,7 +133,10 @@ func (b *Bridge) observeReplyMessage(m InboundMessage) {
 		return
 	}
 	if w.room && m.ReplyToID != w.stanzaID && !b.directReplyPing(m.Room, m.Body) {
-		return
+		parent, found := b.xmpp.lookupRoomReply(m.Room, m.ReplyToID)
+		if !found || !parent.Self || parent.SenderID != w.stanzaID {
+			return
+		}
 	}
 	w.timer.Stop()
 	delete(b.replyWatches, conversation)
