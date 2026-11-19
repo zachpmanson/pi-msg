@@ -178,6 +178,49 @@ func TestRoomAssignedReplyID(t *testing.T) {
 	}
 }
 
+func TestRoomReplySenderIDSurvivesOtherRoomHistory(t *testing.T) {
+	const room = "team@muc.x.com"
+	const other = "other@muc.x.com"
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	b.xmpp.recordSelfMessage("same-id", room, "sent here")
+	b.xmpp.recordRoomReply(room, "same-id", "", room, "sent here", true, false)
+	b.xmpp.roomBares[other] = true
+	b.xmpp.dispatchRoom(incomingMsg{typ: "groupchat", from: other + "/alice", id: "same-id", body: "sent elsewhere"})
+	var delivered int
+	b.xmpp.onMsg = func(InboundMessage) { delivered++ }
+	for _, r := range []string{other, room, room} {
+		b.xmpp.dispatchRoom(incomingMsg{typ: "groupchat", from: r + "/alice", id: "followup", body: "follow-up"})
+	}
+	if delivered != 2 {
+		t.Fatalf("delivered %d follow-ups, want one per room", delivered)
+	}
+	m := InboundMessage{Room: room, ReplyToID: "same-id", Body: "follow-up"}
+	if action, _, _ := b.classify(m); action != actionCommentary {
+		t.Fatal("same-room reply lost after another room reused its sender ID")
+	}
+}
+
+func TestRecoveredRoomReplyDoesNotTrustCurrentRoster(t *testing.T) {
+	const room = "team@muc.x.com"
+	b := roomBridge()
+	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
+	b.xmpp.recordRoomReply(room, "sent", "42", room, "sent here", true, false)
+	m := InboundMessage{Room: room, Historical: true, FromOwner: true, RealJID: b.acct.Owner, ReplyToID: "42", Body: "/stop"}
+	recovered := b.recoveredRoomAuthor(m)
+	if action, _, _ := b.classify(recovered); action != actionCommentary || recovered.RealJID != "" {
+		t.Fatalf("unverified historical reply retained owner authority: %+v", recovered)
+	}
+	m.ReplyToID, m.Body = "", "pi: /stop"
+	if _, _, control := boundaryCommand(b.recoveredRoomAuthor(m), b); control {
+		t.Fatal("unverified historical command retained owner authority without a reply stamp")
+	}
+	m.OriginJID = b.acct.Owner
+	if recovered = b.recoveredRoomAuthor(m); !recovered.FromOwner || recovered.RealJID != b.acct.Owner {
+		t.Fatalf("verified owner origin lost: %+v", recovered)
+	}
+}
+
 func TestMUCStanzaID(t *testing.T) {
 	const room = "team@muc.x.com"
 	d := xml.NewDecoder(strings.NewReader(`<body>hi</body>

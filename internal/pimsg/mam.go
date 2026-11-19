@@ -396,18 +396,13 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 		owner = real == b.ownerBare
 	}
 	if col.record {
-		ids := []string{id}
-		if col.room != "" {
-			if stableID := mucStanzaID(rest, col.room); stableID != "" {
-				ids = append(ids, mucReplyKey(col.room, stableID))
-			}
+		if ownLine {
+			b.recordSelfMessage(id, from, body)
+		} else {
+			b.recordInboundMessage(id, from, body, owner)
 		}
-		for _, key := range ids {
-			if ownLine {
-				b.recordSelfMessage(key, from, body)
-			} else {
-				b.recordInboundMessage(key, from, body, owner)
-			}
+		if col.room != "" {
+			b.recordRoomReply(col.room, id, mucStanzaID(rest, col.room), from, body, ownLine, owner)
 		}
 	}
 	if ownLine && col.record {

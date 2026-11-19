@@ -659,7 +659,7 @@ func (b *XMPPBridge) bufferReplay(m InboundMessage) {
 	defer b.mu.Unlock()
 	if m.ID != "" {
 		for _, e := range b.replayBuf {
-			if e.ID == m.ID {
+			if e.Room == m.Room && e.ID == m.ID {
 				return
 			}
 		}
@@ -1268,7 +1268,7 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 		// Clients can reply to the room-assigned ID rather than the ID we sent.
 		// Index the echo without treating it as input or satisfying reply watches.
 		if m.roomStanzaID != "" && strings.TrimSpace(m.body) != "" {
-			b.recordSelfMessage(mucReplyKey(room, m.roomStanzaID), m.from, m.body)
+			b.recordRoomReply(room, m.id, m.roomStanzaID, m.from, m.body, true, false)
 		}
 		return
 	}
@@ -1309,7 +1309,7 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	if strings.TrimSpace(m.body) == "" && len(m.reactions) == 0 {
 		return // subject-only, chat-states, empty (reaction-only acks forwarded below)
 	}
-	if m.id != "" && b.seenDuplicate(m.id) {
+	if key := stanzaDeliveryKey(room, m.id); key != "" && b.seenDuplicate(key) {
 		return
 	}
 	if strings.TrimSpace(m.body) != "" && b.onReplyMessage != nil {
@@ -1319,9 +1319,7 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	// by ID, and so a later reply to it can be resolved and quoted (#95).
 	owner := real != "" && real == b.ownerBare
 	b.recordInboundMessage(m.id, m.from, m.body, owner)
-	if m.roomStanzaID != "" {
-		b.recordInboundMessage(mucReplyKey(room, m.roomStanzaID), m.from, m.body, owner)
-	}
+	b.recordRoomReply(room, m.id, m.roomStanzaID, m.from, m.body, false, owner)
 	b.onMsg(InboundMessage{
 		Body:       m.body,
 		Nick:       nick,
@@ -1826,6 +1824,9 @@ func (b *XMPPBridge) encodeChat(to, body string, typ stanza.MessageType, reply *
 // before writing so the room can echo or receive a reply as soon as it arrives.
 func (b *XMPPBridge) encodeMessage(ctx context.Context, session *xmpp.Session, msg any, to, id, body string) error {
 	b.recordSelfMessage(id, to, body)
+	if room := bareJid(to); b.isRoomJID(room) {
+		b.recordRoomReply(room, id, "", to, body, true, false)
+	}
 	if err := b.encode(ctx, session, msg); err != nil {
 		return err
 	}
@@ -1898,6 +1899,7 @@ func (b *XMPPBridge) encodeReceipt(to, ns, local, forID string) error {
 type msgHistoryEntry struct {
 	FromJID         string // author of the quoted stanza (XEP-0461)
 	ConversationJID string // chat/room target in which it appeared
+	SenderID        string // original message ID, for room-assigned reply aliases
 	Timestamp       time.Time
 	Body            string
 	Self            bool
@@ -2034,9 +2036,34 @@ func (b *XMPPBridge) lookupMessageEntry(id string) (msgHistoryEntry, bool) {
 	return e, ok
 }
 
-// Room-assigned IDs are unique only within their assigning room. The prefix
-// separates these keys from the original sender IDs accepted for legacy clients.
-func mucReplyKey(room, id string) string { return room + "\x00" + id }
+// Neither room-assigned IDs nor sender IDs are global. The two scoped indexes
+// also keep the room's ID namespace separate from sender-chosen IDs.
+func mucReplyKey(room, id string) string  { return room + "\x00" + id }
+func mucSenderKey(room, id string) string { return "\x00sender\x00" + room + "\x00" + id }
+
+func (b *XMPPBridge) recordRoomReply(room, senderID, stableID, from, body string, self, owner bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record := func(key string) {
+		b.recordMessageBodyLocked(key, from, body)
+		e := b.msgHistory[key]
+		e.Self, e.Owner, e.SenderID = self, owner, senderID
+		b.msgHistory[key] = e
+	}
+	if senderID != "" {
+		record(mucSenderKey(room, senderID))
+	}
+	if stableID != "" {
+		record(mucReplyKey(room, stableID))
+	}
+}
+
+func stanzaDeliveryKey(room, id string) string {
+	if room == "" || id == "" {
+		return id
+	}
+	return mucSenderKey(room, id)
+}
 
 func (b *XMPPBridge) lookupRoomReply(room, id string) (msgHistoryEntry, bool) {
 	if room == "" || id == "" {
@@ -2045,6 +2072,9 @@ func (b *XMPPBridge) lookupRoomReply(room, id string) (msgHistoryEntry, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if e, ok := b.msgHistory[mucReplyKey(room, id)]; ok {
+		return e, true
+	}
+	if e, ok := b.msgHistory[mucSenderKey(room, id)]; ok {
 		return e, true
 	}
 	e, ok := b.msgHistory[id]

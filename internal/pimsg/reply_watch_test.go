@@ -198,6 +198,24 @@ func TestReplyWatchTransportObservation(t *testing.T) {
 	}
 }
 
+func TestReplyWatchRoomAssignedID(t *testing.T) {
+	const room = "team@muc.x"
+	b := newTestBridge(ResolvedAccount{JID: "pi@x", Owner: "owner@x", Nick: "pi", Rooms: []string{room}})
+	b.xmpp.onReplyMessage = b.observeReplyMessage
+	b.xmpp.dispatchRoom(incomingMsg{typ: "groupchat", from: room + "/pi", body: "older", id: "older", roomStanzaID: "40"})
+	b.xmpp.dispatchRoom(incomingMsg{typ: "groupchat", from: room + "/pi", body: "watched", id: "watched", roomStanzaID: "41"})
+	testReplyWatch(t, b, room, "watched", true)
+	for _, tc := range []struct {
+		id, parent string
+		stillArmed bool
+	}{{"earlier-reply", "40", true}, {"watched-reply", "41", false}} {
+		b.xmpp.dispatchRoom(incomingMsg{typ: "groupchat", from: room + "/alice", body: "follow-up", id: tc.id, replyToID: tc.parent})
+		if got := b.replyWatches[room] != nil; got != tc.stillArmed {
+			t.Fatalf("after %s, watch armed=%v; want %v", tc.id, got, tc.stillArmed)
+		}
+	}
+}
+
 func TestReplyWatchNotArmedOnFailureOrOmission(t *testing.T) {
 	for _, mode := range []string{"omitted", "offline", "denied"} {
 		t.Run(mode, func(t *testing.T) {

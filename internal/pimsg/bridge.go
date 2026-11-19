@@ -4752,6 +4752,22 @@ func (b *Bridge) mamFetch(ctx context.Context, since time.Time) []InboundMessage
 	return all
 }
 
+// recoveredRoomAuthor keeps historical routing separate from command authority.
+// Do not promote historical replies or controls based on today's roster. Keep
+// legacy attribution for ordinary non-reply chat to preserve catch-up delivery.
+func (b *Bridge) recoveredRoomAuthor(m InboundMessage) InboundMessage {
+	if m.Room == "" || !m.Historical {
+		return m
+	}
+	_, body := b.matchTrigger(m.Room, m.Body)
+	text := strings.TrimSpace(body)
+	if m.ReplyToID != "" || strings.HasPrefix(text, "/") || strings.HasPrefix(text, "!") || text == "&" {
+		m.RealJID = m.OriginJID
+		m.FromOwner = m.OriginJID != "" && m.OriginJID == bareJid(b.acct.Owner)
+	}
+	return m
+}
+
 // deliverRecovered hands a recovered backlog to the resumed session in one
 // chronological block: a catch-up banner first, then each buffered/archived
 // message through the normal canonical/room path, then any unacknowledged inbox
@@ -4772,7 +4788,7 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
 	durable := append(append([]inboxEntry(nil), inboxes...), b.inboxPending()...)
 	fresh := make([]InboundMessage, 0, len(msgs))
 	for _, m := range msgs {
-		if b.xmpp.hasSeen(m.ID) {
+		if b.xmpp.hasSeen(stanzaDeliveryKey(m.Room, m.ID)) {
 			continue
 		}
 		overlap := false
@@ -4809,13 +4825,14 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
 		if m.Own || (m.Direct && b.acct.JID != "" && bareJid(m.From) == bareJid(b.acct.JID)) {
 			continue
 		}
+		m = b.recoveredRoomAuthor(m)
 		if m.Direct {
 			b.captureAutoInbound(m)
 		} else if action, _, _ := b.classify(m); action != actionNotOurs {
 			b.captureAutoInbound(m)
 		}
 		b.autoActivity()
-		b.xmpp.markSeen(m.ID)
+		b.xmpp.markSeen(stanzaDeliveryKey(m.Room, m.ID))
 		b.noteInboundHandled()
 		b.sessionTransitionMu.Lock()
 		held := b.admitNext(m)

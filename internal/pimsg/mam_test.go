@@ -197,6 +197,16 @@ func mustMarshal(t *testing.T, v any) []byte {
 
 // Duplicate stanza ids must not enter the replay buffer twice: the same message
 // can arrive as a server-pushed delayed stanza and again from MAM.
+func TestReplayBufferScopesStanzaIDToRoom(t *testing.T) {
+	b := &XMPPBridge{}
+	for _, room := range []string{"team@muc.x", "other@muc.x", "team@muc.x"} {
+		b.bufferReplay(InboundMessage{Room: room, ID: "shared-id", Body: "message"})
+	}
+	if len(b.replayBuf) != 2 {
+		t.Fatalf("buffered %d messages, want one per room", len(b.replayBuf))
+	}
+}
+
 func TestReplayBufferDedupesStanzaID(t *testing.T) {
 	b := &XMPPBridge{}
 	b.bufferReplay(InboundMessage{Body: "once", ID: "dup"})
