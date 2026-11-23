@@ -254,6 +254,9 @@ func TestQueuedNextGuardsAndPeerAuthority(t *testing.T) {
 			peer := InboundMessage{Body: "pi: /new", Room: "team@muc.x", Nick: "peer", RealJID: "peer@x", From: "team@muc.x/peer", ID: "peer", ReplyToID: "parent"}
 			f.b.onInbound(peer)
 			f.step()
+			if strings.Contains(fileText(filepath.Join(f.dir, "commands")), `"type":"new_session"`) {
+				t.Fatal("busy queue reset the session")
+			}
 			es := f.b.inbox.protectedPending()
 			if len(f.jobs(t)) != 0 || len(es) != 1 || es[0].FromOwner || es[0].Body != peer.Body || es[0].ReplyToID != "parent" || es[0].Room != peer.Room {
 				t.Fatal("guard bypass or peer authority/metadata changed")

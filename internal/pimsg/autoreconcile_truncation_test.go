@@ -11,8 +11,17 @@ import (
 
 func TestAutoreconcileTextTruncationIdempotent(t *testing.T) {
 	const marker = " [truncated]"
-	for _, runeText := range []string{"é", "界", "😀"} {
-		for _, limit := range []int{512, autoBodyBytes} {
+	checkTagged := func(label, tagged string, limit int) {
+		t.Helper()
+		bounded := autoText(tagged, limit)
+		if len(bounded) > limit+len(marker) || !strings.HasSuffix(bounded, marker) || autoText(bounded, limit) != bounded {
+			t.Fatalf("%s limit %d: oversized tagged input escaped stable bounding", label, limit)
+		}
+	}
+	for _, limit := range []int{512, autoBodyBytes} {
+		checkTagged("ASCII complete marker", strings.Repeat("x", limit+1)+marker, limit)
+		checkTagged("ASCII incomplete marker", strings.Repeat("x", limit+len(marker))+" [truncated", limit)
+		for _, runeText := range []string{"é", "界", "😀"} {
 			source := strings.Repeat(runeText, 3000)
 			want := source[:limit/len(runeText)*len(runeText)] + marker
 			got := autoText(source, limit)
@@ -25,16 +34,7 @@ func TestAutoreconcileTextTruncationIdempotent(t *testing.T) {
 					t.Fatalf("%q limit %d: normalization %d changed bounded text", runeText, limit, n)
 				}
 			}
-			for _, tagged := range []string{
-				source + marker,
-				strings.Repeat("x", limit+1) + marker,
-				strings.Repeat("x", limit+len(marker)) + " [truncated",
-			} {
-				bounded := autoText(tagged, limit)
-				if len(bounded) > limit+len(marker) || !strings.HasSuffix(bounded, marker) || autoText(bounded, limit) != bounded {
-					t.Fatalf("%q limit %d: oversized tagged input escaped stable bounding", runeText, limit)
-				}
-			}
+			checkTagged(runeText, source+marker, limit)
 		}
 	}
 }

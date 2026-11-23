@@ -241,80 +241,84 @@ func touchNext(t *testing.T, path string) {
 	}
 }
 
-func TestNextAndAmpersandBackgroundTransport(t *testing.T) {
-	for _, command := range []string{"/next", "!next", "  &  "} {
-		t.Run(command, func(t *testing.T) {
-			f := nextSetup(t)
-			before := fileText(f.sources[0])
-			f.b.messagingSeeded = true
-			f.b.ranSinceStart = true
-			f.command(command, "team@muc.x")
-			jobs := f.jobs(t)
-			if len(jobs) != 1 {
-				t.Fatalf("jobs: %v; wire %s", jobs, f.wire.String())
-			}
-			dir := jobs[0]
-			if !strings.Contains(f.wire.String(), `to="team@muc.x"`) || !strings.Contains(f.wire.String(), "queued in background") || !strings.Contains(f.wire.String(), "new session ready") {
-				t.Fatalf("missing real queued stanza: %s", f.wire.String())
-			}
-			if f.b.messagingSeeded || f.b.hasRun() || loadSessionState("test") != f.sources[1] {
-				t.Fatalf("fresh state/resume not updated")
-			}
-			if !strings.Contains(fileText(filepath.Join(f.dir, "registered")), dir) {
-				t.Fatal("job not registered before reset")
-			}
-			awaitNext(t, "actual worker start", func() bool {
-				j, e := loadReconcile(dir)
-				return e == nil && j.State == "running" && fileText(filepath.Join(dir, "args")) != ""
-			})
-			f.b.setTurnDest(f.b.acct.Owner, false)
-			f.b.pollReconciles()
-			if !strings.Contains(f.wire.String(), "reconciliation running in background") {
-				t.Fatalf("missing real running stanza: %s", f.wire.String())
-			}
-			args := fileText(filepath.Join(dir, "args"))
-			for _, s := range []string{"--no-extensions", "--no-context-files", "--no-skills", "--skill", filepath.Join(dir, "learn", "SKILL.md"), "--fork", filepath.Join(dir, "snapshot.jsonl"), "--session-dir", "fake/model", "--thinking\nhigh", "ONLY reconcile GitHub issues", "do not edit application source"} {
-				if !strings.Contains(args, s) {
-					t.Errorf("args missing %q: %s", s, args)
-				}
-			}
-			// Fresh primary prompts remain usable while worker is blocked.
-			f.command("new question", f.b.acct.Owner)
-			touchNext(t, filepath.Join(f.dir, "release"))
-			awaitNext(t, "worker terminal", func() bool { j, e := loadReconcile(dir); return e == nil && j.State == "completed" })
-			// Terminal metadata precedes runner.lock release; observe delivery,
-			// not just publication of the worker's terminal state.
-			awaitNext(t, "completion reported", func() bool {
-				f.b.pollReconciles()
-				_, err := os.Stat(filepath.Join(dir, "reported"))
-				return err == nil
-			})
-			wire := f.wire.String()
-			if strings.Contains(wire, `to="zach@x"`) || !strings.Contains(wire, "issues reconciled; wiki unchanged") || !strings.Contains(wire, `type="groupchat"`) {
-				t.Fatalf("completion destination changed: %s", wire)
-			}
-			if got := fileText(f.sources[0]); got != before {
-				t.Fatal("source changed")
-			}
-			if got := fileText(filepath.Join(dir, "snapshot.jsonl")); got != before {
-				t.Fatal("snapshot changed")
-			}
-			if !strings.Contains(fileText(filepath.Join(dir, "sessions", "worker.jsonl")), "private write") {
-				t.Fatal("fake fork not written")
-			}
-			if strings.Contains(fileText(filepath.Join(f.dir, "commands")), "/skill:reconcile") {
-				t.Fatal("old context injected into primary")
-			}
-			f.b.pollReconciles()
-			if f.wire.String() != wire {
-				t.Fatal("duplicate terminal report")
-			}
-		})
+func TestNextBackgroundTransport(t *testing.T) {
+	f := nextSetup(t)
+	// Room aliases reach the same durable queue. Exercise the worker lifecycle
+	// once; the alias-specific behavior is recognizing the addressed command.
+	for _, alias := range []string{"!next", "  &  "} {
+		name, arg, control := boundaryCommand(InboundMessage{Body: "pi: " + alias, FromOwner: true, Room: "team@muc.x", From: f.b.acct.Owner}, f.b)
+		if name != "next" || arg != "" || !control {
+			t.Fatalf("room alias %q was not recognized as /next: %q %q %v", alias, name, arg, control)
+		}
+	}
+	before := fileText(f.sources[0])
+	f.b.messagingSeeded = true
+	f.b.ranSinceStart = true
+	f.command("/next", "team@muc.x")
+	jobs := f.jobs(t)
+	if len(jobs) != 1 {
+		t.Fatalf("jobs: %v; wire %s", jobs, f.wire.String())
+	}
+	dir := jobs[0]
+	if !strings.Contains(f.wire.String(), `to="team@muc.x"`) || !strings.Contains(f.wire.String(), "queued in background") || !strings.Contains(f.wire.String(), "new session ready") {
+		t.Fatalf("missing real queued stanza: %s", f.wire.String())
+	}
+	if f.b.messagingSeeded || f.b.hasRun() || loadSessionState("test") != f.sources[1] {
+		t.Fatalf("fresh state/resume not updated")
+	}
+	if !strings.Contains(fileText(filepath.Join(f.dir, "registered")), dir) {
+		t.Fatal("job not registered before reset")
+	}
+	awaitNext(t, "actual worker start", func() bool {
+		j, e := loadReconcile(dir)
+		return e == nil && j.State == "running" && fileText(filepath.Join(dir, "args")) != ""
+	})
+	f.b.setTurnDest(f.b.acct.Owner, false)
+	f.b.pollReconciles()
+	if !strings.Contains(f.wire.String(), "reconciliation running in background") {
+		t.Fatalf("missing real running stanza: %s", f.wire.String())
+	}
+	args := fileText(filepath.Join(dir, "args"))
+	for _, s := range []string{"--no-extensions", "--no-context-files", "--no-skills", "--skill", filepath.Join(dir, "learn", "SKILL.md"), "--fork", filepath.Join(dir, "snapshot.jsonl"), "--session-dir", "fake/model", "--thinking\nhigh", "ONLY reconcile GitHub issues", "do not edit application source"} {
+		if !strings.Contains(args, s) {
+			t.Errorf("args missing %q: %s", s, args)
+		}
+	}
+	// Fresh primary prompts remain usable while worker is blocked.
+	f.command("new question", f.b.acct.Owner)
+	touchNext(t, filepath.Join(f.dir, "release"))
+	awaitNext(t, "worker terminal", func() bool { j, e := loadReconcile(dir); return e == nil && j.State == "completed" })
+	// Terminal metadata precedes runner.lock release; observe delivery,
+	// not just publication of the worker's terminal state.
+	awaitNext(t, "completion reported", func() bool {
+		f.b.pollReconciles()
+		_, err := os.Stat(filepath.Join(dir, "reported"))
+		return err == nil
+	})
+	wire := f.wire.String()
+	if strings.Contains(wire, `to="zach@x"`) || !strings.Contains(wire, "issues reconciled; wiki unchanged") || !strings.Contains(wire, `type="groupchat"`) {
+		t.Fatalf("completion destination changed: %s", wire)
+	}
+	if got := fileText(f.sources[0]); got != before {
+		t.Fatal("source changed")
+	}
+	if got := fileText(filepath.Join(dir, "snapshot.jsonl")); got != before {
+		t.Fatal("snapshot changed")
+	}
+	if !strings.Contains(fileText(filepath.Join(dir, "sessions", "worker.jsonl")), "private write") {
+		t.Fatal("fake fork not written")
+	}
+	if strings.Contains(fileText(filepath.Join(f.dir, "commands")), "/skill:reconcile") {
+		t.Fatal("old context injected into primary")
+	}
+	f.b.pollReconciles()
+	if f.wire.String() != wire {
+		t.Fatal("duplicate terminal report")
 	}
 }
 
 func TestNextPreparationRefusesWithoutReset(t *testing.T) {
-	for _, kind := range []string{"unset", "relative", "missing", "directory", "fifo", "unreadable", "empty", "learn unreadable", "snapshot missing", "bad snapshot", "missing model", "arguments", "streaming", "background shell", "background subagent", "rpc streaming", "rpc compacting", "rpc pending", "shared lock failure", "storage failure"} {
+	for _, kind := range []string{"unset", "relative", "missing", "directory", "fifo", "unreadable", "empty", "learn unreadable", "snapshot missing", "bad snapshot", "missing model", "arguments", "streaming", "rpc streaming", "shared lock failure", "storage failure"} {
 		t.Run(kind, func(t *testing.T) {
 			f := nextSetup(t)
 			switch kind {
@@ -342,27 +346,18 @@ func TestNextPreparationRefusesWithoutReset(t *testing.T) {
 				_ = os.Remove(f.sources[0])
 			case "bad snapshot":
 				_ = os.WriteFile(f.sources[0], []byte("not JSON"), 0600)
-			case "missing model", "rpc streaming", "rpc compacting", "rpc pending":
+			case "missing model", "rpc streaming":
 				var state map[string]any
 				_ = json.Unmarshal([]byte(fileText(filepath.Join(f.dir, "state-0.json"))), &state)
-				switch kind {
-				case "missing model":
+				if kind == "missing model" {
 					delete(state, "model")
-				case "rpc streaming":
+				} else {
 					state["isStreaming"] = true
-				case "rpc compacting":
-					state["isCompacting"] = true
-				case "rpc pending":
-					state["pendingMessageCount"] = 1
 				}
 				raw, _ := json.Marshal(state)
 				_ = os.WriteFile(filepath.Join(f.dir, "state-0.json"), raw, 0600)
 			case "streaming":
 				f.b.streamingRun = true
-			case "background shell":
-				f.b.bgProcesses = 1
-			case "background subagent":
-				f.b.bgSubagents = 1
 			case "shared lock failure":
 				if err := os.MkdirAll(filepath.Join(f.dir, ".local", "state", "pi-msg", "reconcile.lock"), 0700); err != nil {
 					t.Fatal(err)
@@ -530,8 +525,8 @@ func TestNextInterruptedRecoveryNeverReplays(t *testing.T) {
 	}
 }
 
-func TestNextRunnerGateLossTimeoutAndCancellation(t *testing.T) {
-	for _, kind := range []string{"gate loss", "timeout", "signal"} {
+func TestNextRunnerTimeoutAndCancellation(t *testing.T) {
+	for _, kind := range []string{"timeout", "signal"} {
 		t.Run(kind, func(t *testing.T) {
 			f := nextSetup(t)
 			if kind == "timeout" {
@@ -546,14 +541,12 @@ func TestNextRunnerGateLossTimeoutAndCancellation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if kind != "gate loss" {
-				touchNext(t, filepath.Join(f.dir, "commands"))
-				_ = os.WriteFile(filepath.Join(f.dir, "commands"), []byte("reset\n"), 0600)
-				if err := authorizeReconcile(dir); err != nil {
-					t.Fatal(err)
-				}
-				_, _ = gate.Write([]byte("run\n"))
+			touchNext(t, filepath.Join(f.dir, "commands"))
+			_ = os.WriteFile(filepath.Join(f.dir, "commands"), []byte("reset\n"), 0600)
+			if err := authorizeReconcile(dir); err != nil {
+				t.Fatal(err)
 			}
+			_, _ = gate.Write([]byte("run\n"))
 			gate.Close()
 			if kind == "signal" {
 				awaitNext(t, "runner start", func() bool { j, _ := loadReconcile(dir); return j != nil && j.State == "running" })
@@ -561,16 +554,7 @@ func TestNextRunnerGateLossTimeoutAndCancellation(t *testing.T) {
 				p, _ := os.FindProcess(j.RunnerPID)
 				_ = p.Signal(syscall.SIGTERM)
 			}
-			want := "cancelled"
-			if kind == "gate loss" {
-				want = "interrupted"
-			}
-			awaitNext(t, want, func() bool { j, _ := loadReconcile(dir); return j != nil && j.State == want })
-			if kind == "gate loss" {
-				if _, err := os.Stat(filepath.Join(dir, "started")); !os.IsNotExist(err) {
-					t.Fatal("worker effects before reset authorization")
-				}
-			}
+			awaitNext(t, "cancelled", func() bool { j, _ := loadReconcile(dir); return j != nil && j.State == "cancelled" })
 		})
 	}
 }

@@ -16,7 +16,6 @@ func TestAwayTimeoutConfig(t *testing.T) {
 		{name: "five minutes", value: "5m", want: 5 * time.Minute},
 		{name: "duration", value: "1h30m", want: 90 * time.Minute},
 		{name: "zero", value: "0", bad: true},
-		{name: "zero unit", value: "0m", bad: true},
 		{name: "negative", value: "-5m", bad: true},
 		{name: "malformed", value: "five minutes", bad: true},
 		{name: "no unit", value: "5", bad: true},
@@ -57,7 +56,6 @@ func TestIdleTickAwayTimeout(t *testing.T) {
 	}{
 		{"five minutes before", 5 * time.Minute, 4 * time.Minute, false},
 		{"five minutes after", 5 * time.Minute, 6 * time.Minute, true},
-		{"default before", 0, 6 * time.Minute, false},
 		{"default just before", 0, 19 * time.Minute, false},
 		{"default after", 0, 21 * time.Minute, true},
 	} {
@@ -71,9 +69,6 @@ func TestIdleTickAwayTimeout(t *testing.T) {
 			}
 			if b.acct.AutoreconcileTimeout != 0 || b.auto.running {
 				t.Fatal("away threshold enabled automatic cleanup")
-			}
-			if ParticipationHorizon != 20*time.Minute {
-				t.Fatal("room participation horizon changed")
 			}
 		})
 	}

@@ -159,14 +159,14 @@ func TestUntaggedOwnerReachesRecentParticipants(t *testing.T) {
 	}
 
 	// Taking part in the conversation puts us back in earshot...
-	spokeAgo(b, room, 5*time.Minute)
+	spokeAgo(b, room, 19*time.Minute)
 	if got := owner(b, room, "status please"); got != actionCanonical {
 		t.Errorf("after speaking here: untagged owner message = %v, want actionCanonical", got)
 	}
 
-	// ...for the window, and no longer: the horizon is the conversation's, not
-	// ours to extend.
-	spokeAgo(b, room, ParticipationHorizon+time.Minute)
+	// ...for the 20-minute window, and no longer: the horizon is the
+	// conversation's, not ours to extend.
+	spokeAgo(b, room, 21*time.Minute)
 	if got := owner(b, room, "status please"); got != actionNotOurs {
 		t.Errorf("after the window: untagged owner message = %v, want actionNotOurs", got)
 	}
