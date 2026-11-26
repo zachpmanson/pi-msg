@@ -86,7 +86,8 @@ func TestWakeGuardPreflightsActualRoomChunks(t *testing.T) {
 					t.Fatal("fixture must produce multiple transport chunks")
 				}
 				if tt.blocked {
-					if addressed, _ := matchTriggerName(tt.text, "alice"); addressed || containsBroadcast(stripUnquoted(tt.text)) {
+					addr := parseRoomAddressing(tt.text)
+					if addressed, _ := addr.matchName("alice"); addressed || addr.hasAny(broadcastHandles) {
 						t.Fatal("fixture must be quoted before transport chunking")
 					}
 				}

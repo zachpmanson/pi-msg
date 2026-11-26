@@ -161,8 +161,8 @@ func (b *XMPPBridge) sleepingMessageTargets(to, text string, reply *replyTarget,
 	}
 	targetSet := make(map[string]bool)
 	for i, part := range parts {
-		scan := stripUnquoted(strings.TrimSpace(part))
-		broadcast := containsBroadcast(scan) || containsFreeBroadcast(scan)
+		addr := parseRoomAddressing(part)
+		broadcast := addr.hasAny(broadcastHandles) || addr.hasAny(freeHandles)
 		partReply := replyForChunk(i, reply)
 		for endpoint, p := range b.peerPresence {
 			if bareJid(endpoint) != roomJID || !p.agent || !sleepingShow(p.show) || b.wakeExemptJID(p.jid) {
@@ -172,7 +172,7 @@ func (b *XMPPBridge) sleepingMessageTargets(to, text string, reply *replyTarget,
 			if nick == "" || nick == ownNick {
 				continue
 			}
-			addressed, _ := matchTriggerName(part, nick)
+			addressed, _ := addr.matchName(nick)
 			if broadcast || addressed || (partReply != nil && canonicalPeerJID(partReply.author) == endpoint) {
 				targetSet[nick+" ("+p.show+")"] = true
 			}

@@ -65,7 +65,7 @@ func TestRoomPointerBlocks(t *testing.T) {
 			notice: &roomNotice{kind: noticeOwnerBroadcast},
 			sender: owner,
 			id:     osid,
-			want: "[pi-msg: room: The owner spoke to the room without naming anyone. The text is not in this prompt.\n" +
+			want: "[pi-msg: room: This owner message reached you via ordinary room routing. The text is not in this prompt.\n" +
 				"from: " + room + "\n" +
 				"sender: " + owner + "\n" +
 				"stanza-id: " + osid + "\n" +
@@ -217,7 +217,10 @@ func TestRoomNoticeFor(t *testing.T) {
 		{"owner broadcast", InboundMessage{Room: room, Body: "everyone please note", FromOwner: true}, noticeOwnerBroadcast},
 		{"owner @free", InboundMessage{Room: room, Body: "@free report in", FromOwner: true}, noticeOwnerBroadcast},
 		{"peer @free", InboundMessage{Room: room, Body: "@free report in"}, noticeFreeBroadcast},
-		{"peer @free naming us too", InboundMessage{Room: room, Body: "@free and pi: report in"}, noticeTag},
+		{"peer @free with only our bare name", InboundMessage{Room: room, Body: "@free and pi: report in"}, noticeFreeBroadcast},
+		{"peer @free explicitly tagging us too", InboundMessage{Room: room, Body: "@free and @pi report in"}, noticeTag},
+		{"owner bare name tags us", InboundMessage{Room: room, Body: "hello pi", FromOwner: true}, noticeTag},
+		{"another bare name doesn't tag us", InboundMessage{Room: room, Body: "hello peer", FromOwner: true}, noticeOwnerBroadcast},
 		{"owner broadcast to all", InboundMessage{Room: room, Body: "@everyone hello", FromOwner: true}, noticeTag},
 		{"reply to ours", InboundMessage{Room: room, Body: "and another thing", ReplyToID: ours}, noticeReplyToOwn},
 	}

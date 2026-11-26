@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"mellium.im/xmpp/jid"
 )
@@ -1279,8 +1281,7 @@ func (b *Bridge) handleReaction(m InboundMessage) {
 	// another occupant's message is somebody else's conversation: with no ambient
 	// buffer and no passive awareness (#106), waking on it would be the last
 	// surviving room path where a non-addressing message costs a turn — and an
-	// owner's reaction to a peer's message is that peer's business, exactly as an
-	// owner reply to it is (ownerDirectedElsewhere).
+	// owner's reaction to a peer's message is that peer's business.
 	if !m.Direct {
 		if b.xmpp != nil && b.xmpp.replyTargetOther(m.ReactionID) {
 			b.log("info", fmt.Sprintf("reaction from %s dropped: it targets another agent's message (#106)", render))
@@ -1366,13 +1367,13 @@ type roomNotice struct {
 
 // roomNoticeFor selects the pointer block for a room-triggered prompt (#58): E
 // when the message replies to one of ours, C when the owner spoke to the room
-// without naming anyone, F when someone summoned the room's away agents with
+// via ordinary owner routing, F when someone summoned the room's away agents with
 // @free, A otherwise. It returns nil for a non-room turn, which keeps the
 // header+body form (owner DMs, initial prompts).
 //
 // The owner's C block covers both an admitted untagged message and an @free
-// summons, but not @everyone, which is an aimed broadcast and reads as a tag. C is deliberately not selectable by a peer: only the
-// owner can speak to the room without naming anyone.
+// summons, but not @everyone, which reads as a tag. C is not selectable by a
+// peer: only the owner can reach agents who aren't addressed.
 func (b *Bridge) roomNoticeFor(m InboundMessage) *roomNotice {
 	if m.Room == "" {
 		return nil
@@ -1380,11 +1381,12 @@ func (b *Bridge) roomNoticeFor(m InboundMessage) *roomNotice {
 	if m.ReplyToID != "" && b.replyToOwnMessage(m) {
 		return &roomNotice{kind: noticeReplyToOwn, parentID: m.ReplyToID}
 	}
-	explicit, _ := b.matchTriggerExplicit(m.Room, m.Body)
-	if m.FromOwner && !explicit && !broadcastsToAll(m.Body) {
+	addr := parseRoomAddressing(m.Body)
+	named, _ := addr.matchName(b.acct.TriggerFor(m.Room))
+	if m.FromOwner && !named && !addr.hasAny(broadcastHandles) {
 		return &roomNotice{kind: noticeOwnerBroadcast}
 	}
-	if !explicit && freeOnlyBroadcast(m.Body) {
+	if !named && addr.hasAny(freeHandles) && !addr.hasAny(broadcastHandles) {
 		return &roomNotice{kind: noticeFreeBroadcast}
 	}
 	return &roomNotice{kind: noticeTag}
@@ -1414,71 +1416,42 @@ const (
 // word when a bare mention was the only reason we were addressed (else "") —
 // the false-trigger counter.
 func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
-	addressed, stripped := b.matchTrigger(m.Room, m.Body)
-	explicit, _ := b.matchTriggerExplicit(m.Room, m.Body)
-	mention := ""
-	if addressed {
-		mention = b.bareMention(m.Room, m.Body)
+	addr := parseRoomAddressing(m.Body)
+	trig := b.acct.TriggerFor(m.Room)
+	action := actionCommentary
+	if m.FromOwner {
+		action = actionCanonical
+	}
+	if named, stripped := addr.matchName(trig); named {
+		mention := addr.bareMention(trig)
 		if mention != "" {
 			b.log("notice", fmt.Sprintf("bare-name mention %q from %q in %s addressed us", mention, m.Nick, m.Room))
 		}
+		return action, stripped, mention
 	}
-	// The presence gate: an @free body reaches us only while we are free — away,
-	// or a bridge nothing has been asked of yet. m.Addressed means the message
-	// cleared this gate when it first arrived and is being re-delivered from the
-	// durable queue (a restart empties the presence we would re-derive it from),
-	// so the verdict travels with it rather than being recomputed.
-	replyToOwn := b.replyToOwnMessage(m)
-	if !m.Addressed && !explicit && !replyToOwn && freeOnlyBroadcast(m.Body) && !b.freeForSummons() {
-		b.log("info", fmt.Sprintf("free broadcast in %s from %q skipped: we are not free", m.Room, m.Nick))
+	// A durable inbox entry already cleared admission before any presence or
+	// stanza history changes. A reply to our own stanza is independently aimed.
+	if m.Addressed || b.replyToOwnMessage(m) || (trig != "" && addr.hasAny(broadcastHandles)) {
+		return action, m.Body, ""
+	}
+	if trig != "" && addr.hasAny(freeHandles) && b.freeForSummons() {
+		return action, m.Body, ""
+	}
+	// A standalone @handle opts out of ordinary delivery, even if it is a
+	// typo or its recipient is absent from our roster. Bare names only add
+	// recipients; to everyone else the message follows unaddressed routing.
+	if len(addr.handles) != 0 || !m.FromOwner {
 		return actionNotOurs, m.Body, ""
 	}
-	switch {
-	case m.FromOwner:
-		// The owner is trusted traffic, so an owner room message needs no
-		// mention to reach us — but only an owner message that names nobody is
-		// a broadcast. A tag or a stanza reply picks out an account, and the
-		// message belongs to that account alone (#106).
-		if addressed {
-			if explicit {
-				return actionCanonical, stripped, ""
-			}
-			// @everyone / @free (and we are away): a broadcast, body intact.
-			return actionCanonical, m.Body, ""
-		}
-		if replyToOwn {
-			return actionCanonical, m.Body, ""
-		}
-		if who, why := b.ownerDirectedElsewhere(m); who != "" {
-			b.log("notice", fmt.Sprintf("owner message in %s is directed at %s (%s), not us — not delivering", m.Room, who, why))
+	if b.xmpp != nil {
+		if parent, ok := b.xmpp.lookupRoomReply(m.Room, m.ReplyToID); ok && !parent.Self && !parent.Owner {
 			return actionNotOurs, m.Body, ""
 		}
-		// Unnamed owner messages continue the conversation for recent room
-		// participants. Waking other free agents is opt-in; explicit @free and
-		// @everyone summons were handled above. Preserve prior admission when
-		// replaying the durable inbox, even if the setting has since changed.
-		if !m.Addressed && !b.participated(m.Room) && !(b.acct.UntaggedOwnerToFree && b.freeForSummons()) {
-			b.log("info", fmt.Sprintf("owner broadcast in %s skipped: no recent participation or enabled free-agent delivery", m.Room))
-			return actionNotOurs, m.Body, ""
-		}
-		return actionCanonical, m.Body, ""
-	case addressed:
-		return actionCommentary, stripped, mention
-	case replyToOwn:
-		// Someone answered something we said, without naming us. Treat it as
-		// addressing us (XEP-0461, #95) rather than dropping it: a reply to our
-		// own message is the one form of non-named traffic that is unambiguously
-		// meant for us.
-		return actionCommentary, m.Body, ""
-	case m.Addressed:
-		// Address-hood already established when this message was received (see
-		// InboundMessage.Addressed): it is being re-delivered from the durable
-		// queue, and the evidence that made it ours may no longer be resolvable
-		// (an emptied stanza history after a restart).
-		return actionCommentary, m.Body, ""
-	default:
-		return actionNotOurs, m.Body, ""
 	}
+	if b.participated(m.Room) || (b.acct.UntaggedOwnerToFree && b.freeForSummons()) {
+		return action, m.Body, ""
+	}
+	return actionNotOurs, m.Body, ""
 }
 
 // replyToOwnMessage reports whether m is a XEP-0461 reply to a stanza this
@@ -1492,90 +1465,6 @@ func (b *Bridge) replyToOwnMessage(m InboundMessage) bool {
 	}
 	e, ok := b.xmpp.lookupRoomReply(m.Room, m.ReplyToID)
 	return ok && e.Self
-}
-
-// ownerDirectedElsewhere reports which other account an owner message is meant
-// for, and why, or ("", "") when it is an unaddressed broadcast. It is only
-// consulted for owner messages that do not address us at all, and it is
-// deliberately about the owner: a peer's unaddressed room message is dropped
-// either way, so the extra work only exists where silence would otherwise mean
-// every agent answering a message written for one of them.
-//
-// Two forms count as directed, in this order:
-//
-//   - a XEP-0461 reply to a stanza we have seen from a peer — the reply answers
-//     that peer. A reply to the owner's own message, or to an id we do not know
-//     (it may be ours, from before a restart), is not evidence of a handoff and
-//     falls through to the untagged broadcast case, so an unresolvable reply is
-//     delivered rather than lost.
-//   - a name: an @handle, a leading "nick:" / "nick,", or a bare nick of
-//     another occupant. Occupants come from presence, so with a roster that has
-//     not populated yet there is no evidence and the message stays a broadcast.
-func (b *Bridge) ownerDirectedElsewhere(m InboundMessage) (who, why string) {
-	if b.xmpp == nil {
-		return "", ""
-	}
-	if e, ok := b.xmpp.lookupRoomReply(m.Room, m.ReplyToID); ok && !e.Self && !e.Owner {
-		return "another agent", fmt.Sprintf("reply to stanza %s", m.ReplyToID)
-	}
-	if who := b.addressesOtherOccupant(m.Room, m.Body); who != "" {
-		return who, "named in the body"
-	}
-	return "", ""
-}
-
-// addressesOtherOccupant reports the nick of another occupant this room message
-// names, or "" if it names nobody but us. It shares the addressing vocabulary
-// the rest of the bridge uses (see matchTrigger), so an owner message is read
-// the same way a peer's message is.
-func (b *Bridge) addressesOtherOccupant(room, body string) string {
-	if b.xmpp == nil || room == "" {
-		return ""
-	}
-	occupants := b.xmpp.OccupantNicks(room)
-	if len(occupants) == 0 {
-		return ""
-	}
-	me := b.xmpp.ownNick(room)
-	if me == "" {
-		me = b.acct.Nick
-	}
-	trig := b.acct.TriggerFor(room)
-	ours := func(name string) bool {
-		return (me != "" && strings.EqualFold(name, me)) || (trig != "" && strings.EqualFold(name, trig))
-	}
-	scan := stripUnquoted(body)
-	if scan == "" {
-		return ""
-	}
-	for _, match := range handleRe.FindAllStringSubmatch(scan, -1) {
-		name := match[1]
-		if ours(name) {
-			continue
-		}
-		for _, occ := range occupants {
-			if strings.EqualFold(name, occ) {
-				return occ
-			}
-		}
-	}
-	// A leading "nick:" / "nick," is the colon form matchTrigger accepts, and a
-	// bare nick anywhere in an unquoted line is the bare-name form.
-	trimmed := strings.TrimSpace(body)
-	for _, occ := range occupants {
-		if ours(occ) {
-			continue
-		}
-		if len(trimmed) > len(occ) && strings.EqualFold(trimmed[:len(occ)], occ) {
-			if c := trimmed[len(occ)]; c == ':' || c == ',' {
-				return occ
-			}
-		}
-		if containsMention(scan, occ) {
-			return occ
-		}
-	}
-	return ""
 }
 
 // handleRoom routes a room message per its classification: owner → canonical
@@ -2365,11 +2254,11 @@ func (b *Bridge) roomsContract() string {
 	if len(b.acct.Rooms) == 0 {
 		return ""
 	}
-	ownerRouting := "Unnamed owner messages reach recent room participants, not other idle agents"
+	ownerRouting := "Unaddressed owner messages reach recent room participants, not other idle agents"
 	if b.acct.UntaggedOwnerToFree {
-		ownerRouting = "Unnamed owner messages may reach idle agents or recent room participants"
+		ownerRouting = "Unaddressed owner messages may reach idle agents or recent room participants"
 	}
-	return fmt.Sprintf("[pi-msg: rooms: Joined rooms: %s. Address agents by bare name or @name; @all addresses all, @free idle agents. Mentions in quotations or code do not count. Messages addressed to other agents and unaddressed peer chatter are not delivered or buffered; history remains readable. %s; replies to your known stanzas can also address you. Use read_messages to retrieve unseen room context.]", strings.Join(b.acct.Rooms, ", "), ownerRouting)
+	return fmt.Sprintf("[pi-msg: rooms: Joined rooms: %s. Use @name to route only to explicit tags and the author of a known reply parent. Without explicit tags, a bare name tags that agent without excluding others from ordinary routing. @all addresses all, @free idle agents. Names in quotations, code, or user@host are not tags. Unaddressed peer chatter is not delivered or buffered; history remains readable. %s; replies to your known stanzas can also address you. Use read_messages to retrieve unseen room context.]", strings.Join(b.acct.Rooms, ", "), ownerRouting)
 }
 
 func (b *Bridge) composePrompt(body, origin, sender, reactID, reactTo, replyTo string, notice *roomNotice) string {
@@ -2438,7 +2327,7 @@ func (b *Bridge) seedContracts(sb *strings.Builder) {
 func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sender, reactID, reactTo string) {
 	switch n.kind {
 	case noticeOwnerBroadcast:
-		sb.WriteString("[pi-msg: room: The owner spoke to the room without naming anyone. The text is not in this prompt.\n")
+		sb.WriteString("[pi-msg: room: This owner message reached you via ordinary room routing. The text is not in this prompt.\n")
 	case noticeFreeBroadcast:
 		sb.WriteString("[pi-msg: room: The room's idle agents were summoned. The text is not in this prompt.\n")
 	case noticeReplyToOwn:
@@ -2462,95 +2351,71 @@ func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sen
 	fmt.Fprintf(sb, "Check message using read_messages(target=%q, limit=15).]", origin)
 }
 
-// matchTrigger reports whether body addresses the bot in room, and returns the
-// text to prompt with. Four forms are accepted:
-//
-//	"pi: …" / "pi, …"  at the start   → addressed; the prefix is stripped
-//	"… pi: …"          anywhere       → addressed; body kept intact
-//	"… @pi …"          anywhere       → addressed; body kept intact
-//	"… pi …"           anywhere       → addressed; body kept intact (bare mention)
-//
-// plus the room-wide handles (@everyone and friends, @free).
-//
-// Agents address each other mid-message far more often than at position 0, so
-// restricting to the leading form drops most handoffs on the floor (#21). The
-// colon form is honoured anywhere for the same reason.
-//
-// The bare mention (no sigil, no colon) was added in #106, when the ambient
-// buffer was removed: with no buffer, a missed address means the message does
-// not exist for the agent at all. It costs false positives — prose about an
-// agent ("beltino handed over to fox") now wakes that agent — which is the
-// deliberate trade for not losing handoffs, and why the old code restricted
-// inline matching to the colon form. Matching is word-boundary and excludes
-// code fences and quoted lines, so a pasted transcript cannot trigger an agent.
-//
-// This is the syntactic question — "does the body name us or the room?" — and it
-// deliberately does NOT apply the @free presence gate; classify does that, since
-// only it decides delivery. Callers asking whether a message reached us must go
-// through classify.
+// matchTrigger checks for a syntactic address without applying the @free
+// presence gate or considering reply metadata and participation (see classify).
 func (b *Bridge) matchTrigger(room, body string) (bool, string) {
-	if ok, stripped := b.matchTriggerExplicit(room, body); ok {
+	addr := parseRoomAddressing(body)
+	trig := b.acct.TriggerFor(room)
+	if ok, stripped := addr.matchName(trig); ok {
 		return true, stripped
 	}
-	if b.acct.TriggerFor(room) == "" {
-		return false, ""
-	}
-	t := strings.TrimSpace(body)
-	scan := stripUnquoted(t)
-	if scan != "" && (containsBroadcast(scan) || containsFreeBroadcast(scan)) {
-		return true, t
+	if trig != "" && (addr.hasAny(broadcastHandles) || addr.hasAny(freeHandles)) {
+		return true, addr.body
 	}
 	return false, ""
 }
 
-// matchTriggerExplicit reports whether body addresses THIS agent by name — the
-// leading "trig:" / "trig," form, an "@trig" handle, or a bare mention — leaving
-// the room-wide handles to matchTrigger. classify needs the split because the two
-// are gated differently (#130): a name is aimed, so it is delivered whatever our
-// presence says, while @free reaches an away agent only.
-func (b *Bridge) matchTriggerExplicit(room, body string) (bool, string) {
-	return matchTriggerName(body, b.acct.TriggerFor(room))
+// roomAddressing is shared by inbound routing and the outbound wake guard.
+// The presence of any valid @handle makes the address list exclusive.
+// Otherwise a bare name adds a recipient without restricting other delivery.
+type roomAddressing struct {
+	body, scan string
+	handles    []string
 }
 
-// matchTriggerName is shared by inbound addressing and the outbound wake guard.
-func matchTriggerName(body, trig string) (bool, string) {
-	if trig == "" {
-		return false, ""
-	}
-	t := strings.TrimSpace(body)
-	// Leading form: strip the prefix so the agent sees only the instruction.
-	if len(t) > len(trig) && strings.EqualFold(t[:len(trig)], trig) {
-		switch t[len(trig)] {
-		case ':', ',':
-			return true, strings.TrimSpace(t[len(trig)+1:])
+func parseRoomAddressing(body string) roomAddressing {
+	body = strings.TrimSpace(body)
+	scan := userHostRe.ReplaceAllString(stripUnquoted(body), " ")
+	return roomAddressing{body: body, scan: scan, handles: handlesInScan(scan)}
+}
+
+func (a roomAddressing) hasHandle(name string) bool {
+	for _, h := range a.handles {
+		if strings.EqualFold(h, name) {
+			return true
 		}
 	}
-	// Inline forms: the address is part of the sentence, so the body is passed
-	// through unchanged — stripping would discard content.
-	scan := stripUnquoted(t)
-	if scan == "" {
+	return false
+}
+
+func (a roomAddressing) hasAny(names []string) bool {
+	for _, name := range names {
+		if a.hasHandle(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a roomAddressing) matchName(name string) (bool, string) {
+	if name == "" {
 		return false, ""
 	}
-	if containsAddress(scan, trig) || containsMention(scan, trig) {
-		return true, t
+	if len(a.handles) != 0 {
+		if a.hasHandle(name) {
+			return true, a.body
+		}
+		return false, ""
+	}
+	if len(a.body) > len(name) && strings.EqualFold(a.body[:len(name)], name) {
+		if c := a.body[len(name)]; c == ':' || c == ',' {
+			return true, strings.TrimSpace(a.body[len(name)+1:])
+		}
+	}
+	if containsMention(a.scan, name, "") {
+		return true, a.body
 	}
 	return false, ""
-}
-
-// broadcastsToAll reports whether body carries an unconditional room-wide handle
-// (@everyone / @all / @here): the form that reaches every agent in the room
-// whatever its presence.
-func broadcastsToAll(body string) bool {
-	scan := stripUnquoted(strings.TrimSpace(body))
-	return scan != "" && containsBroadcast(scan)
-}
-
-// freeOnlyBroadcast reports whether body's only claim on the room is @free: it
-// carries the tag and no unconditional broadcast. @all alongside @free wins, so
-// the presence gate never narrows the forcing function (#130).
-func freeOnlyBroadcast(body string) bool {
-	scan := stripUnquoted(strings.TrimSpace(body))
-	return scan != "" && containsFreeBroadcast(scan) && !containsBroadcast(scan)
 }
 
 // isAway reports whether our own presence has drifted to <show>away</show> — one
@@ -2627,31 +2492,16 @@ func (b *Bridge) hasRun() bool {
 	return b.ranSinceStart
 }
 
-// bareMention returns the trigger word when a bare mention is the ONLY reason
-// the body addresses this agent — no sigil, no colon, no broadcast. It exists to
-// count the false positives the bare-mention rule deliberately accepts (#106):
-// the issue asked for the matched word and the sender to be logged for a week so
-// the trade could be measured, and without it the rate is unknowable.
-func (b *Bridge) bareMention(room, body string) string {
-	trig := b.acct.TriggerFor(room)
-	if trig == "" {
+// bareMention identifies prose matches for the false-trigger log (#106).
+func (a roomAddressing) bareMention(name string) string {
+	if len(a.handles) != 0 || containsMention(a.scan, name, ":") {
 		return ""
 	}
-	t := strings.TrimSpace(body)
-	// The leading colon/comma form, or an explicit @handle anywhere, is a real
-	// address: not a bare-mention false positive.
-	if len(t) > len(trig) && strings.EqualFold(t[:len(trig)], trig) {
-		switch t[len(trig)] {
-		case ':', ',':
-			return ""
-		}
-	}
-	scan := stripUnquoted(t)
-	if scan == "" || containsAddress(scan, trig) || containsBroadcast(scan) {
+	if len(a.body) > len(name) && a.body[len(name)] == ',' && strings.EqualFold(a.body[:len(name)], name) {
 		return ""
 	}
-	if containsMention(scan, trig) {
-		return trig
+	if containsMention(a.scan, name, "") {
+		return name
 	}
 	return ""
 }
@@ -2677,85 +2527,14 @@ var broadcastHandles = []string{"everyone", "all", "here"}
 // wake a fleet that is mid-round.
 var freeHandles = []string{"free"}
 
-// containsBroadcast reports whether scan addresses the whole room via "@everyone"
-// / "@all" / "@here". The "@" sigil is required: "all" and "here" are ordinary
-// words, and matching them bare would trigger on half of normal prose.
-func containsBroadcast(scan string) bool { return containsSigilHandle(scan, broadcastHandles) }
-
-// containsFreeBroadcast reports whether scan summons the room's away agents via
-// "@free" (#130). Like the unconditional handles, the sigil is required — "free"
-// on its own is ordinary prose ("free to take this").
-func containsFreeBroadcast(scan string) bool { return containsSigilHandle(scan, freeHandles) }
-
-// containsSigilHandle reports whether scan carries "@<handle>" for one of handles.
-// The sigil is required, and the handle must end at a word boundary so
-// "@freely" and "@allocate" are not handles.
-func containsSigilHandle(scan string, handles []string) bool {
-	lower := strings.ToLower(scan)
-	for _, h := range handles {
-		for i := 0; ; {
-			j := strings.Index(lower[i:], "@"+h)
-			if j < 0 {
-				break
-			}
-			at := i + j
-			i = at + 1 + len(h)
-			// Reject "@everyones" / "@freely": the handle must end here.
-			if i < len(lower) && isWordByte(lower[i]) {
-				continue
-			}
-			return true
-		}
-	}
-	return false
+func mentionWord(r rune) bool {
+	return r == '_' || r == '-' || unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsMark(r)
 }
 
-// containsAddress reports whether scan addresses trig somewhere other than the
-// start, as "trig:" or "@trig". Matching is case-insensitive and requires a
-// word boundary before the trigger so "pilot:" does not match "pi".
-func containsAddress(scan, trig string) bool {
-	lower := strings.ToLower(scan)
-	lt := strings.ToLower(trig)
-	for i := 0; ; {
-		j := strings.Index(lower[i:], lt)
-		if j < 0 {
-			return false
-		}
-		at := i + j
-		i = at + len(lt)
-		// Require a non-word character before the trigger, or an "@" sigil.
-		var prev byte
-		if at > 0 {
-			prev = lower[at-1]
-		}
-		if at > 0 && prev != '@' && isWordByte(prev) {
-			continue
-		}
-		if i >= len(lower) {
-			continue
-		}
-		if lower[i] == ':' || prev == '@' {
-			return true
-		}
-	}
-}
-
-func isWordByte(c byte) bool {
-	return c == '_' || c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-}
-
-// containsMention reports whether scan names the trigger as a standalone word,
-// with no "@" sigil and no trailing ":" required. That is the form the older
-// containsAddress deliberately ignored, and it is the whole point of #106:
-// "ask peppy", "peppy should own this" and "beltino handed over to fox" are
-// addressed messages in every sense that matters, and with the ambient buffer
-// gone nothing else would catch them.
-//
-// Word boundaries are enforced on both sides, so "peppy" does not match inside
-// "peppytest" and "pi" does not match inside "api". scan is expected to have
-// had code fences and quoted lines removed (see stripUnquoted) — a pasted
-// transcript must not address anyone.
-func containsMention(scan, trig string) bool {
+// containsMention reports whether the filtered scan contains a standalone bare
+// name. If punctuation is nonempty, the name must be immediately followed by
+// one of those punctuation characters (e.g. a directed "pi:" in a reply).
+func containsMention(scan, trig, punctuation string) bool {
 	lower := strings.ToLower(scan)
 	lt := strings.ToLower(trig)
 	if lt == "" {
@@ -2768,17 +2547,14 @@ func containsMention(scan, trig string) bool {
 		}
 		at := i + j
 		i = at + len(lt)
-		// Word boundary before: start of string, or a non-word character.
-		if at > 0 && isWordByte(lower[at-1]) {
+		prev, _ := utf8.DecodeLastRuneInString(lower[:at])
+		next, _ := utf8.DecodeRuneInString(lower[i:])
+		if mentionWord(prev) || prev == '@' || mentionWord(next) || next == '@' {
 			continue
 		}
-		// Word boundary after: end of string, or a non-word character. This is
-		// what keeps "peppy" out of "peppytest" while still matching "peppy,"
-		// and "peppy.".
-		if i < len(lower) && isWordByte(lower[i]) {
-			continue
+		if punctuation == "" || (i < len(lower) && strings.IndexByte(punctuation, lower[i]) >= 0) {
+			return true
 		}
-		return true
 	}
 }
 
@@ -2809,32 +2585,47 @@ func stripUnquoted(t string) string {
 //
 // Only BALANCED pairs are removed: an unmatched backtick is left as literal text
 // so a typo cannot silently swallow a real mention later in the same line.
+var backtickRunRe = regexp.MustCompile("`+")
+
 func stripCodeSpans(line string) string {
-	first := strings.IndexByte(line, '`')
-	if first < 0 {
+	if !strings.ContainsRune(line, '`') {
 		return line
 	}
-	var sb strings.Builder
-	rest := line
-	for {
-		i := strings.IndexByte(rest, '`')
-		if i < 0 {
-			break
-		}
-		j := strings.IndexByte(rest[i+1:], '`')
-		if j < 0 {
-			break // unbalanced: keep the remainder verbatim
-		}
-		sb.WriteString(rest[:i])
-		rest = rest[i+j+2:]
+	runs := backtickRunRe.FindAllStringIndex(line, -1)
+	// Markdown requires opening and closing runs to have the same length.
+	// Index the next run of each length so unmatched runs stay literal.
+	closing := make([]int, len(runs))
+	byLength := make(map[int]int)
+	for i := len(runs) - 1; i >= 0; i-- {
+		n := runs[i][1] - runs[i][0]
+		closing[i] = byLength[n] // 0 means none; a closer is never the first run
+		byLength[n] = i
 	}
-	sb.WriteString(rest)
+	var sb strings.Builder
+	start := 0
+	for i := 0; i < len(runs); i++ {
+		if j := closing[i]; j != 0 {
+			sb.WriteString(line[start:runs[i][0]])
+			sb.WriteByte(' ')
+			start = runs[j][1]
+			i = j
+		}
+	}
+	sb.WriteString(line[start:])
 	return sb.String()
 }
 
-// handleRe matches an "@handle" mention. A trailing "." or "@" is excluded so
-// bare JIDs and email addresses in the body aren't mistaken for mentions.
-var handleRe = regexp.MustCompile(`@([A-Za-z0-9_-]+)`)
+// Mask user@host tokens (including bare hostnames and common JID resources)
+// before scanning either form of mention. Neither side is an agent address.
+const handlePart = `[\pL\pN\pM_-]+`
+const handleName = handlePart + `(?:\.` + handlePart + `)*`
+
+const localPartChar = `[\pL\pN\pM_.!#$%&'*+/=?^{}|~\x60-]`
+
+// Require at least one letter, digit or underscore before @ so punctuation
+// alone (e.g. Markdown's **@name**) isn't masked as a user.
+var userHostRe = regexp.MustCompile(localPartChar + `*[\pL\pN_]` + localPartChar + `*@` + handleName + `(?:/[\pL\pN\pM_.%/+~:-]+)?`)
+var handleRe = regexp.MustCompile(`@(` + handleName + `)`)
 
 // unknownHandles returns the "@name" mentions in body that match no current
 // occupant of room, alongside the handles that would have worked. Both are
@@ -2846,21 +2637,15 @@ func (b *Bridge) unknownHandles(room, body string) (unknown, valid []string) {
 	return unknown, valid
 }
 
-// mentionsIn returns the "@handle" names appearing in body, in order, with the
-// "@" sigil dropped. A trailing "." or "@" disqualifies one: "@foo.bar" and
-// "@foo@bar" are domains and JID fragments, not mentions.
-//
-// The scan runs on stripUnquoted(body) — a fenced block, a quoted line or an
-// inline `code` span addresses nobody — and the names are sliced from THAT
-// string, never from body. Stripping shortens the text, so indices taken from
-// the scan and applied to body slice the wrong characters: a mention written
-// after a code span came back as a garbled name that matched no occupant, and
-// the sender was warned about a handle it never typed.
-func mentionsIn(body string) []string {
-	scan := stripUnquoted(body)
+// mentionsIn returns explicit tags for the sender-side handle diagnostics.
+func mentionsIn(body string) []string { return parseRoomAddressing(body).handles }
+
+func handlesInScan(scan string) []string {
 	var names []string
 	for _, m := range handleRe.FindAllStringSubmatchIndex(scan, -1) {
-		if m[3] < len(scan) && (scan[m[3]] == '.' || scan[m[3]] == '@') {
+		prev, _ := utf8.DecodeLastRuneInString(scan[:m[0]])
+		next, _ := utf8.DecodeRuneInString(scan[m[3]:])
+		if mentionWord(prev) || prev == '@' || next == '@' {
 			continue
 		}
 		names = append(names, scan[m[2]:m[3]])
@@ -3032,47 +2817,25 @@ func (b *Bridge) addressesRoom(room, body string) bool {
 	if len(occupants) == 0 {
 		return true
 	}
-	scan := stripUnquoted(body)
-	if strings.TrimSpace(scan) == "" {
-		// Everything was quoted, fenced or inline code: it addresses nobody.
-		return false
-	}
+	addr := parseRoomAddressing(body)
 	me := b.xmpp.ownNick(room)
 	if me == "" {
 		me = b.acct.Nick
 	}
-	// Handles answer "@x" mentions; bare answers a plain name. They differ by
-	// the broadcast words: "@everyone" is an address, but the bare word
-	// "everyone" — "that's all from me", "we're all here" — is ordinary prose
-	// and must not read as one.
-	handles := map[string]struct{}{}
-	bare := map[string]struct{}{}
+	if addr.hasAny(broadcastHandles) || addr.hasAny(freeHandles) {
+		return true
+	}
 	for _, n := range occupants {
-		if me != "" && strings.EqualFold(n, me) {
+		if strings.EqualFold(n, me) {
 			continue // our own nick is never an address we can use
 		}
-		handles[strings.ToLower(n)] = struct{}{}
-		bare[strings.ToLower(n)] = struct{}{}
+		if named, _ := addr.matchName(n); named {
+			return true
+		}
 	}
 	if i := strings.IndexByte(b.acct.Owner, '@'); i > 0 {
-		handles[strings.ToLower(b.acct.Owner[:i])] = struct{}{}
-		bare[strings.ToLower(b.acct.Owner[:i])] = struct{}{}
-	}
-	for _, h := range broadcastHandles {
-		handles[h] = struct{}{}
-	}
-	for _, h := range freeHandles {
-		handles[h] = struct{}{}
-	}
-	for _, name := range mentionsIn(body) {
-		if _, ok := handles[strings.ToLower(name)]; ok {
-			return true
-		}
-	}
-	for name := range bare {
-		if containsMention(scan, name) {
-			return true
-		}
+		named, _ := addr.matchName(b.acct.Owner[:i])
+		return named
 	}
 	return false
 }

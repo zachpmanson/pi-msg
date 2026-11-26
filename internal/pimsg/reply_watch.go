@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -144,17 +143,9 @@ func (b *Bridge) observeReplyMessage(m InboundMessage) {
 
 // Aimed addressing only, not the bare-name mention or broadcast routing rules.
 func (b *Bridge) directReplyPing(room, body string) bool {
-	scan := stripUnquoted(strings.TrimSpace(body))
+	addr := parseRoomAddressing(body)
 	for _, name := range []string{b.acct.TriggerFor(room), b.xmpp.ownNick(room)} {
-		if name == "" {
-			continue
-		}
-		for _, handle := range mentionsIn(scan) {
-			if strings.EqualFold(handle, name) {
-				return true
-			}
-		}
-		if regexp.MustCompile(`(?i)(^|[^[:alnum:]_@-])` + regexp.QuoteMeta(name) + `[:,]`).MatchString(scan) {
+		if addr.hasHandle(name) || (len(addr.handles) == 0 && containsMention(addr.scan, name, ":,")) {
 			return true
 		}
 	}

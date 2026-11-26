@@ -44,6 +44,15 @@ func TestMatchTrigger(t *testing.T) {
 		// Inline "@trig" anywhere — addressed, body kept intact.
 		{"@pi how do I pull the logs", true, "@pi how do I pull the logs"},
 		{"over to @pi for the exact path", true, "over to @pi for the exact path"},
+		{"thanks @PI.", true, "thanks @PI."},
+		{"@pigeon is not @ pilot", false, ""},
+		{"try pi@naboo, root@pi or user@x.pi/device", false, ""},
+		{"try pi!ops@example.org or user@host/ci:pi", false, ""},
+		{"look at @pi.example", false, ""},
+		{"hey **@pi**", true, "hey **@pi**"},
+		{"pi inspect ``@peppy``", true, "pi inspect ``@peppy``"},
+		{"pi inspect ``escaped ` @peppy``", true, "pi inspect ``escaped ` @peppy``"},
+		{"pi: ask @peppy", false, ""},
 
 		// Bare mentions, the form added in #106. With no ambient buffer a missed
 		// address means the message does not exist for the agent, so prose that
@@ -64,6 +73,19 @@ func TestMatchTrigger(t *testing.T) {
 		addressed, stripped := b.matchTrigger("team@muc.x.com", c.in)
 		if addressed != c.addressed || (addressed && stripped != c.stripped) {
 			t.Errorf("matchTrigger(%q) = (%v,%q), want (%v,%q)", c.in, addressed, stripped, c.addressed, c.stripped)
+		}
+	}
+}
+
+func TestExplicitHandleUsesFullName(t *testing.T) {
+	for _, pair := range [][2]string{{"café", "caf"}, {"ops.eu", "ops"}, {"pi-2", "pi"}} {
+		body := "hello @" + pair[0] + "."
+		addr := parseRoomAddressing(body)
+		if ok, stripped := addr.matchName(pair[0]); !ok || stripped != body {
+			t.Errorf("%q did not address %q", body, pair[0])
+		}
+		if ok, _ := addr.matchName(pair[1]); ok {
+			t.Errorf("%q also addressed %q", body, pair[1])
 		}
 	}
 }
@@ -236,8 +258,9 @@ func TestMUCStanzaID(t *testing.T) {
 	}
 }
 
-// With the optional idle fan-out enabled, unnamed owner messages reach free
-// agents. Tags and stanza replies still select their intended account alone.
+// With optional idle fan-out enabled, unaddressed owner messages reach free
+// agents. Bare names are additive; explicit tags and anchored replies narrow
+// delivery to their intended recipients.
 func TestOwnerMessageRouting(t *testing.T) {
 	b := roomBridge() // owner zach@x.com, nick pi, trigger pi, room team@muc.x.com
 	b.acct.UntaggedOwnerToFree = true
@@ -270,9 +293,17 @@ func TestOwnerMessageRouting(t *testing.T) {
 		{"owner @free reaches an away agent", "@free status please", "", true, "away", true, actionCanonical},
 		{"owner @free skips a settled agent", "@free status please", "", true, "", true, actionNotOurs},
 		{"owner @everyone reaches an idle fleet", "@everyone standup in 5", "", true, "", true, actionCanonical},
-		{"owner @handle picks one account", "@peppy have a look", "", true, "", true, actionNotOurs},
-		{"owner colon form picks one account", "peppy: have a look", "", true, "", true, actionNotOurs},
-		{"owner bare name picks one account", "peppy have a look at the parser", "", true, "", true, actionNotOurs},
+		{"owner @handle excludes even idle fan-out", "@peppy have a look", "", true, "away", true, actionNotOurs},
+		{"owner colon form leaves ordinary routing for us", "peppy: have a look", "", true, "away", true, actionCanonical},
+		{"owner bare name leaves ordinary routing for us", "peppy have a look at the parser", "", true, "away", true, actionCanonical},
+		{"owner bare name doesn't expand ordinary fan-out for us", "peppy have a look at the parser", "", true, "", true, actionNotOurs},
+		{"our bare name reaches us directly", "hello pi", "", true, "", true, actionCanonical},
+		{"our bare name ignored alongside an explicit tag", "@peppy ask pi about this", "", true, "away", true, actionNotOurs},
+		{"unknown explicit tag is still exclusive", "@unknown ask pi about this", "", true, "away", true, actionNotOurs},
+		{"unix user and host don't tag us", "how big is pi@peppy", "", true, "", true, actionNotOurs},
+		{"unix user and host don't suppress fan-out", "how big is peppy@pi", "", true, "away", true, actionCanonical},
+		{"quoted explicit doesn't override a bare name", "pi please look at `@peppy`", "", true, "", true, actionCanonical},
+		{"email user and host don't count as broadcasts", "mail someone@all", "", true, "", true, actionNotOurs},
 		{"owner naming us is ours", "@pi take this one", "", true, "", true, actionCanonical},
 		{"owner naming us among others is ours", "@peppy and @pi sort it out", "", true, "", true, actionCanonical},
 		{"a fenced name is not a tag", "```\npeppy: do it\n```", "", true, "away", true, actionCanonical},
@@ -280,8 +311,13 @@ func TestOwnerMessageRouting(t *testing.T) {
 		{"owner reply to a peer belongs to the peer", "", "peppy-id", true, "away", true, actionNotOurs},
 		{"owner reply to the owner's own names nobody, so it is @free", "", "owner-id", true, "away", true, actionCanonical},
 		{"owner reply to us is ours", "", "our-id", true, "", true, actionCanonical},
+		{"owner reply to us also reaches us when it tags others", "@peppy check this", "our-id", true, "", true, actionCanonical},
+		{"owner reply to someone else can explicitly add us", "@pi check this", "peppy-id", true, "", true, actionCanonical},
+		{"owner reply to someone else doesn't fan out further", "@beltino check this", "peppy-id", true, "away", true, actionNotOurs},
 		{"an unresolvable reply follows the same rule", "", "unknown-id", true, "away", true, actionCanonical},
 		{"a peer naming another peer is still not ours", "@beltino yours", "", false, "away", true, actionNotOurs},
+		{"a peer using another bare name still doesn't address us", "beltino yours", "", false, "away", true, actionNotOurs},
+		{"a peer reply to us can tag someone else", "@beltino yours", "our-id", false, "away", true, actionCommentary},
 		{"a peer naming nobody is still dropped", "no name here", "", false, "away", true, actionNotOurs},
 	}
 	for _, c := range cases {
@@ -293,15 +329,14 @@ func TestOwnerMessageRouting(t *testing.T) {
 		}
 	}
 
-	// With no occupant roster there is nothing to check a name against, so the
-	// message stays a broadcast rather than silently reaching nobody — still
-	// through the @free gate, since it names nobody.
+	// Exclusive addressing must not depend on whether presence has populated
+	// the local roster yet.
 	empty := roomBridge()
 	empty.acct.UntaggedOwnerToFree = true
 	empty.xmpp = NewXMPPBridge(empty.acct, func(InboundMessage) {}, empty.log)
 	setShow(empty, "away", true)
-	if action, _, _ := empty.classify(InboundMessage{Body: "@peppy look", Room: room, FromOwner: true}); action != actionCanonical {
-		t.Errorf("owner message with an empty roster = %d, want actionCanonical", action)
+	if action, _, _ := empty.classify(InboundMessage{Body: "@peppy look", Room: room, FromOwner: true}); action != actionNotOurs {
+		t.Errorf("owner message with an empty roster = %d, want actionNotOurs", action)
 	}
 }
 
@@ -578,9 +613,11 @@ func TestUnknownHandles(t *testing.T) {
 		{"@zbeltino @zbeltino @zbeltino", []string{"zbeltino"}}, // deduped
 		{"thanks @zach", nil},                                   // owner localpart
 		{"mail me at bob@example.com", nil},                     // domain, not a mention
-		{"ping beltino@x.com directly", nil},                    // bare JID
-		{"```\n@nobody: do it\n```", nil},                       // fenced
-		{"> @nobody said so", nil},                              // quoted
+		{"see beltino@naboo", nil},
+		{"thanks @peppy.", nil},
+		{"ping beltino@x.com directly", nil}, // bare JID
+		{"```\n@nobody: do it\n```", nil},    // fenced
+		{"> @nobody said so", nil},           // quoted
 		{"no mentions at all", nil},
 	}
 	for _, c := range cases {
@@ -1053,21 +1090,17 @@ func TestRedeliveredAddressedMessageKeepsItsVerdict(t *testing.T) {
 // the ONLY reason a message addresses us, so the false-positive rate the
 // bare-name rule trades for can be measured from the log (#106).
 func TestBareMentionCounter(t *testing.T) {
-	b := roomBridge() // trigger "pi"
-
-	if got := b.bareMention("team@muc.x.com", "ask pi for the path"); got != "pi" {
+	if got := parseRoomAddressing("ask pi for the path").bareMention("pi"); got != "pi" {
 		t.Errorf("bareMention = %q, want pi", got)
 	}
 	// Explicit addresses are not false positives.
 	for _, body := range []string{"pi: do it", "pi, go", "@pi do it", "@everyone report", "unrelated chatter", "the pilot flew"} {
-		if got := b.bareMention("team@muc.x.com", body); got != "" {
+		if got := parseRoomAddressing(body).bareMention("pi"); got != "" {
 			t.Errorf("bareMention(%q) = %q, want empty", body, got)
 		}
 	}
-	// A bare mention still counts when the trigger is only part of the reason we
-	// are addressed... it is not: a broadcast or a handle elsewhere means this is
-	// not a bare-mention case, and the counter must not inflate.
-	if got := b.bareMention("team@muc.x.com", "@everyone ask pi about the path"); got != "" {
+	// Explicit broadcasts do not count as bare-name matches.
+	if got := parseRoomAddressing("@everyone ask pi about the path").bareMention("pi"); got != "" {
 		t.Errorf("bareMention with a broadcast = %q, want empty", got)
 	}
 }
@@ -1076,7 +1109,7 @@ func TestBareMentionCounter(t *testing.T) {
 func TestRoutingContractStatesBareMentions(t *testing.T) {
 	b := roomBridge()
 	got := b.roomsContract()
-	for _, want := range []string{"bare name or @name", "@all", "@free", "quotations or code", "Unnamed owner", "known stanzas", "not delivered or buffered", "read_messages"} {
+	for _, want := range []string{"bare name", "@name", "@all", "@free", "quotations, code, or user@host", "Unaddressed owner", "known stanzas", "not delivered or buffered", "read_messages"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("room contract missing %q: %s", want, got)
 		}

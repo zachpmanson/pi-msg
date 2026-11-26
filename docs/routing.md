@@ -52,8 +52,9 @@ unavailable/error, room departure or reconnect invalidates the relevant state.
 History alone never establishes current presence. A reconnect preserves our
 own away/xa show and status rather than resetting the published idle state.
 
-Room checks use current room/nickname presence and the same bare-name,
-`@name`, leading/inline address and quote/code filtering as inbound delivery.
+Room checks use current room/nickname presence and the same exclusive `@name`
+and additive bare-name rules as inbound delivery, including filtering quotes,
+code and `user@host` tokens.
 They also check the current author of a threaded reply and broadcasts
 (e.g. `@all`, `@here`, `@free`). Configured peer trigger aliases that
 differ from the nickname are not advertised/discovered, so only nickname-based
@@ -153,14 +154,20 @@ and marked `[we sent]`. Reading is on demand and never sends a message.
 
 ## Room addressing and delivery
 
-Room messages are delivered as prompts only when they address this agent.
-`@name` and an unprefixed agent name both address that agent; quoted, fenced,
-and inline-code text is ignored. `@all` addresses the room. `@free`
-addresses idle agents (presence away or not yet asked to work), not agents
-currently working. A mistyped name matches nobody. Unaddressed messages are not
-queued for later; they remain available through `read_messages`.
+Standalone `@name` tags make routing exclusive: pi-msg delivers to the
+explicitly tagged agents and the known reply-parent author, not to agents
+mentioned only by bare name or normally eligible through participation. An
+unknown `@name` still makes the message exclusive, but matches no agent.
+`@all` addresses the room; `@free` adds idle agents (away/XA or not yet asked
+to work and not currently working).
 
-By default, an owner message naming nobody reaches only agents who have spoken
+Without any explicit tags, a bare name tags that agent and leaves ordinary
+unaddressed routing in place for everyone else. `name:` and `name,` follow
+the same rule. Block quotes, fenced code, inline code, and `user@host` tokens
+(including emails and JIDs) do not count as mentions. Messages not delivered
+as prompts are not queued for later; they remain in `read_messages`.
+
+By default, unaddressed owner traffic reaches only agents who have spoken
 in that room within the 20-minute participation window. Set the per-account
 `"untaggedOwnerToFree": true` option to also deliver these messages to free
 agents (away/XA, or not yet asked to work and not currently working). This is an
@@ -170,8 +177,9 @@ if nobody qualifies, no agent receives the message. Explicit `@free` and
 known stanza counts as a direct tag of that agent, including replies to
 `send_file` messages. The sender's stanza ID or a room-assigned XEP-0359 ID
 can identify the parent in the same room. No recent participation or idle
-state is needed; extra mentions or broadcasts in the reply still work as
-usual. Unknown reply IDs follow ordinary room routing. Peer messages that do
+state is needed. A reply to a known peer stanza does not fan out through
+ordinary owner routing, but explicit tags or (if none are present) bare names
+can add recipients. Unknown reply IDs follow ordinary room routing. Peer messages that do
 not address an agent are not visible to it. The durable inbox preserves the
 original addressed verdict across restarts. Addressed peer handoffs have no
 consecutive-turn limit and do not

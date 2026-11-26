@@ -31,7 +31,8 @@ func TestDiscardedInboundPreservesPresence(t *testing.T) {
 	}{
 		{"peer chatter", InboundMessage{Body: "unrelated chatter"}},
 		{"unnamed owner without opt-in", InboundMessage{Body: "do this", FromOwner: true}},
-		{"owner names someone else", InboundMessage{Body: "@peer do this", FromOwner: true}},
+		{"owner explicitly tags someone else", InboundMessage{Body: "@peer do this", FromOwner: true}},
+		{"Unix username is not a tag", InboundMessage{Body: "check pi@naboo", FromOwner: true}},
 		{"owner replies to someone else", InboundMessage{Body: "do this", FromOwner: true, ReplyToID: "other"}},
 		{"unknown peer reaction", InboundMessage{Reactions: []string{"OK"}, ReactionID: "unknown"}},
 		{"owner reaction to peer", InboundMessage{FromOwner: true, Reactions: []string{"OK"}, ReactionID: "other"}},
@@ -107,6 +108,8 @@ func TestAddressedInboundActivityAndPreActivityVerdict(t *testing.T) {
 		{name: "owner free", body: "@free do this", show: "away", owner: true},
 		{name: "owner untagged away opted in", body: "do this", show: "away", owner: true, untaggedOwnerToFree: true},
 		{name: "owner recent participant", body: "do this", owner: true, participating: true},
+		{name: "owner bare name still reaches other participants", body: "peer do this", owner: true, participating: true},
+		{name: "owner Unix username still reaches other participants", body: "check peer@naboo", owner: true, participating: true},
 		{name: "owner fresh opted in", body: "do this", owner: true, fresh: true, untaggedOwnerToFree: true},
 		{name: "peer admitted replay", body: "do this", alreadyAddressed: true},
 		{name: "owner admitted replay", body: "do this", owner: true, alreadyAddressed: true},

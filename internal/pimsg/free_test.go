@@ -57,8 +57,9 @@ func TestFreeHandleSyntax(t *testing.T) {
 		if got, _ := b.matchTrigger("team@muc.x.com", c.in); got != c.addressed {
 			t.Errorf("matchTrigger(%q) = %v, want %v", c.in, got, c.addressed)
 		}
-		if got := freeOnlyBroadcast(c.in); got != c.freeOnly {
-			t.Errorf("freeOnlyBroadcast(%q) = %v, want %v", c.in, got, c.freeOnly)
+		addr := parseRoomAddressing(c.in)
+		if got := addr.hasAny(freeHandles) && !addr.hasAny(broadcastHandles); got != c.freeOnly {
+			t.Errorf("free-only broadcast (%q) = %v, want %v", c.in, got, c.freeOnly)
 		}
 	}
 }

@@ -48,9 +48,10 @@ func TestAddressesRoom(t *testing.T) {
 		{"zach, the report is up", true}, // the owner is addressable by name
 		{"@zach the report is up", true},
 		{"mail me at bob@example.com", false}, // domain, not a mention
-		// A bare JID still names the occupant in prose, and inbound dispatch
-		// treats that as addressing them (#106), so it is addressed here too.
-		{"ping peppy@x.com directly", true},
+		{"ping peppy@x.com directly", false},
+		{"check peppy@slippy", false},
+		{"@unknown ask peppy", false},
+		{"hello @peppy.", true},
 		{"Thanks Peppy — done!", true}, // bare mention, any case
 		{"peppytest is a different word", false},
 	}
