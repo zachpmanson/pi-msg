@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1542,21 +1543,15 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 	}
 	// A real message supersedes any pending/active reaction-only wake.
 	b.setReactionAckRun(false)
-	// Point the default reply/file destination at the message that arrived, BEFORE
-	// any dispatch. A control command produces no prompt of its own, so setting
-	// this only on the prompt path below would make a command inherit the
-	// destination of the previous turn: /export or /dump typed in the owner's 1:1
-	// would upload the session file to whatever room the agent spoke in last
-	// (zpm/beltino#56).
-	b.setTurnDest(origin, false) // the owner wrote it, so no tag is expected
-	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!") || t == "&") && b.handleCommand(t) {
+	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!") || t == "&") && b.handleCommand(t, origin) {
 		// Handled in-process: it never becomes a prompt, so nothing will ever
 		// settle for it (#104).
 		b.inboxDrop(reactID, "", "")
 		return
 	}
-	// A real prompt: point lifecycle/agent reactions at the message that drove it.
-	// The reply/file destination was already set above, before the command check.
+	// Controls have their own immutable reply destination and never take over an
+	// in-flight turn's routing. Real prompts do update the turn destination.
+	b.setTurnDest(origin, false)
 	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
 	b.countInbound(senderName(nick, sender, origin), reactID, t)
@@ -1669,7 +1664,12 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 // handleCommand runs a recognized control command and returns true. Unknown
 // "/…" input (extension commands, /skill:name, /template) returns false so the
 // caller forwards it to pi as a prompt.
-func (b *Bridge) handleCommand(t string) bool {
+func (b *Bridge) handleCommand(t, origin string) bool {
+	if origin == "" {
+		origin = b.acct.Owner
+	}
+	reply := b.commandReply(origin)
+	fail := b.commandFailure(origin)
 	name, arg := splitCommand(t)
 	if t == "&" {
 		name = "next"
@@ -1693,10 +1693,10 @@ func (b *Bridge) handleCommand(t string) bool {
 	}
 	switch name {
 	case "next":
-		b.handleNext(arg)
+		b.handleNext(arg, origin)
 	case "new":
 		if b.inbox != nil && len(b.inbox.protectedPending()) > 0 {
-			b.reply("/new: unresolved exact-target input retained; consume it in the original session before resetting")
+			reply("/new: unresolved exact-target input retained; consume it in the original session before resetting")
 			return true
 		}
 		if b.streaming() {
@@ -1707,24 +1707,29 @@ func (b *Bridge) handleCommand(t string) bool {
 		if err == nil && res.success() && res.Obj("data").Bool("cancelled") {
 			err = fmt.Errorf("session reset cancelled")
 		}
-		b.reportResult(err, res, "🆕 new session ready", "/new")
+		reportCommandResult(reply, fail, err, res, "🆕 new session ready", "/new")
 		if err == nil && res.success() {
 			b.afterNewSession()
 		}
 	case "compact":
 		res, err := b.rpc.Compact(b.ctx, arg)
-		b.reportResult(err, res, "🗜️ context compacted", "/compact")
+		reportCommandResult(reply, fail, err, res, "🗜️ context compacted", "/compact")
 	case "think":
 		res, err := b.rpc.SetThinkingLevel(b.ctx, arg)
-		b.reportResult(err, res, "🧠 thinking level: "+arg, "/think")
+		reportCommandResult(reply, fail, err, res, "🧠 thinking level: "+arg, "/think")
 	case "model":
-		b.handleModel(arg)
+		b.handleModel(arg, reply, fail)
 	case "models":
-		b.handleModels()
+		b.handleModels(reply, fail)
 	case "name":
-		b.handleName(arg)
+		if arg == "" && slices.Contains(b.acct.Rooms, origin) {
+			reply("The current session name will be sent privately to the owner.")
+			b.handleName(arg, b.reply, b.commandFailure(b.acct.Owner))
+		} else {
+			b.handleName(arg, reply, fail)
+		}
 	case "session":
-		b.handleSession()
+		b.handleSession(reply, fail, slices.Contains(b.acct.Rooms, origin))
 	case "abort", "stop":
 		// Drain the queue BEFORE aborting. `abort` alone leaves queued steers
 		// and follow-ups in the session, so pi starts a fresh run the moment
@@ -1739,7 +1744,7 @@ func (b *Bridge) handleCommand(t string) bool {
 		} else if dropped > 1 {
 			msg += fmt.Sprintf(" (%d queued messages dropped)", dropped)
 		}
-		b.reply(msg)
+		reply(msg)
 	case "interrupt":
 		// Bare "!": stop the current command/thinking WITHOUT flushing the
 		// queue. Only the abort RPC is sent — clear_queue is what drops
@@ -1748,14 +1753,26 @@ func (b *Bridge) handleCommand(t string) bool {
 		b.rpc.Abort()
 		b.settleLocally()
 		b.reactInterrupted()
+		reply("⛔ interrupted (queue kept)")
 	case "quit", "exit":
+		reply("Shutting down.")
 		b.shutdown("requested over chat")
-	case "dump":
-		b.dumpSession(arg)
-	case "dump-all", "dumpall":
-		b.dumpAllSessions(arg)
-	case "export":
-		b.handleExport(arg)
+	case "dump", "dump-all", "dumpall", "export":
+		// Neither the transcript nor its download URL can go to a room: a
+		// session may contain private DM history (zpm/beltino#56).
+		fileReply := fileCommandReply{private: b.reply}
+		if slices.Contains(b.acct.Rooms, origin) {
+			fileReply.room = reply
+			reply("Preparing the session file for private delivery to the owner…")
+		}
+		switch name {
+		case "dump":
+			b.dumpSession(arg, fileReply)
+		case "dump-all", "dumpall":
+			b.dumpAllSessions(arg, fileReply)
+		case "export":
+			b.handleExport(fileReply)
+		}
 	default:
 		return false
 	}
@@ -1779,12 +1796,24 @@ func (b *Bridge) afterNewSession() {
 // falls through to the agent, who picks the artifact to share based on
 // conversation context (the /share → always-naboo policy lives in the fleet's
 // beltino `share` skill, not in pi-msg).
-func (b *Bridge) handleExport(_ string) {
+type fileCommandReply struct {
+	private func(string)
+	room    func(string)
+}
+
+func (r fileCommandReply) failure(detail string) {
+	r.private(detail)
+	if r.room != nil {
+		r.room("No session file was sent. Details were sent privately to the owner.")
+	}
+}
+
+func (b *Bridge) handleExport(reply fileCommandReply) {
 	slug := fmt.Sprintf("%s-session-%s", b.acct.Name, time.Now().Format("20060102-150405"))
 	// Pi writes into a private directory; remove its artifact on every outcome.
 	dir, err := os.MkdirTemp("", "pi-msg-export-*")
 	if err != nil {
-		b.reply("⚠️ /export failed: " + err.Error())
+		reply.failure("⚠️ /export failed: " + err.Error())
 		return
 	}
 	defer os.RemoveAll(dir)
@@ -1792,28 +1821,28 @@ func (b *Bridge) handleExport(_ string) {
 	b.reply("📄 exporting session…")
 	res, err := b.rpc.ExportHTML(b.ctx, tmpHTML)
 	if err != nil {
-		b.reply("⚠️ /export failed: " + err.Error())
+		reply.failure("⚠️ /export failed: " + err.Error())
 		return
 	}
 	if !res.success() {
-		b.reply("⚠️ /export failed: " + res.errText())
+		reply.failure("⚠️ /export failed: " + res.errText())
 		return
 	}
-	b.sendSessionExport(slug+".html", tmpHTML)
+	b.sendSessionExport(slug+".html", tmpHTML, reply)
 }
 
 // Only native session exports receive the rendering-only visibility transform.
 // Generic rendered files and raw session dumps remain byte-for-byte unchanged.
-func (b *Bridge) sendSessionExport(name, path string) {
+func (b *Bridge) sendSessionExport(name, path string, reply fileCommandReply) {
 	content, err := os.ReadFile(path)
 	if err == nil {
 		content, err = visibleExportContext(content)
 	}
 	if err != nil {
-		b.reply("⚠️ /export failed: " + err.Error())
+		reply.failure("⚠️ /export failed: " + err.Error())
 		return
 	}
-	b.sendDumpFile(name, content)
+	b.sendDumpFile(name, content, reply)
 }
 
 // sendRenderedFile uploads a locally-rendered file to the owner via XEP-0363
@@ -1825,7 +1854,7 @@ func (b *Bridge) sendRenderedFile(name, path string) {
 		b.reply("⚠️ /export: rendered but could not read file: " + err.Error())
 		return
 	}
-	b.sendDumpFile(name, content)
+	b.sendDumpFile(name, content, fileCommandReply{private: b.reply})
 }
 
 // dumpSession sends the current session's transcript to the owner, straight
@@ -1833,28 +1862,28 @@ func (b *Bridge) sendRenderedFile(name, path string) {
 // then relays the file: verbatim JSONL by default, or a tab-separated table
 // (one record per row) when arg is "table" (or "pretty", its former name).
 // The upload always goes to the owner (never a room) — see sendDumpFile.
-func (b *Bridge) dumpSession(arg string) {
+func (b *Bridge) dumpSession(arg string, reply fileCommandReply) {
 	res, err := b.rpc.GetState(b.ctx)
 	if err != nil {
-		b.reply("⚠️ /dump failed: " + err.Error())
+		reply.failure("⚠️ /dump failed: " + err.Error())
 		return
 	}
 	if !res.success() {
-		b.reply("⚠️ /dump failed: " + res.errText())
+		reply.failure("⚠️ /dump failed: " + res.errText())
 		return
 	}
 	path := res.Obj("data").Str("sessionFile")
 	if path == "" {
-		b.reply("⚠️ /dump: no session file (session persistence is disabled)")
+		reply.failure("⚠️ /dump: no session file (session persistence is disabled)")
 		return
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		b.reply("⚠️ /dump: cannot read session file: " + err.Error())
+		reply.failure("⚠️ /dump: cannot read session file: " + err.Error())
 		return
 	}
 	if len(raw) == 0 {
-		b.reply("📄 session is empty")
+		reply.failure("📄 session is empty")
 		return
 	}
 	// Dumps are transferred as an uploaded file (XEP-0363) rather than inline:
@@ -1873,7 +1902,7 @@ func (b *Bridge) dumpSession(arg string) {
 	} else {
 		b.reply(fmt.Sprintf("📄 raw session dump — %s (%d bytes) — uploading…", path, len(raw)))
 	}
-	b.sendDumpFile(name, content)
+	b.sendDumpFile(name, content, reply)
 }
 
 // uploadDumpFile performs the XEP-0363 upload for a session dump or export. It
@@ -1893,17 +1922,19 @@ var uploadDumpFile = func(x *XMPPBridge, to, path string) (string, error) {
 // only a diagnostic: HTML/JSONL can contain enormous individual lines, so an
 // inline fallback risks exceeding the server's stanza limit and disconnecting
 // the account.
-func (b *Bridge) sendDumpFile(name string, content []byte) {
+func (b *Bridge) sendDumpFile(name string, content []byte, reply fileCommandReply) {
 	p := filepath.Join(os.TempDir(), fmt.Sprintf("pi-msg-%s-%d-%s", b.acct.Name, time.Now().UnixNano(), name))
 	if err := os.WriteFile(p, content, 0o600); err != nil {
-		b.reply("⚠️ cannot write temp file: " + err.Error())
+		reply.failure("⚠️ cannot write temp file: " + err.Error())
 		return
 	}
 	dest := b.acct.Owner
 	go func() {
 		defer os.Remove(p)
 		if _, err := uploadDumpFile(b.xmpp, dest, p); err != nil {
-			b.reply(fmt.Sprintf("⚠️ file upload failed (%d bytes): %v. Not sending inline to avoid oversized XMPP stanzas; try a smaller export or share the file via a web link.", len(content), err))
+			reply.failure(fmt.Sprintf("⚠️ file upload failed (%d bytes): %v. Not sending inline to avoid oversized XMPP stanzas; try a smaller export or share the file via a web link.", len(content), err))
+		} else if reply.room != nil {
+			reply.room("Session file sent privately to the owner.")
 		}
 	}()
 }
@@ -1915,29 +1946,29 @@ func (b *Bridge) sendDumpFile(name string, content []byte) {
 // /dump (which reads just the live get_state session file), this spans all
 // past sessions so you can see the complete transcript, not just the current
 // working file.
-func (b *Bridge) dumpAllSessions(arg string) {
+func (b *Bridge) dumpAllSessions(arg string, reply fileCommandReply) {
 	res, err := b.rpc.GetState(b.ctx)
 	if err != nil {
-		b.reply("⚠️ /dump-all failed: " + err.Error())
+		reply.failure("⚠️ /dump-all failed: " + err.Error())
 		return
 	}
 	if !res.success() {
-		b.reply("⚠️ /dump-all failed: " + res.errText())
+		reply.failure("⚠️ /dump-all failed: " + res.errText())
 		return
 	}
 	path := res.Obj("data").Str("sessionFile")
 	if path == "" {
-		b.reply("⚠️ /dump-all: no session (session persistence disabled)")
+		reply.failure("⚠️ /dump-all: no session (session persistence disabled)")
 		return
 	}
 	dir := filepath.Dir(path)
 	matches, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil {
-		b.reply("⚠️ /dump-all: cannot list sessions: " + err.Error())
+		reply.failure("⚠️ /dump-all: cannot list sessions: " + err.Error())
 		return
 	}
 	if len(matches) == 0 {
-		b.reply("⚠️ /dump-all: no session files found in " + dir)
+		reply.failure("⚠️ /dump-all: no session files found in " + dir)
 		return
 	}
 	sort.Strings(matches) // filename embeds ISO start timestamp → chronological
@@ -1958,7 +1989,7 @@ func (b *Bridge) dumpAllSessions(arg string) {
 		}
 	}
 	if records == 0 {
-		b.reply("⚠️ /dump-all: no session records found")
+		reply.failure("⚠️ /dump-all: no session records found")
 		return
 	}
 	table := strings.EqualFold(strings.TrimSpace(arg), "table") || strings.EqualFold(strings.TrimSpace(arg), "pretty")
@@ -1969,7 +2000,7 @@ func (b *Bridge) dumpAllSessions(arg string) {
 		name = "session-" + b.acct.Name + "-all-table.tsv"
 	}
 	b.reply(fmt.Sprintf("📄 full session dump (%d files, %d records) — uploading…", len(matches), records))
-	b.sendDumpFile(name, content)
+	b.sendDumpFile(name, content, reply)
 }
 
 // prettyDump reformats a session's JSONL into a real TSV — one record per row
@@ -2402,10 +2433,17 @@ func (a roomAddressing) matchName(name string) (bool, string) {
 		return false, ""
 	}
 	if len(a.handles) != 0 {
-		if a.hasHandle(name) {
-			return true, a.body
+		if !a.hasHandle(name) {
+			return false, ""
 		}
-		return false, ""
+		// Let an explicit tag select one agent for an exact reset. A sentence
+		// such as "@pi /new didn't work" must remain ordinary chat.
+		if i := strings.IndexFunc(a.body, unicode.IsSpace); i >= 0 && strings.EqualFold(strings.TrimRight(a.body[:i], ":,"), "@"+name) {
+			if command := strings.TrimSpace(a.body[i:]); command == "/new" || command == "!new" {
+				return true, command
+			}
+		}
+		return true, a.body
 	}
 	if len(a.body) > len(name) && strings.EqualFold(a.body[:len(name)], name) {
 		if c := a.body[len(name)]; c == ':' || c == ',' {
@@ -2889,9 +2927,36 @@ func (b *Bridge) warnUntaggedRoomReply(room, body string) {
 // ambient buffer removed (#106): unaddressed room messages are dropped at
 // dispatch instead of being held for a later turn. See handleRoom.
 
-// reply sends a bridge-generated notice (banner, command results, shutdown,
-// errors) to the owner's 1:1 — the primary channel. Agent-authored text is
-// private unless it is sent through an explicit messaging tool.
+// commandReply binds a reply to the authenticated command's conversation, not
+// the prior or next turn. An unavailable room never falls back to a DM.
+func (b *Bridge) commandReply(origin string) func(string) {
+	return func(text string) {
+		if b.xmpp == nil || strings.TrimSpace(text) == "" {
+			return
+		}
+		if slices.Contains(b.acct.Rooms, origin) {
+			b.xmpp.SendRoomTo(origin, text)
+		} else if origin == b.acct.Owner {
+			b.reply(text)
+		}
+	}
+}
+
+// commandFailure keeps raw RPC/OS diagnostics private. A public result
+// reports the failed command without echoing details from the active session.
+func (b *Bridge) commandFailure(origin string) func(string, string) {
+	reply := b.commandReply(origin)
+	inRoom := slices.Contains(b.acct.Rooms, origin)
+	return func(cmd, detail string) {
+		if inRoom {
+			reply("⚠️ " + cmd + " failed. See the owner DM for details.")
+		}
+		b.reply("⚠️ " + cmd + " failed: " + detail)
+	}
+}
+
+// reply sends private bridge notices to the owner's 1:1. Owner command
+// results use their captured conversation instead (except private uploads).
 func (b *Bridge) reply(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
@@ -3174,38 +3239,38 @@ func (b *Bridge) fireSendRecovery() bool {
 	return b.promptSynthetic("[pi-msg: recovery: No chat message was sent during the last run. Final assistant text is internal and was not delivered. If a reply is needed, call send_message(to, text, reply_to?) now; use a separate call for each message. The tool result will confirm whether each message was sent.]")
 }
 
-func (b *Bridge) handleModel(arg string) {
+func (b *Bridge) handleModel(arg string, reply func(string), fail func(string, string)) {
 	if arg == "" {
-		b.reply("usage: /model <provider/id> or /model <search>")
+		reply("usage: /model <provider/id> or /model <search>")
 		return
 	}
 	if strings.Contains(arg, "/") {
 		provider, rest, _ := strings.Cut(arg, "/")
 		res, err := b.rpc.SetModel(b.ctx, provider, rest)
-		b.reportResult(err, res, "🤖 model set: "+arg, "/model")
+		reportCommandResult(reply, fail, err, res, "🤖 model set: "+arg, "/model")
 		return
 	}
 	// Fuzzy: fetch models and match by substring.
 	res, err := b.rpc.GetAvailableModels(b.ctx)
 	if err != nil {
-		b.reply("⚠️ /model failed: " + err.Error())
+		fail("/model", err.Error())
 		return
 	}
 	provider, id, ok := matchModel(res, arg)
 	if !ok {
-		b.reply(fmt.Sprintf("no model matches %q. Try /model provider/id.", arg))
+		reply(fmt.Sprintf("no model matches %q. Try /model provider/id.", arg))
 		return
 	}
 	set, err := b.rpc.SetModel(b.ctx, provider, id)
-	b.reportResult(err, set, fmt.Sprintf("🤖 model set: %s/%s", provider, id), "/model")
+	reportCommandResult(reply, fail, err, set, fmt.Sprintf("🤖 model set: %s/%s", provider, id), "/model")
 }
 
 // handleModels lists every model pi can select, straight from
 // get_available_models — no LLM turn. The current model is marked.
-func (b *Bridge) handleModels() {
+func (b *Bridge) handleModels(reply func(string), fail func(string, string)) {
 	res, err := b.rpc.GetState(b.ctx)
 	if err != nil {
-		b.reply("⚠️ /models failed: " + err.Error())
+		fail("/models", err.Error())
 		return
 	}
 	cur := ""
@@ -3216,16 +3281,16 @@ func (b *Bridge) handleModels() {
 	}
 	res, err = b.rpc.GetAvailableModels(b.ctx)
 	if err != nil {
-		b.reply("⚠️ /models failed: " + err.Error())
+		fail("/models", err.Error())
 		return
 	}
 	if !res.success() {
-		b.reply("⚠️ /models failed: " + res.errText())
+		fail("/models", res.errText())
 		return
 	}
 	models, _ := res.Obj("data")["models"].([]any)
 	if len(models) == 0 {
-		b.reply("🤖 no models available")
+		reply("🤖 no models available")
 		return
 	}
 	lines := []string{fmt.Sprintf("🤖 %d models (▶ current):", len(models))}
@@ -3245,49 +3310,49 @@ func (b *Bridge) handleModels() {
 		}
 		lines = append(lines, line)
 	}
-	b.reply(strings.Join(lines, "\n"))
+	reply(strings.Join(lines, "\n"))
 }
 
 // handleName shows the session display name, or sets it when an arg is given.
-func (b *Bridge) handleName(arg string) {
+func (b *Bridge) handleName(arg string, reply func(string), fail func(string, string)) {
 	if arg == "" {
 		res, err := b.rpc.GetState(b.ctx)
 		if err != nil {
-			b.reply("⚠️ /name failed: " + err.Error())
+			fail("/name", err.Error())
 			return
 		}
 		if !res.success() {
-			b.reply("⚠️ /name failed: " + res.errText())
+			fail("/name", res.errText())
 			return
 		}
 		d := res.Obj("data")
 		name := orUnknown(d.Str("sessionName"))
-		b.reply("🏷️ session name: " + name)
+		reply("🏷️ session name: " + name)
 		return
 	}
 	res, err := b.rpc.SetSessionName(b.ctx, arg)
-	b.reportResult(err, res, "🏷️ session name set: "+arg, "/name")
+	reportCommandResult(reply, fail, err, res, "🏷️ session name set: "+arg, "/name")
 }
 
 // handleSession reports the current session's id, file, message counts, token
 // usage and cost straight from get_session_stats — no LLM turn.
-func (b *Bridge) handleSession() {
+func (b *Bridge) handleSession(reply func(string), fail func(string, string), inRoom bool) {
 	res, err := b.rpc.GetSessionStats(b.ctx)
 	if err != nil {
-		b.reply("⚠️ /session failed: " + err.Error())
+		fail("/session", err.Error())
 		return
 	}
 	if !res.success() {
-		b.reply("⚠️ /session failed: " + res.errText())
+		fail("/session", res.errText())
 		return
 	}
 	data := res.Obj("data")
 	if data == nil {
-		b.reply("⚠️ /session: no stats data")
+		reply("⚠️ /session: no stats data")
 		return
 	}
 	lines := []string{"📊 session " + orUnknown(data.Str("sessionId"))}
-	if f := data.Str("sessionFile"); f != "" {
+	if f := data.Str("sessionFile"); f != "" && !inRoom {
 		lines = append(lines, "file: "+f)
 	}
 	lines = append(lines, fmt.Sprintf(
@@ -3309,7 +3374,7 @@ func (b *Bridge) handleSession() {
 		lines = append(lines, fmt.Sprintf("context: %.1f%% (%s / %s tokens)", cu.F64("percent"),
 			commaInt(int64(cu.F64("tokens"))), commaInt(int64(cu.F64("contextWindow")))))
 	}
-	b.reply(strings.Join(lines, "\n"))
+	reply(strings.Join(lines, "\n"))
 }
 
 // commaInt formats n with thousands separators.
@@ -3328,17 +3393,15 @@ func commaInt(n int64) string {
 	return b.String()
 }
 
-// reportResult sends okMsg on success, or a formatted failure for command cmd.
-func (b *Bridge) reportResult(err error, res Event, okMsg, cmd string) {
+// reportCommandResult sends okMsg on success, or a formatted failure for cmd.
+func reportCommandResult(reply func(string), fail func(string, string), err error, res Event, okMsg, cmd string) {
 	if err != nil {
-		b.reply(fmt.Sprintf("⚠️ %s failed: %s", cmd, err.Error()))
-		return
+		fail(cmd, err.Error())
+	} else if res.success() {
+		reply(okMsg)
+	} else {
+		fail(cmd, res.errText())
 	}
-	if res.success() {
-		b.reply(okMsg)
-		return
-	}
-	b.reply(fmt.Sprintf("⚠️ %s failed: %s", cmd, res.errText()))
 }
 
 // reportCreditIfWatched reports the OpenRouter credit after /new, but only

@@ -18,7 +18,7 @@ type nextQueue struct {
 	wake        chan struct{}
 	started     bool
 	executing   bool
-	supersede   bool
+	supersedeTo string
 	submitted   map[string]bool
 	fenced      atomic.Bool // event consumers must never wait for admission/disk IO
 	quarantined atomic.Bool // historical ordinary controls must not age-ack
@@ -230,7 +230,7 @@ func (b *Bridge) admitNextResult(m InboundMessage) nextAdmission {
 			}
 			b.next.record = r
 		}
-		b.sendReconcileNotice(r.Destination, fmt.Sprintf("/next: boundary %s %s; wait for active work to settle; later chat held for the new session. %s", r.ID, r.Phase, r.LastError))
+		b.sendReconcileNotice(dest, fmt.Sprintf("/next: boundary %s %s; wait for active work to settle; later chat held for the new session.", r.ID, r.Phase))
 		if b.next.wake != nil {
 			select {
 			case b.next.wake <- struct{}{}:
@@ -246,6 +246,7 @@ func (b *Bridge) admitNextResult(m InboundMessage) nextAdmission {
 		switch name {
 		case "quit", "exit":
 			// Existing shutdown is allowed; durable input and boundary are untouched.
+			b.commandReply(dest)("Shutting down; pending /next retained.")
 			go b.shutdown("requested over chat; pending /next retained")
 			return nextControlConsumed
 		case "new":
@@ -261,7 +262,11 @@ func (b *Bridge) admitNextResult(m InboundMessage) nextAdmission {
 				b.sendReconcileNotice(dest, "/new: pending /next is executing or already target-bound; cannot safely supersede/retarget input; inspect boundary artifacts")
 				return nextControlConsumed
 			}
-			b.next.supersede = true
+			if b.next.supersedeTo != "" {
+				b.commandReply(dest)("/new: supersession already queued; the original request will receive its result.")
+				return nextControlConsumed
+			}
+			b.next.supersedeTo = dest
 			b.sendReconcileNotice(dest, "/new: lossless supersession requested; held input retained until a distinct durable target is proven")
 			if b.next.wake != nil {
 				select {
@@ -335,24 +340,28 @@ func stateIdentity(s Event) string {
 	}
 	return ""
 }
-func (b *Bridge) blockNext(r *nextBoundaryRecord, err error) {
+func (b *Bridge) markNextBlocked(r *nextBoundaryRecord, err error) {
 	r.Phase, r.LastError = nextBoundaryBlocked, err.Error()
 	if e := saveNextBoundary(b.nextPath(), r); e != nil {
 		r.LastError += "; persist blocked state: " + e.Error()
 	}
+}
+
+func (b *Bridge) blockNext(r *nextBoundaryRecord, err error) {
+	b.markNextBlocked(r, err)
 	b.sendReconcileNotice(r.Destination, "/next: blocked; held input retained: "+r.LastError)
 }
 
 func (b *Bridge) executeNextQueue() {
 	b.next.mu.Lock()
 	r := b.next.record
-	if r == nil || b.next.executing || (r.Phase == nextBoundaryBlocked && !b.next.supersede) {
+	if r == nil || b.next.executing || (r.Phase == nextBoundaryBlocked && b.next.supersedeTo == "") {
 		b.next.mu.Unlock()
 		return
 	}
 	b.next.executing = true
-	supersede := b.next.supersede
-	b.next.supersede = false
+	supersedeTo := b.next.supersedeTo
+	b.next.supersedeTo = ""
 	defer func() { b.next.mu.Lock(); b.next.executing = false; b.next.mu.Unlock() }()
 	phase := r.Phase
 	b.mu.Lock()
@@ -362,6 +371,7 @@ func (b *Bridge) executeNextQueue() {
 	if promptErr != "" {
 		b.blockNext(r, fmt.Errorf("%s", promptErr))
 		b.next.mu.Unlock()
+		b.commandReply(supersedeTo)("/new: blocked; held input retained.")
 		return
 	}
 	b.next.mu.Unlock()
@@ -378,11 +388,12 @@ func (b *Bridge) executeNextQueue() {
 				}
 			}
 			b.next.mu.Unlock()
+			b.commandReply(supersedeTo)("/new: blocked by unresolved input in an older session.")
 			return
 		}
 	}
-	if supersede {
-		b.supersedeNext(r)
+	if supersedeTo != "" {
+		b.supersedeNext(r, supersedeTo)
 		return
 	}
 	if phase == nextBoundaryResetConfirmed || phase == nextBoundaryReleasing {
@@ -680,7 +691,8 @@ func (b *Bridge) submitProtectedPrompt(text, behavior string, e inboxEntry) bool
 
 // Explicit owner recovery only: never reopens a reconciliation gate, never
 // retargets previously assigned input, and never retries an uncertain reset.
-func (b *Bridge) supersedeNext(r *nextBoundaryRecord) {
+func (b *Bridge) supersedeNext(r *nextBoundaryRecord, origin string) {
+	reply := b.commandReply(origin)
 	b.sessionTransitionMu.Lock()
 	b.mu.Lock()
 	b.nextTransition = true
@@ -688,7 +700,16 @@ func (b *Bridge) supersedeNext(r *nextBoundaryRecord) {
 	b.mu.Unlock()
 	b.sessionTransitionMu.Unlock()
 	defer func() { b.mu.Lock(); b.nextTransition = false; b.mu.Unlock() }()
-	fail := func(err error) { b.next.mu.Lock(); b.blockNext(r, err); b.next.mu.Unlock() }
+	fail := func(err error) {
+		b.next.mu.Lock()
+		b.markNextBlocked(r, err)
+		detail, boundaryDest := r.LastError, r.Destination
+		b.next.mu.Unlock()
+		if boundaryDest != origin {
+			b.commandReply(boundaryDest)("/next: blocked; held input retained.")
+		}
+		b.commandFailure(origin)("/new", "supersession blocked; held input retained: "+detail)
+	}
 	if active {
 		b.rpc.Abort()
 	}
@@ -700,7 +721,7 @@ func (b *Bridge) supersedeNext(r *nextBoundaryRecord) {
 		return
 	} else if n > 0 {
 		b.next.quarantined.Store(false)
-		b.sendReconcileNotice(r.Destination, fmt.Sprintf("/new: discarded %d unresolved OLD primary inbox entries; all post-boundary input retained", n))
+		reply(fmt.Sprintf("/new: discarded %d unresolved OLD primary inbox entries; all post-boundary input retained", n))
 	}
 	state, err := b.rpc.observedState(b.ctx)
 	if err != nil || !state.success() || stateIdentity(state.Obj("data")) == "" {
@@ -747,7 +768,7 @@ func (b *Bridge) supersedeNext(r *nextBoundaryRecord) {
 	b.sessionFile = fresh.Str("sessionFile")
 	b.messagingSeeded = false
 	b.markFresh()
-	b.sendReconcileNotice(r.Destination, "🆕 /new session ready; pending reconciliation superseded, held input retained for this target")
+	reply("🆕 /new session ready; pending reconciliation superseded, held input retained for this target")
 	b.mu.Lock()
 	b.nextTransition = false
 	b.mu.Unlock()

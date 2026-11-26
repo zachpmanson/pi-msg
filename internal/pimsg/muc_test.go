@@ -45,6 +45,8 @@ func TestMatchTrigger(t *testing.T) {
 		{"@pi how do I pull the logs", true, "@pi how do I pull the logs"},
 		{"over to @pi for the exact path", true, "over to @pi for the exact path"},
 		{"thanks @PI.", true, "thanks @PI."},
+		{"@pi /new", true, "/new"},
+		{"@pi /new didn't work", true, "@pi /new didn't work"},
 		{"@pigeon is not @ pilot", false, ""},
 		{"try pi@naboo, root@pi or user@x.pi/device", false, ""},
 		{"try pi!ops@example.org or user@host/ci:pi", false, ""},

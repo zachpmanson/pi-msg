@@ -191,6 +191,16 @@ An outbound room message intended as a handoff should use an explicit
 at most once per peer-triggered run, if a room reply appears to address nobody;
 owner-triggered reports are not warned. Messages are not blocked by this warning.
 
+## Bridge commands
+
+Owner-only commands handled by the bridge, such as `/new`, reply in the room
+or DM where they were invoked. Use `@name /new` to reset only one agent. Controls
+do not change an unrelated Pi turn's reply destination. `/next` keeps background
+job updates in the initiating conversation. Session transcripts, export links,
+a bare `/name` lookup, and detailed RPC errors go only to the owner privately;
+room requests receive status without private content.
+Unsolicited bridge/health notices still go to the owner.
+
 ## Room-triggered prompts
 
 A room-triggered prompt is a pointer block: it carries the room, sender, and

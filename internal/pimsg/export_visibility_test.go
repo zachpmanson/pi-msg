@@ -197,7 +197,7 @@ func TestSessionExportVisibilityUpload(t *testing.T) {
 				b.rpc.pending[command.Str("id")] <- Event{"success": true}
 				return len(p), nil
 			}}
-			b.handleExport("")
+			b.handleExport(fileCommandReply{private: b.reply})
 			if msg := nextSessionUploadMessage(t, messages); !strings.Contains(msg.Body, "exporting session") {
 				t.Fatal("missing progress", msg)
 			}

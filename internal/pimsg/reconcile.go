@@ -634,10 +634,12 @@ func (b *Bridge) sendReconcileNotice(dest, text string) bool {
 }
 
 // Legacy canonical entry points still use the same durable admission seam.
-func (b *Bridge) handleNext(arg string) {
-	dest := b.currentTurnDest()
-	if dest == "" {
-		dest = b.acct.Owner
+func (b *Bridge) handleNext(arg, origin string) {
+	m := InboundMessage{Body: "/next " + arg, FromOwner: true, From: b.acct.Owner}
+	if origin == b.acct.Owner {
+		m.Direct = true
+	} else {
+		m.Room = origin
 	}
-	b.admitNext(InboundMessage{Body: "/next " + arg, Direct: dest == b.acct.Owner, FromOwner: true, Room: dest, From: b.acct.Owner})
+	b.admitNext(m)
 }

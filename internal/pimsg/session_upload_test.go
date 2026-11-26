@@ -105,7 +105,7 @@ func TestSessionUploadFailureNeverSendsInline(t *testing.T) {
 				}
 				b.sendRenderedFile(tc.name, path)
 			} else {
-				b.sendDumpFile(tc.name, content)
+				b.sendDumpFile(tc.name, content, fileCommandReply{private: b.reply})
 			}
 			msg := nextSessionUploadMessage(t, messages)
 			for _, want := range []string{"file upload failed", fmt.Sprintf("%d bytes", tc.size), "requesting upload slot: file too large", "Not sending inline", "web link"} {

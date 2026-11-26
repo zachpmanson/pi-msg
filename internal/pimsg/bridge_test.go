@@ -1377,32 +1377,54 @@ func TestRPCEnv(t *testing.T) {
 	}
 }
 
-// A control command produces no prompt, so it must set its own reply/file
-// destination rather than inheriting the previous turn's. Before this, a
-// /export or /dump typed in the owner's 1:1 uploaded the session file to
-// whichever room the agent last spoke in (zpm/beltino#56, pi-msg#113).
 func TestCommandReplyUsesItsOwnOrigin(t *testing.T) {
-	b := roomBridge()
-	b.rpc = &RPCClient{} // fire-and-forget writes fail harmlessly ("pi not running")
-	b.xmpp = NewXMPPBridge(b.acct, func(InboundMessage) {}, b.log)
-	// The agent's last turn was in the room...
-	b.setTurnDest("team@muc.x.com", true)
-
-	// ...then an owner command arrives in the 1:1. The destination must move to
-	// the owner, not stay in the room.
-	b.handleCanonical("/interrupt", "", b.acct.Owner, "", "", "", "", nil, false)
-	if got := b.currentTurnDest(); got != b.acct.Owner {
-		t.Errorf("1:1 command turnDest = %q, want owner %q", got, b.acct.Owner)
+	for _, tc := range []struct{ origin, prior, typ string }{
+		{"zach@x", "team@muc.x", "chat"},
+		{"team@muc.x", "zach@x", "groupchat"},
+	} {
+		t.Run(tc.typ, func(t *testing.T) {
+			b, wire, _ := messageTransportBridge(t, false)
+			b.setTurnDest(tc.prior, true)
+			b.handleCanonical("/model", "", tc.origin, "", "", "", "", nil, false)
+			if !strings.Contains(wire.String(), `to="`+tc.origin+`" type="`+tc.typ+`"><body>usage: /model`) {
+				t.Fatalf("wrong command result stanza: %s", wire)
+			}
+			if got := b.currentTurnDest(); got != tc.prior || !b.peerTriggered() {
+				t.Errorf("command modified the earlier turn: dest=%q, peer=%v", got, b.peerTriggered())
+			}
+		})
 	}
-	if b.peerTriggered() {
-		t.Error("an owner command must not be marked as a peer-triggered run")
-	}
+}
 
-	// And the reverse: a command typed in a room replies in that room.
-	b.setTurnDest(b.acct.Owner, false)
-	b.handleCanonical("/interrupt", "zach", "team@muc.x.com", "", "", "", "", nil, false)
-	if got := b.currentTurnDest(); got != "team@muc.x.com" {
-		t.Errorf("room command turnDest = %q, want room", got)
+func TestRoomNewCommandReply(t *testing.T) {
+	for _, tc := range []struct{ name, data, result string }{
+		{"success", `{"cancelled":false}`, "new session ready"},
+		{"cancelled", `{"cancelled":true}`, "/new failed. See the owner DM for details."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, wire, _ := messageTransportBridge(t, false)
+			b.ctx = context.Background()
+			b.acct.RoomTrigger = "pi"
+			b.rpc = NewRPCClient(fakePiRespond(t, `{"type":"response","id":"%s","success":true,"data":`+tc.data+`}`), "", "", "", nil)
+			if err := b.rpc.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer b.rpc.Stop()
+			b.handleRoom(InboundMessage{Room: "team@muc.x", Nick: "zach", RealJID: b.acct.Owner, FromOwner: true, Body: "@pi /new"})
+			encoded := wire.String()
+			if !strings.Contains(encoded, `to="team@muc.x" type="groupchat"><body>`) || !strings.Contains(encoded, tc.result) {
+				t.Fatalf("wrong /new room result: %s", wire)
+			}
+			const dm = `to="zach@x" type="chat"><body>`
+			if tc.name == "cancelled" {
+				before, after, ok := strings.Cut(encoded, dm)
+				if !ok || strings.Contains(before, "session reset cancelled") || !strings.Contains(after, "session reset cancelled") {
+					t.Fatalf("raw failure not confined to the owner DM: %s", wire)
+				}
+			} else if strings.Contains(encoded, dm) {
+				t.Fatalf("success should not send a second result by DM: %s", wire)
+			}
+		})
 	}
 }
 
@@ -1424,7 +1446,7 @@ func TestDumpUploadForcesOwnerOverRoom(t *testing.T) {
 	}
 	defer func() { uploadDumpFile = orig }()
 
-	b.sendDumpFile("session.jsonl", []byte("{}"))
+	b.sendDumpFile("session.jsonl", []byte("{}"), fileCommandReply{private: b.reply})
 
 	select {
 	case dest := <-got:
