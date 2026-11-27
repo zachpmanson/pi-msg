@@ -1385,7 +1385,11 @@ func TestCommandReplyUsesItsOwnOrigin(t *testing.T) {
 		t.Run(tc.typ, func(t *testing.T) {
 			b, wire, _ := messageTransportBridge(t, false)
 			b.setTurnDest(tc.prior, true)
-			b.handleCanonical("/model", "", tc.origin, "", "", "", "", nil, false)
+			m := InboundMessage{Direct: tc.typ == "chat"}
+			if !m.Direct {
+				m.Room = tc.origin
+			}
+			b.handleCanonical("/model", m)
 			if !strings.Contains(wire.String(), `to="`+tc.origin+`" type="`+tc.typ+`"><body>usage: /model`) {
 				t.Fatalf("wrong command result stanza: %s", wire)
 			}

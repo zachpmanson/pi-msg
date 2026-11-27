@@ -24,7 +24,7 @@ func TestAutoreconcileUnknownOutcomeDurablyFencesInputAndRestart(t *testing.T) {
 		t.Fatal("unknown switch delivered into an unproven primary")
 	}
 	f.incoming("/new", "no-blind-reset")
-	if f.b.next.supersedeTo != "" {
+	if f.b.next.supersede != nil {
 		t.Fatal("unknown native switch allowed blind /new supersession")
 	}
 	restarted := NewBridge(f.b.acct, false)

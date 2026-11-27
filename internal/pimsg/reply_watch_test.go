@@ -98,7 +98,7 @@ func TestReplyWatchInterruptDrainsQueuedExpiry(t *testing.T) {
 	b.expireReplyWatch(w)
 	<-b.replyWatchWake
 	b.flushReplyWatches() // consume original wake while busy
-	if !b.handleCommand("!", b.acct.Owner) {
+	if !b.handleCommand("!", commandSource{dest: b.acct.Owner}) {
 		t.Fatal("interrupt not handled")
 	}
 	select {
@@ -118,7 +118,7 @@ func TestReplyWatchInterruptDrainsQueuedExpiry(t *testing.T) {
 	acceptPromptResponses(b, true)
 	b.setStreaming(true)
 	// Aborting the synthetic run must not leave heartbeatRun blocking later watches.
-	if !b.handleCommand("!", b.acct.Owner) {
+	if !b.handleCommand("!", commandSource{dest: b.acct.Owner}) {
 		t.Fatal("second interrupt not handled")
 	}
 	if b.heartbeatRun || b.volunteered || b.streaming() {
@@ -288,7 +288,7 @@ func TestReplyWatchAbortCommandsDrainQueuedExpiry(t *testing.T) {
 			b.expireReplyWatch(w)
 			<-b.replyWatchWake
 			b.flushReplyWatches()
-			if !b.handleCommand(command, b.acct.Owner) {
+			if !b.handleCommand(command, commandSource{dest: b.acct.Owner}) {
 				t.Fatal("command not handled")
 			}
 			if b.streaming() || b.heartbeatRun || b.volunteered {

@@ -435,6 +435,7 @@ func (b *XMPPBridge) collectMAMResult(toks []xml.Token, res xml.StartElement) {
 	if col.room != "" {
 		real := b.occupantRealJID(col.room, nick)
 		m.Room = col.room
+		m.RoomStanzaID = mucStanzaID(rest, col.room)
 		m.Nick = nick
 		m.RealJID = real
 		m.FromOwner = real != "" && real == b.ownerBare

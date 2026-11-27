@@ -48,7 +48,7 @@ func TestQueuedNextRecoveredArchiveControlOverlapQuarantined(t *testing.T) {
 						t.Fatal("historical copy created/replaced a boundary")
 					}
 					f.b.next.mu.Lock()
-					supersede := f.b.next.supersedeTo != ""
+					supersede := f.b.next.supersede != nil
 					f.b.next.mu.Unlock()
 					if supersede || !f.b.next.quarantined.Load() || len(f.jobs(t)) != 0 {
 						t.Fatal("historical copy requested supersession/effects or lost quarantine")

@@ -18,7 +18,7 @@ type nextQueue struct {
 	wake        chan struct{}
 	started     bool
 	executing   bool
-	supersedeTo string
+	supersede   *commandSource
 	submitted   map[string]bool
 	fenced      atomic.Bool // event consumers must never wait for admission/disk IO
 	quarantined atomic.Bool // historical ordinary controls must not age-ack
@@ -262,11 +262,12 @@ func (b *Bridge) admitNextResult(m InboundMessage) nextAdmission {
 				b.sendReconcileNotice(dest, "/new: pending /next is executing or already target-bound; cannot safely supersede/retarget input; inspect boundary artifacts")
 				return nextControlConsumed
 			}
-			if b.next.supersedeTo != "" {
+			if b.next.supersede != nil {
 				b.commandReply(dest)("/new: supersession already queued; the original request will receive its result.")
 				return nextControlConsumed
 			}
-			b.next.supersedeTo = dest
+			source := b.commandSource(m)
+			b.next.supersede = &source
 			b.sendReconcileNotice(dest, "/new: lossless supersession requested; held input retained until a distinct durable target is proven")
 			if b.next.wake != nil {
 				select {
@@ -325,7 +326,8 @@ func sameProtectedStanza(e inboxEntry, m InboundMessage) bool {
 
 func historicalBoundaryControl(m InboundMessage, b *Bridge) bool {
 	name, _, control := boundaryCommand(m, b)
-	return control && (name == "next" || name == "new" || name == "abort" || name == "stop" || name == "interrupt")
+	_, tagged := taggedRoomCommand(m.Body)
+	return control && (tagged != "" || name == "next" || name == "new" || name == "abort" || name == "stop" || name == "interrupt")
 }
 
 func (b *Bridge) nextBusyLocked() bool {
@@ -355,13 +357,13 @@ func (b *Bridge) blockNext(r *nextBoundaryRecord, err error) {
 func (b *Bridge) executeNextQueue() {
 	b.next.mu.Lock()
 	r := b.next.record
-	if r == nil || b.next.executing || (r.Phase == nextBoundaryBlocked && b.next.supersedeTo == "") {
+	if r == nil || b.next.executing || (r.Phase == nextBoundaryBlocked && b.next.supersede == nil) {
 		b.next.mu.Unlock()
 		return
 	}
 	b.next.executing = true
-	supersedeTo := b.next.supersedeTo
-	b.next.supersedeTo = ""
+	supersede := b.next.supersede
+	b.next.supersede = nil
 	defer func() { b.next.mu.Lock(); b.next.executing = false; b.next.mu.Unlock() }()
 	phase := r.Phase
 	b.mu.Lock()
@@ -371,7 +373,9 @@ func (b *Bridge) executeNextQueue() {
 	if promptErr != "" {
 		b.blockNext(r, fmt.Errorf("%s", promptErr))
 		b.next.mu.Unlock()
-		b.commandReply(supersedeTo)("/new: blocked; held input retained.")
+		if supersede != nil {
+			b.commandReply(supersede.dest)("/new: blocked; held input retained.")
+		}
 		return
 	}
 	b.next.mu.Unlock()
@@ -388,12 +392,14 @@ func (b *Bridge) executeNextQueue() {
 				}
 			}
 			b.next.mu.Unlock()
-			b.commandReply(supersedeTo)("/new: blocked by unresolved input in an older session.")
+			if supersede != nil {
+				b.commandReply(supersede.dest)("/new: blocked by unresolved input in an older session.")
+			}
 			return
 		}
 	}
-	if supersedeTo != "" {
-		b.supersedeNext(r, supersedeTo)
+	if supersede != nil {
+		b.supersedeNext(r, *supersede)
 		return
 	}
 	if phase == nextBoundaryResetConfirmed || phase == nextBoundaryReleasing {
@@ -691,7 +697,8 @@ func (b *Bridge) submitProtectedPrompt(text, behavior string, e inboxEntry) bool
 
 // Explicit owner recovery only: never reopens a reconciliation gate, never
 // retargets previously assigned input, and never retries an uncertain reset.
-func (b *Bridge) supersedeNext(r *nextBoundaryRecord, origin string) {
+func (b *Bridge) supersedeNext(r *nextBoundaryRecord, source commandSource) {
+	origin := source.dest
 	reply := b.commandReply(origin)
 	b.sessionTransitionMu.Lock()
 	b.mu.Lock()
@@ -768,7 +775,7 @@ func (b *Bridge) supersedeNext(r *nextBoundaryRecord, origin string) {
 	b.sessionFile = fresh.Str("sessionFile")
 	b.messagingSeeded = false
 	b.markFresh()
-	reply("🆕 /new session ready; pending reconciliation superseded, held input retained for this target")
+	b.acknowledgeNew(source, "🆕 /new session ready; pending reconciliation superseded, held input retained for this target")
 	b.mu.Lock()
 	b.nextTransition = false
 	b.mu.Unlock()

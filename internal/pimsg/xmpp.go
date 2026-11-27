@@ -293,11 +293,12 @@ type InboundMessage struct {
 	// Historical separates archived/delayed origin evidence from legacy routing
 	// identity, which may use today's occupant map. OriginJID is trusted only
 	// when matched to previously verified delivery/accepted-send provenance.
-	Historical bool
-	OriginJID  string
-	Direct     bool   // arrived as a 1:1 chat, not groupchat (reply goes back 1:1)
-	Room       string // source room bare JID (room mode); "" for 1:1
-	ID         string // stanza id (used as the XEP-0444 reaction target)
+	Historical   bool
+	OriginJID    string
+	Direct       bool   // arrived as a 1:1 chat, not groupchat (reply goes back 1:1)
+	Room         string // source room bare JID (room mode); "" for 1:1
+	ID           string // sender-assigned message ID
+	RoomStanzaID string // room-assigned XEP-0359 ID, required for MUC command reactions
 	// ArchiveID is the XEP-0313 MAM result id: the id the server archived the
 	// stanza under, which is what RSM <before>/<after> cursors address. It is NOT
 	// the message's own id — measured live 2026-09-28 in testing-2: the archive id
@@ -1288,18 +1289,19 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 		// so a dropped owner message in a reconnect gap is visible — #94).
 		if b.swapWindowActive() && b.inSwapWindow(m.delayStamp) {
 			b.bufferReplay(InboundMessage{
-				ReplyToID:  m.replyToID,
-				ReplyToJID: m.replyToJID,
-				Body:       m.body,
-				Nick:       nick,
-				RealJID:    real,
-				FromOwner:  real != "" && real == b.ownerBare,
-				Room:       room,
-				ID:         m.id,
-				From:       m.from,
-				Stamp:      m.delayStamp,
-				Historical: true,
-				OriginJID:  origin,
+				ReplyToID:    m.replyToID,
+				ReplyToJID:   m.replyToJID,
+				Body:         m.body,
+				Nick:         nick,
+				RealJID:      real,
+				FromOwner:    real != "" && real == b.ownerBare,
+				Room:         room,
+				ID:           m.id,
+				RoomStanzaID: m.roomStanzaID,
+				From:         m.from,
+				Stamp:        m.delayStamp,
+				Historical:   true,
+				OriginJID:    origin,
 			})
 		} else {
 			b.log("notice", fmt.Sprintf("dropped delayed room message outside the replay window (room=%s nick=%s id=%s stamp=%s)", room, nick, m.id, stampLabel(m.delayStamp)))
@@ -1321,17 +1323,18 @@ func (b *XMPPBridge) dispatchRoom(m incomingMsg) {
 	b.recordInboundMessage(m.id, m.from, m.body, owner)
 	b.recordRoomReply(room, m.id, m.roomStanzaID, m.from, m.body, false, owner)
 	b.onMsg(InboundMessage{
-		Body:       m.body,
-		Nick:       nick,
-		RealJID:    real,
-		FromOwner:  owner,
-		Room:       room,
-		ReplyToID:  m.replyToID,
-		ReplyToJID: m.replyToJID,
-		ID:         m.id,
-		From:       m.from,
-		Reactions:  m.reactions,
-		ReactionID: m.reactionFor,
+		Body:         m.body,
+		Nick:         nick,
+		RealJID:      real,
+		FromOwner:    owner,
+		Room:         room,
+		ReplyToID:    m.replyToID,
+		ReplyToJID:   m.replyToJID,
+		ID:           m.id,
+		RoomStanzaID: m.roomStanzaID,
+		From:         m.from,
+		Reactions:    m.reactions,
+		ReactionID:   m.reactionFor,
 	})
 }
 

@@ -193,9 +193,18 @@ owner-triggered reports are not warned. Messages are not blocked by this warning
 
 ## Bridge commands
 
-Owner-only commands handled by the bridge, such as `/new`, reply in the room
-or DM where they were invoked. Use `@name /new` to reset only one agent. Controls
-do not change an unrelated Pi turn's reply destination. `/next` keeps background
+Owner-only bridge commands accept leading room tags on the same line. For
+example, `@name /new` resets one agent, `@free /new` resets eligible free agents,
+and `@all /new` resets every addressed bridge in the room, even during active
+turns. Only the leading tags select recipients of a tagged control, not the
+reply parent or mentions in arguments. A sentence like `@all /new didn't work`
+remains chat.
+
+A successful `/new` reacts 🆕 to the command itself. If reactions are disabled,
+there is no usable message ID (a room-assigned stanza ID in a MUC), or sending
+fails, the bridge sends the usual confirmation in the originating conversation.
+Errors remain text. Controls do not change an unrelated Pi turn's reply
+destination. `/next` keeps background
 job updates in the initiating conversation. Session transcripts, export links,
 a bare `/name` lookup, and detailed RPC errors go only to the owner privately;
 room requests receive status without private content.

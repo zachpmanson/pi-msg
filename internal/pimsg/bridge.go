@@ -1243,7 +1243,7 @@ func (b *Bridge) onInbound(m InboundMessage) {
 	if m.Direct {
 		// Owner 1:1: origin is the owner; no separate sender. The reaction target
 		// is this message (routed to its full from-JID).
-		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil, m.Markable)
+		b.handleCanonical(m.Body, m)
 		return
 	}
 	b.handleRoom(m)
@@ -1422,6 +1422,15 @@ func (b *Bridge) classify(m InboundMessage) (roomAction, string, string) {
 	action := actionCommentary
 	if m.FromOwner {
 		action = actionCanonical
+		if targets, command := taggedRoomCommand(addr.body); command != "" {
+			// Unlike chat, a tagged control never implicitly targets a reply
+			// parent or an agent mentioned in its arguments.
+			if trig != "" && (targets.hasHandle(trig) || targets.hasAny(broadcastHandles) ||
+				(targets.hasAny(freeHandles) && (m.Addressed || b.freeForSummons()))) {
+				return action, command, ""
+			}
+			return actionNotOurs, m.Body, ""
+		}
 	}
 	if named, stripped := addr.matchName(trig); named {
 		mention := addr.bareMention(trig)
@@ -1485,17 +1494,7 @@ func (b *Bridge) handleRoom(m InboundMessage) {
 	action, body, _ := b.classify(m)
 	switch action {
 	case actionCanonical:
-		// The stanza id always travels: it can be send_message's reply_to
-		// value (#54), whether or not reactions are on.
-		// Room reactions enabled → also use the room JID as the reaction target,
-		// so auto-reacts and send_reaction hit the room message. Every reaction
-		// path needs BOTH a target jid and an id, so an id with no jid reacts to
-		// nothing.
-		reactTo := ""
-		if b.acct.ReactionsFor(m.Room) {
-			reactTo = m.Room
-		}
-		b.handleCanonical(body, m.Nick, m.Room, m.RealJID, reactTo, m.ID, b.replyContext(m), b.roomNoticeFor(m), false)
+		b.handleCanonical(body, m)
 	case actionCommentary:
 		reactTo := ""
 		if b.acct.ReactionsFor(m.Room) {
@@ -1527,26 +1526,33 @@ func senderName(nick, sender, origin string) string {
 	return "user"
 }
 
-// handleCanonical handles a trusted (owner / 1:1) message: control commands
-// dispatch directly; anything else becomes a canonical prompt. origin is the
-// jid the message arrived on (owner or room); sender is the individual (room
-// only), both surfaced to the agent for explicit reply routing. nick is the
-// sender's occupant nick in a room, "" in a 1:1 — it only names the sender in
-// the unanswered-message hint's history. markable is the inbound XEP-0333 flag
-// for a 1:1 owner message; with it, the deferred "displayed" marker is
-// registered against the prompt so it fires only when pi reads the message.
-func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, replyTo string, notice *roomNotice, markable bool) {
+// handleCanonical dispatches controls from verified owner traffic; anything
+// else becomes a prompt. Keep the original stanza separate from parsed text.
+func (b *Bridge) handleCanonical(text string, m InboundMessage) {
+	source := b.commandSource(m)
+	origin := source.dest
+	reactTo, sender := m.From, ""
+	var notice *roomNotice
+	if !m.Direct {
+		sender = m.RealJID
+		reactTo = ""
+		if b.acct.ReactionsFor(m.Room) {
+			reactTo = m.Room
+		}
+		notice = b.roomNoticeFor(m)
+	}
+	reactID, replyTo := m.ID, b.replyContext(m)
 	t := strings.TrimSpace(text)
 	if t == "" {
-		b.inboxDrop(reactID, "", "")
+		b.inboxDrop(reactID, m.From, m.Body)
 		return
 	}
 	// A real message supersedes any pending/active reaction-only wake.
 	b.setReactionAckRun(false)
-	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!") || t == "&") && b.handleCommand(t, origin) {
+	if (strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!") || t == "&") && b.handleCommand(t, source) {
 		// Handled in-process: it never becomes a prompt, so nothing will ever
 		// settle for it (#104).
-		b.inboxDrop(reactID, "", "")
+		b.inboxDrop(reactID, m.From, m.Body)
 		return
 	}
 	// Controls have their own immutable reply destination and never take over an
@@ -1554,13 +1560,13 @@ func (b *Bridge) handleCanonical(text, nick, origin, sender, reactTo, reactID, r
 	b.setTurnDest(origin, false)
 	b.inboxMarkDelivered(reactID)
 	b.setLifecycleReactTarget(reactTo, reactID)
-	b.countInbound(senderName(nick, sender, origin), reactID, t)
+	b.countInbound(senderName(m.Nick, sender, origin), reactID, t)
 	prompt := b.composePrompt(t, origin, sender, reactID, reactTo, replyTo, notice)
 	// A markable 1:1 message is acknowledged only once pi starts it: register the
 	// marker against the exact prompt text and let the matching user
 	// `message_start` fire it (#73). A message with no usable stanza id, or a
 	// room message, carries no marker — the previous policy, unchanged.
-	b.promptMarked(prompt, markable, reactTo, reactID)
+	b.promptMarked(prompt, m.Direct && m.Markable, reactTo, reactID)
 	b.busyPresence("thinking…")
 }
 
@@ -1664,9 +1670,39 @@ func (b *Bridge) dispatchCommentary(body, nick, origin, sender, reactTo, reactID
 // handleCommand runs a recognized control command and returns true. Unknown
 // "/…" input (extension commands, /skill:name, /template) returns false so the
 // caller forwards it to pi as a prompt.
-func (b *Bridge) handleCommand(t, origin string) bool {
+// commandSource binds output to the originating conversation and, when
+// available, an XEP-0444 target. A MUC sender's id is not a room stanza-id.
+type commandSource struct {
+	dest, reactTo, reactID string
+}
+
+func (b *Bridge) commandSource(m InboundMessage) commandSource {
+	if m.Direct {
+		return commandSource{b.acct.Owner, m.From, m.ID}
+	}
+	return commandSource{m.Room, m.Room, m.RoomStanzaID}
+}
+
+func (b *Bridge) acknowledgeNew(source commandSource, fallback string) {
+	enabled := b.acct.Reactions
+	if slices.Contains(b.acct.Rooms, source.dest) {
+		enabled = b.acct.ReactionsFor(source.dest)
+	}
+	if enabled && b.xmpp != nil && source.reactTo != "" && source.reactID != "" {
+		err := b.xmpp.encodeReaction(source.reactTo, source.reactID, []string{"🆕"})
+		if err == nil {
+			return
+		}
+		b.log("warning", "new session reaction failed: "+err.Error())
+	}
+	b.commandReply(source.dest)(fallback)
+}
+
+func (b *Bridge) handleCommand(t string, source commandSource) bool {
+	origin := source.dest
 	if origin == "" {
 		origin = b.acct.Owner
+		source.dest = origin
 	}
 	reply := b.commandReply(origin)
 	fail := b.commandFailure(origin)
@@ -1707,9 +1743,11 @@ func (b *Bridge) handleCommand(t, origin string) bool {
 		if err == nil && res.success() && res.Obj("data").Bool("cancelled") {
 			err = fmt.Errorf("session reset cancelled")
 		}
-		reportCommandResult(reply, fail, err, res, "🆕 new session ready", "/new")
 		if err == nil && res.success() {
 			b.afterNewSession()
+			b.acknowledgeNew(source, "🆕 new session ready")
+		} else {
+			reportCommandResult(reply, fail, err, res, "", "/new")
 		}
 	case "compact":
 		res, err := b.rpc.Compact(b.ctx, arg)
@@ -2387,6 +2425,10 @@ func (b *Bridge) writeRoomPointer(sb *strings.Builder, n roomNotice, origin, sen
 func (b *Bridge) matchTrigger(room, body string) (bool, string) {
 	addr := parseRoomAddressing(body)
 	trig := b.acct.TriggerFor(room)
+	if targets, command := taggedRoomCommand(addr.body); command != "" && trig != "" &&
+		(targets.hasHandle(trig) || targets.hasAny(broadcastHandles) || targets.hasAny(freeHandles)) {
+		return true, command
+	}
 	if ok, stripped := addr.matchName(trig); ok {
 		return true, stripped
 	}
@@ -2428,22 +2470,52 @@ func (a roomAddressing) hasAny(names []string) bool {
 	return false
 }
 
+// taggedRoomCommand recognizes leading @handles and a single-line control.
+// Unknown commands and extra words after no-argument controls remain chat.
+func taggedRoomCommand(body string) (targets roomAddressing, command string) {
+	t := strings.TrimSpace(body)
+	if strings.ContainsAny(t, "\r\n") {
+		return targets, ""
+	}
+	for strings.HasPrefix(t, "@") {
+		i := strings.IndexFunc(t, unicode.IsSpace)
+		if i < 0 {
+			return targets, ""
+		}
+		token := strings.TrimRight(t[:i], ":,")
+		if tag := handleRe.FindString(token); tag == "" || tag != token {
+			return targets, ""
+		}
+		targets.handles = append(targets.handles, token[1:])
+		t = strings.TrimSpace(t[i:])
+	}
+	if len(targets.handles) == 0 || !(strings.HasPrefix(t, "/") || strings.HasPrefix(t, "!") || t == "&") {
+		return targets, ""
+	}
+	if t == "!" || t == "&" {
+		return targets, t
+	}
+	name, arg := splitCommand(t)
+	switch name {
+	case "compact", "think", "model", "name", "dump", "dump-all", "dumpall":
+		return targets, t
+	case "new", "next", "abort", "stop", "interrupt", "models", "session", "quit", "exit", "export":
+		if arg == "" {
+			return targets, t
+		}
+	}
+	return targets, ""
+}
+
 func (a roomAddressing) matchName(name string) (bool, string) {
 	if name == "" {
 		return false, ""
 	}
 	if len(a.handles) != 0 {
-		if !a.hasHandle(name) {
-			return false, ""
+		if a.hasHandle(name) {
+			return true, a.body
 		}
-		// Let an explicit tag select one agent for an exact reset. A sentence
-		// such as "@pi /new didn't work" must remain ordinary chat.
-		if i := strings.IndexFunc(a.body, unicode.IsSpace); i >= 0 && strings.EqualFold(strings.TrimRight(a.body[:i], ":,"), "@"+name) {
-			if command := strings.TrimSpace(a.body[i:]); command == "/new" || command == "!new" {
-				return true, command
-			}
-		}
-		return true, a.body
+		return false, ""
 	}
 	if len(a.body) > len(name) && strings.EqualFold(a.body[:len(name)], name) {
 		if c := a.body[len(name)]; c == ':' || c == ',' {
@@ -4587,7 +4659,8 @@ func (b *Bridge) recoveredRoomAuthor(m InboundMessage) InboundMessage {
 	}
 	_, body := b.matchTrigger(m.Room, m.Body)
 	text := strings.TrimSpace(body)
-	if m.ReplyToID != "" || strings.HasPrefix(text, "/") || strings.HasPrefix(text, "!") || text == "&" {
+	_, tagged := taggedRoomCommand(m.Body)
+	if tagged != "" || m.ReplyToID != "" || strings.HasPrefix(text, "/") || strings.HasPrefix(text, "!") || text == "&" {
 		m.RealJID = m.OriginJID
 		m.FromOwner = m.OriginJID != "" && m.OriginJID == bareJid(b.acct.Owner)
 	}
@@ -4654,8 +4727,21 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
 		m = b.recoveredRoomAuthor(m)
 		if m.Direct {
 			b.captureAutoInbound(m)
-		} else if action, _, _ := b.classify(m); action != actionNotOurs {
-			b.captureAutoInbound(m)
+		} else {
+			action, _, _ := b.classify(m)
+			if _, tagged := taggedRoomCommand(m.Body); m.FromOwner && tagged != "" {
+				// As for live delivery, do not hold an off-target control at a
+				// /next boundary. Preserve the pre-activity @free verdict.
+				if action == actionNotOurs {
+					b.xmpp.markSeen(stanzaDeliveryKey(m.Room, m.ID))
+					b.noteInboundHandled()
+					continue
+				}
+				m.Addressed = true
+			}
+			if action != actionNotOurs {
+				b.captureAutoInbound(m)
+			}
 		}
 		b.autoActivity()
 		b.xmpp.markSeen(stanzaDeliveryKey(m.Room, m.ID))
@@ -4667,7 +4753,7 @@ func (b *Bridge) deliverRecovered(msgs []InboundMessage, inboxes []inboxEntry) {
 			continue
 		}
 		if m.Direct {
-			b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil, m.Markable)
+			b.handleCanonical(m.Body, m)
 		} else {
 			b.handleRoom(m)
 		}
@@ -4743,7 +4829,7 @@ func (b *Bridge) deliverInbox(e inboxEntry) {
 	}
 	m.Body = strings.TrimSpace(m.Body) + "\n\n" + inboxNote
 	if m.Direct {
-		b.handleCanonical(m.Body, "", b.acct.Owner, "", m.From, m.ID, b.replyContext(m), nil, m.Markable)
+		b.handleCanonical(m.Body, m)
 		return
 	}
 	b.handleRoom(m)
